@@ -49,6 +49,21 @@ const (
 	setPeerPolicies     = "arcade_peer_policies"
 )
 
+// defaultBatchSize matches the store.aerospike.batch_size config default.
+// Batch loops advance with `i += s.batchSize`; a non-positive step never
+// moves and hangs mined-status, BUMP, and STUMP cleanup (issue #90).
+const defaultBatchSize = 500
+
+// effectiveBatchSize returns n when it is a positive loop step, otherwise
+// defaultBatchSize. Config validation rejects <= 0; this clamp covers
+// callers that build config.Aero without going through Load.
+func effectiveBatchSize(n int) int {
+	if n <= 0 {
+		return defaultBatchSize
+	}
+	return n
+}
+
 // BUMP chunking — large compound BUMPs (scaling networks with millions of
 // txs/block produce tens of MiB of merkle path data) cannot fit in a single
 // Aerospike record because record size is bounded by the namespace's
@@ -161,7 +176,7 @@ func New(ctx context.Context, cfg config.Aero) (*Store, error) {
 	s := &Store{
 		client:        client,
 		namespace:     cfg.Namespace,
-		batchSize:     cfg.BatchSize,
+		batchSize:     effectiveBatchSize(cfg.BatchSize),
 		queryTimeout:  time.Duration(cfg.QueryTimeoutMs) * time.Millisecond,
 		opTimeout:     time.Duration(cfg.OpTimeoutMs) * time.Millisecond,
 		socketTimeout: time.Duration(cfg.SocketTimeoutMs) * time.Millisecond,

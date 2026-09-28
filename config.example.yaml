@@ -115,7 +115,8 @@ store:
     # arcade_submissions, arcade_leases, and arcade_datahub_endpoints sets.
     namespace: bsv_broadcaster
     # Max records per BatchGet/BatchWrite call. Larger batches reduce RTT
-    # overhead but raise per-op latency and memory pressure.
+    # overhead but raise per-op latency and memory pressure. Must be > 0;
+    # a zero step never advances the batch loops (issue #90).
     batch_size: 500
     # Per-node connection pool size (ConnectionQueueSize). Tune to roughly
     # the peak concurrent goroutines hitting the store.
