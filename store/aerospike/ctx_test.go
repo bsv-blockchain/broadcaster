@@ -28,7 +28,7 @@ func integrationStore(t *testing.T) *Store {
 		QueryTimeoutMs:  8000,
 		OpTimeoutMs:     3000,
 		SocketTimeoutMs: 5000,
-	})
+	}, nil)
 	if err != nil {
 		t.Skipf("aerospike unavailable on localhost:3200: %v", err)
 	}

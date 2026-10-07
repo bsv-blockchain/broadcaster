@@ -1,8 +1,8 @@
 package deploy
 
 import (
+	"io/fs"
 	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -12,7 +12,11 @@ import (
 // the build workflow publishes (ghcr.io/bsv-blockchain/broadcaster:<git sha>),
 // not a mutable :latest tag or a foreign GHCR namespace. Issues #92 and #93.
 func TestBroadcasterWorkloadManifests(t *testing.T) {
-	files, err := filepath.Glob("*.yaml")
+	// DirFS + fs.ReadFile keeps the path inside this package directory.
+	// os.ReadFile on a glob result trips gosec G304 even though the names
+	// are not attacker-controlled.
+	root := os.DirFS(".")
+	files, err := fs.Glob(root, "*.yaml")
 	if err != nil {
 		t.Fatalf("glob deploy yaml: %v", err)
 	}
@@ -22,7 +26,7 @@ func TestBroadcasterWorkloadManifests(t *testing.T) {
 
 	var workloads int
 	for _, name := range files {
-		body, err := os.ReadFile(name)
+		body, err := fs.ReadFile(root, name)
 		if err != nil {
 			t.Fatalf("read %s: %v", name, err)
 		}
