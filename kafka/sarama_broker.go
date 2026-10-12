@@ -310,8 +310,22 @@ func newSaramaConsumerConfig(start StartOffset) *sarama.Config {
 	return saramaCfg
 }
 
+// partitionCountClientConfig is the metadata client used by PartitionCount.
+//
+// AllowAutoTopicCreation is forced off. Sarama's default is true, so a
+// metadata lookup for a missing topic would ask the broker to create it
+// at the cluster default width. CheckPartitions and CheckMinPartitions
+// both go through PartitionCount; a probe that created the topic would
+// hide ErrTopicNotFound, and every later restart would fail on "has N
+// partitions" against a topic the probe itself created.
+func partitionCountClientConfig() *sarama.Config {
+	cfg := sarama.NewConfig()
+	cfg.Metadata.AllowAutoTopicCreation = false
+	return cfg
+}
+
 func (b *saramaBroker) PartitionCount(topic string) (int, error) {
-	client, err := sarama.NewClient(b.brokers, sarama.NewConfig())
+	client, err := sarama.NewClient(b.brokers, partitionCountClientConfig())
 	if err != nil {
 		return 0, fmt.Errorf("creating metadata client: %w", err)
 	}

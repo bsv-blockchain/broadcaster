@@ -57,6 +57,17 @@ func SetTopicPrefix(prefix string) {
 	TopicStatusUpdateDLQ = DLQTopic(TopicStatusUpdate)
 }
 
+// HorizontalScaleTopics returns the fan-out topics checked against
+// kafka.min_partitions when that floor is greater than 1.
+//
+// TopicPropagation is not included: CheckMinPartitions already enforces
+// propagation.partitions, a different knob. The retired TopicTransaction
+// and the DLQ topics are one partition by design. Names follow the prefix
+// applied by SetTopicPrefix, so call this after that.
+func HorizontalScaleTopics() []string {
+	return []string{TopicBlockProcessed, TopicStatusUpdate}
+}
+
 // AllTopics returns all primary topics created/managed by BSV Broadcaster.
 func AllTopics() []string {
 	return []string{

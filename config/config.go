@@ -295,11 +295,14 @@ type Kafka struct {
 	ConsumerGroup string   `mapstructure:"consumer_group"`
 	MaxRetries    int      `mapstructure:"max_retries"`
 	BufferSize    int      `mapstructure:"buffer_size"`
-	// MinPartitions is a soft minimum-partition hint for horizontally-scaled
-	// topics; BSV Broadcaster fails fast at startup when an existing topic has fewer.
+	// MinPartitions is the partition floor CheckPartitions applies to
+	// HorizontalScaleTopics (block_processed and tx_status) when it is
+	// greater than 1. A topic that is missing or narrower than this floor
+	// fails startup. The metadata probe does not create the topic.
+	// Values of 0 or 1 skip the check (standalone / single replica,
+	// including the in-memory broker).
 	// TopicPropagation has its own dedicated knob (propagation.partitions)
 	// with a fail-closed startup check — see PropagationConfig.Partitions.
-	// Leave at 0 or 1 in standalone/single-replica deployments.
 	MinPartitions int `mapstructure:"min_partitions"`
 	// TopicPrefix namespaces every topic as "<prefix>.<name>" (default
 	// "bsv-broadcaster"). Deployments that predate the BSV Broadcaster
