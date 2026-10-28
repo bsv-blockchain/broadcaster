@@ -392,7 +392,11 @@ func (s *Service) deliver(ctx context.Context, sub *models.Submission, status *m
 		metrics.MinedPushWithoutMerklePathTotal.WithLabelValues("webhook").Inc()
 	}
 
-	body, err := json.Marshal(status)
+	// The event-only CallbackTokenHint must never reach a receiver: it is an
+	// SSE subscriber's token, not part of the status.
+	payload := *status
+	payload.CallbackTokenHint = ""
+	body, err := json.Marshal(&payload)
 	if err != nil {
 		logger.Warn("encoding status payload failed", zap.Error(err))
 		return

@@ -1038,6 +1038,8 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 		return
 	}
 
+	s.publishReceived(c.Request.Context(), []string{txid}, opts)
+
 	telemetry.LoggerWith(c.Request.Context(), s.logger).Info(
 		"transaction received",
 		logfields.TxID(txid),
@@ -1049,6 +1051,36 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 		Status:   http.StatusAccepted,
 		TxStatus: models.StatusReceived,
 	})
+}
+
+// publishReceived fans the RECEIVED status onto the events publisher once the
+// propagation message is durably queued, so a subscriber that opened its
+// stream before submitting sees the lifecycle from its first state rather
+// than from ACCEPTED_BY_NETWORK (hosted-service report, issue 6d). The
+// request's callback token rides along as a hint because the submission row
+// is written by the asynchronous recorder and may not exist yet when the SSE
+// pod resolves the txid's subscribers. Best-effort: the row and the Kafka
+// message are already durable, and connect-time catchup covers a lost event.
+func (s *Server) publishReceived(ctx context.Context, txids []string, opts submitOptions) {
+	if s.publisher == nil || len(txids) == 0 {
+		return
+	}
+	st := &models.TransactionStatus{
+		Status:            models.StatusReceived,
+		Timestamp:         time.Now(),
+		CallbackTokenHint: opts.CallbackToken,
+	}
+	var err error
+	if len(txids) == 1 {
+		st.TxID = txids[0]
+		err = s.publisher.Publish(ctx, st)
+	} else {
+		st.TxIDs = txids
+		err = s.publisher.PublishBulk(ctx, st)
+	}
+	if err != nil {
+		s.logger.Warn("RECEIVED publish failed", zap.Int("count", len(txids)), zap.Error(err))
+	}
 }
 
 // arcStatusCodeOf extracts the numeric ARC status code (460-476 taxonomy,
@@ -1121,6 +1153,8 @@ func (s *Server) rejectAtIntake(ctx context.Context, txid, reason string, status
 		StatusCode: statusCode,
 		ExtraInfo:  reason,
 		Timestamp:  time.Now(),
+		// Same race as publishReceived: the submission row may not exist yet.
+		CallbackTokenHint: opts.CallbackToken,
 	}
 	if err := s.publisher.Publish(ctx, status); err != nil {
 		s.logger.Warn(
@@ -1434,6 +1468,7 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 		for i, p := range toPublish {
 			publishedTxIDs[i] = p.txid
 		}
+		s.publishReceived(ctx, publishedTxIDs, opts)
 		// Bounded (TxIDBatch: true count + capped list), NOT chunked: this
 		// runs synchronously before the HTTP response and /txs accepts up to
 		// 256 MiB, so unbounded sequential chunk writes would land in the

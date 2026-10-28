@@ -244,9 +244,13 @@ func (m *Manager) fanOut(ctx context.Context, status *models.TransactionStatus) 
 	if len(clients) == 0 {
 		return // nobody listening — skip token resolution and enrichment
 	}
+	// The hint is consumed here and never travels further: it is another
+	// subscriber's token, and the frame builder would not serialize it anyway.
+	hint := status.CallbackTokenHint
+	status.CallbackTokenHint = ""
 	var tokens tokenSet
 	if tokenScoped(clients) {
-		tokens = m.tokens.lookup(ctx, status.TxID)
+		tokens = m.tokens.lookup(ctx, status.TxID).withHint(hint)
 	}
 	m.deliver(ctx, clients, status, tokens)
 	m.observeFanout("single", start)
@@ -270,6 +274,8 @@ func (m *Manager) fanOutBulk(ctx context.Context, status *models.TransactionStat
 	if len(clients) == 0 {
 		return
 	}
+	hint := status.CallbackTokenHint
+	status.CallbackTokenHint = ""
 	var resolved map[string]tokenSet
 	if tokenScoped(clients) {
 		resolved = m.tokens.resolveBatch(ctx, status.TxIDs)
@@ -278,7 +284,7 @@ func (m *Manager) fanOutBulk(ctx context.Context, status *models.TransactionStat
 		perTx := *status
 		perTx.TxID = txid
 		perTx.TxIDs = nil
-		m.deliver(ctx, clients, &perTx, resolved[txid])
+		m.deliver(ctx, clients, &perTx, resolved[txid].withHint(hint))
 	}
 	m.observeFanout("bulk", start)
 }

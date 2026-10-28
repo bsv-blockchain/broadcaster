@@ -25,6 +25,20 @@ type tokenSet []string
 // has reports whether token is subscribed to the txid this set describes.
 func (s tokenSet) has(token string) bool { return slices.Contains(s, token) }
 
+// withHint returns s plus the token an intake event carried as its
+// CallbackTokenHint (models.TransactionStatus): the submission row the index
+// resolves tokens from is written asynchronously and may not exist yet when
+// the RECEIVED event arrives. Always a copy, never an append in place — a
+// cached set is read by other fan-outs without the index lock.
+func (s tokenSet) withHint(hint string) tokenSet {
+	if hint == "" || s.has(hint) {
+		return s
+	}
+	out := make(tokenSet, 0, len(s)+1)
+	out = append(out, s...)
+	return append(out, hint)
+}
+
 // Cache bounds. The index is a pure accelerator — every miss is answered by
 // the store — so the bounds are chosen for a small, predictable resident set
 // rather than for completeness. The SSE pod runs with a 256Mi limit and has
