@@ -1018,6 +1018,16 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 	// any status events fired on this txid can find a matching row.
 	s.recordSubmission(c.Request.Context(), txid, opts)
 
+	// RECEIVED goes out BEFORE the propagation message: once that message is
+	// queued the propagator can publish ACCEPTED_BY_NETWORK or REJECTED, and a
+	// RECEIVED published after it could reach a live stream as a stale frame
+	// behind the verdict. A REJECTED resubmit is skipped — its row stays
+	// REJECTED, so a repeat rejection is not a transition and would never
+	// correct a RECEIVED frame.
+	if submitResult != "retry_rejected" {
+		s.publishReceived(c.Request.Context(), []string{txid}, opts)
+	}
+
 	msg := map[string]interface{}{
 		"txid":        txid,
 		"raw_tx":      rawTx,
@@ -1038,8 +1048,6 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 		return
 	}
 
-	s.publishReceived(c.Request.Context(), []string{txid}, opts)
-
 	telemetry.LoggerWith(c.Request.Context(), s.logger).Info(
 		"transaction received",
 		logfields.TxID(txid),
@@ -1054,13 +1062,16 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 }
 
 // publishReceived fans the RECEIVED status onto the events publisher once the
-// propagation message is durably queued, so a subscriber that opened its
-// stream before submitting sees the lifecycle from its first state rather
-// than from ACCEPTED_BY_NETWORK (hosted-service report, issue 6d). The
-// request's callback token rides along as a hint because the submission row
-// is written by the asynchronous recorder and may not exist yet when the SSE
-// pod resolves the txid's subscribers. Best-effort: the row and the Kafka
-// message are already durable, and connect-time catchup covers a lost event.
+// RECEIVED row is durable and before the propagation message is queued, so a
+// subscriber that opened its stream before submitting sees the lifecycle from
+// its first state rather than from ACCEPTED_BY_NETWORK (hosted-service
+// report, issue 6d), and never sees RECEIVED behind a verdict. Callers pass
+// only txids whose stored row is RECEIVED. The request's callback token rides
+// along as a hint because the submission row is written by the asynchronous
+// recorder and may not exist yet when the SSE pod resolves the txid's
+// subscribers. Best-effort: the row is already durable, and connect-time
+// catchup covers a lost event. A failed Kafka send after this leaves the row
+// at RECEIVED, which the client's retry re-queues, so the frame stays true.
 func (s *Server) publishReceived(ctx context.Context, txids []string, opts submitOptions) {
 	if s.publisher == nil || len(txids) == 0 {
 		return
@@ -1373,6 +1384,9 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 	// that selected them; their stored keys win over this request's choice
 	// (adoptStoredFamilyKeys).
 	republished := make(map[string]models.Status)
+	// receivedTxIDs is toPublish minus REJECTED resubmits: only txids whose
+	// stored row is RECEIVED get a RECEIVED event (see handleSubmitTransaction).
+	receivedTxIDs := make([]string, 0, len(parsed))
 	duplicates := 0
 	newSubmits, retryRejected := 0, 0
 	if s.store != nil {
@@ -1393,12 +1407,15 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 				s.logger.Error("dedup CAS failed", logfields.TxID(p.txid), zap.Error(dedupErr))
 				newSubmits++
 				toPublish = append(toPublish, p)
+				receivedTxIDs = append(receivedTxIDs, p.txid)
 			case !inserted && existing != nil && shouldRepublishExisting(existing.Status):
 				// REJECTED resubmit and stranded RECEIVED (Kafka send failed
 				// after insert) both re-enter toPublish. Mirrors
 				// handleSubmitTransaction. Seen/accepted rows stay duplicates.
 				if existing.Status == models.StatusRejected {
 					retryRejected++
+				} else {
+					receivedTxIDs = append(receivedTxIDs, p.txid)
 				}
 				toPublish = append(toPublish, p)
 				republished[p.txid] = existing.Status
@@ -1415,11 +1432,15 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 			default:
 				newSubmits++
 				toPublish = append(toPublish, p)
+				receivedTxIDs = append(receivedTxIDs, p.txid)
 			}
 		}
 	} else {
 		toPublish = parsed
 		newSubmits = len(parsed)
+		for _, p := range parsed {
+			receivedTxIDs = append(receivedTxIDs, p.txid)
+		}
 	}
 	metrics.APITxsSubmittedTotal.WithLabelValues("/txs", "new").Add(float64(newSubmits))
 	metrics.APITxsSubmittedTotal.WithLabelValues("/txs", "duplicate").Add(float64(duplicates))
@@ -1451,6 +1472,9 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 	// per-partition order still delivers parents before children.
 	if len(toPublish) > 0 {
 		s.adoptStoredFamilyKeys(ctx, keyByTxid, famByTxid, republished)
+		// Before SendBatch, for the ordering reason in handleSubmitTransaction.
+		s.publishReceived(ctx, receivedTxIDs, opts)
+
 		msgs := propagationMessages(toPublish, keyByTxid, inputsByTxid)
 		if err := s.producer.SendBatch(ctx, kafka.TopicPropagation, msgs); err != nil {
 			if errors.Is(err, kafka.ErrBrokerBackpressure) {
@@ -1468,7 +1492,6 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 		for i, p := range toPublish {
 			publishedTxIDs[i] = p.txid
 		}
-		s.publishReceived(ctx, publishedTxIDs, opts)
 		// Bounded (TxIDBatch: true count + capped list), NOT chunked: this
 		// runs synchronously before the HTTP response and /txs accepts up to
 		// 256 MiB, so unbounded sequential chunk writes would land in the

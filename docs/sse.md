@@ -45,7 +45,7 @@ data: {"txid":"abc...","txStatus":"SEEN_ON_NETWORK","timestamp":"2026-04-28T18:2
 
 - `id` is a Unix nanosecond timestamp. Clients should remember the most recent `id` and send it back as `Last-Event-ID` on reconnect (browser `EventSource` does this automatically).
 - `event: status` is the only event type emitted for transaction updates.
-- The first frame for a submitted txid is `RECEIVED`, published as soon as intake has queued the transaction for propagation; `ACCEPTED_BY_NETWORK`, `SEEN_ON_NETWORK`, `SEEN_MULTIPLE_NODES` and `MINED` follow as the network reports them (`PENDING_RETRY` and `REJECTED` are the side states). Open the stream before submitting to see the lifecycle from its first state.
+- The first frame for a submitted txid is `RECEIVED`, published once intake has stored the transaction and before it is queued for propagation, so it always precedes the network's verdict; `ACCEPTED_BY_NETWORK`, `SEEN_ON_NETWORK`, `SEEN_MULTIPLE_NODES` and `MINED` follow as the network reports them (`PENDING_RETRY` and `REJECTED` are the side states). Open the stream before submitting to see the lifecycle from its first state. Resubmitting a `REJECTED` transaction re-broadcasts it without a new `RECEIVED` frame; the next frame is the network's new verdict, or none if it is rejected again.
 - `data` is one JSON object per frame. Every frame carries `txid`, `txStatus`, and `timestamp` (RFC 3339, with fractional seconds when the event has sub-second precision — the same instant as `id`, so latency can be measured from the payload alone). Fractional seconds are optional in RFC 3339; a whole-second timestamp is still rendered as `2026-04-28T18:20:56Z`.
 - A blank line terminates each frame.
 
