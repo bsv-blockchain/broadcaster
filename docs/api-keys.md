@@ -11,6 +11,10 @@ Send your key as a bearer token, the same header ARC clients already use:
 Authorization: Bearer bsvb_…
 ```
 
+Keys issued by a provider the deployment trusts (for example WhatsOnChain's
+`bsv_…` keys, see [`auth.introspection`](#keys-verified-by-an-external-provider-authintrospection))
+are sent the same way.
+
 Requests without a key are served at the anonymous tier, limited per client
 IP by a bucket local to the replica that handled the request (not shared
 across replicas). An IPv6 client is bucketed by its `/64`, not its exact
