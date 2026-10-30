@@ -13,6 +13,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/bsv-blockchain/broadcaster/config"
+	"github.com/bsv-blockchain/broadcaster/services/apikey"
 	"github.com/bsv-blockchain/broadcaster/services/ratelimit"
 	"github.com/bsv-blockchain/broadcaster/store/pebble"
 )
@@ -97,4 +98,97 @@ func TestAccessControlEndToEnd(t *testing.T) {
 		adminDo(t, admin, http.MethodDelete, "/admin/v1/keys/"+created.ID, "admin-secret", "").Code)
 	time.Sleep(5 * time.Millisecond)
 	require.Equal(t, http.StatusUnauthorized, call(created.Key).Code, "revoked within the cache TTL")
+}
+
+// TestIntrospectionProviderEndToEnd drives the public guard chain with a
+// bsv_ provider configured: provider keys resolve through introspection,
+// an unbounded provider tier is never limited while anonymous callers are,
+// and two keys sharing a limit_id share one quota.
+func TestIntrospectionProviderEndToEnd(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	st, err := pebble.New(config.Pebble{Path: t.TempDir(), MemTableSizeMB: 4, L0CompactionThreshold: 2})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+
+	unlimited := providerKey(t)
+	planA, planB := providerKey(t), providerKey(t)
+	answers := map[string]string{
+		apikey.Hash(unlimited): `{"valid":true,"key_id":"k-unlimited","tier":"standard","expires_at":null}`,
+		apikey.Hash(planA):     `{"valid":true,"key_id":"k-a","limit_id":"lim_plan","tier":"free"}`,
+		apikey.Hash(planB):     `{"valid":true,"key_id":"k-b","limit_id":"lim_plan","tier":"free"}`,
+	}
+	calls := 0
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		var body struct {
+			KeyHash string `json:"key_hash"`
+		}
+		if r.Header.Get("Authorization") != "Bearer svc-token" || json.NewDecoder(r.Body).Decode(&body) != nil {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		answer, ok := answers[body.KeyHash]
+		if !ok {
+			answer = `{"valid":false}`
+		}
+		_, _ = w.Write([]byte(answer))
+	}))
+	t.Cleanup(provider.Close)
+
+	cfg := &config.Config{
+		Auth: config.AuthConfig{Enabled: true, Introspection: map[string]config.IntrospectionProvider{
+			"woc": {KeyPrefix: "bsv_", URL: provider.URL, Token: "svc-token"},
+		}},
+		RateLimit: config.RateLimitConfig{
+			Enabled: true, LeaseFraction: 0.1, ShrinkThreshold: 0.8,
+			KeyCacheTTLMs: 30000, KeyCacheStaleMaxMs: 60000, ExpectedReplicas: 1,
+			Costs:     config.RateLimitCosts{SubmitTx: 10, Read: 1},
+			Anonymous: config.TierConfig{UnitsPerMinute: 2, MaxInFlight: 5, MaxBatch: 1},
+			Tiers: map[string]config.TierConfig{
+				config.TierFree: {UnitsPerMinute: 3, MaxInFlight: 5, MaxBatch: 1},
+				"standard":      {},
+			},
+		},
+	}
+	srv := &Server{cfg: cfg, logger: zap.NewNop(), store: st}
+	require.NoError(t, srv.initAccessControl())
+	fixed := time.Date(2026, 10, 30, 12, 0, 30, 0, time.UTC)
+	srv.limiter = ratelimit.New(cfg.RateLimit, st, zap.NewNop(), ratelimit.WithClock(func() time.Time { return fixed }))
+
+	api := gin.New()
+	api.GET("/limited", srv.guarded(1, func(c *gin.Context) { c.Status(http.StatusNoContent) })...)
+	call := func(key string) int {
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/limited", nil)
+		if key != "" {
+			req.Header.Set("Authorization", "Bearer "+key)
+		}
+		w := httptest.NewRecorder()
+		api.ServeHTTP(w, req)
+		return w.Code
+	}
+
+	require.Equal(t, http.StatusNoContent, call(""))
+	require.Equal(t, http.StatusNoContent, call(""))
+	require.Equal(t, http.StatusTooManyRequests, call(""), "anonymous is limited")
+
+	for i := range 200 {
+		require.Equal(t, http.StatusNoContent, call(unlimited), "request %d", i)
+	}
+	require.Equal(t, 1, calls, "the answer is cached")
+
+	require.Equal(t, http.StatusUnauthorized, call(providerKey(t)), "a key the provider doesn't know")
+
+	// free is 3 units/minute per allowance, and planA and planB share one.
+	require.Equal(t, http.StatusNoContent, call(planA))
+	require.Equal(t, http.StatusNoContent, call(planB))
+	require.Equal(t, http.StatusNoContent, call(planA))
+	require.Equal(t, http.StatusTooManyRequests, call(planB), "keys on one limit_id share its quota")
+}
+
+// providerKey returns a well-formed key under the bsv_ provider prefix.
+func providerKey(t *testing.T) string {
+	t.Helper()
+	k, err := apikey.Generate()
+	require.NoError(t, err)
+	return "bsv_" + strings.TrimPrefix(k, apikey.Prefix)
 }
