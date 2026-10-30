@@ -300,8 +300,18 @@ Revoking a provider key takes effect within the provider's own propagation
 delay plus `key_cache_ttl_ms`. The admin endpoints (`/admin/keys`) manage
 only `bsvb_` keys.
 
+**Backoff.** After a failed call, the api-server stops calling that provider
+for a while and fails fast instead: 30s after `401`/`403`, the provider's
+`Retry-After` (capped at 60s) after `429` or `5xx`, otherwise 5s after `429`
+and 2s after a `5xx`, timeout or connection error. During that time cached
+keys keep working and uncached keys get `503`. This keeps an outage or a bad
+token from sending every request to the provider. That matters for
+WhatsOnChain, which rate-limits per source IP, so a burst from one replica
+would throttle every replica behind the same egress.
+
 Metric: `bsv_broadcaster_apikey_introspect_total{provider,result}`, where
-`result` is `valid`, `invalid`, `unauthorized` (bad service token) or `error`.
+`result` is `valid`, `invalid`, `unauthorized` (bad service token), `error`,
+or `backoff` (not called because of an earlier failure).
 
 ### Managing keys
 

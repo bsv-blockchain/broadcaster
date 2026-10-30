@@ -164,3 +164,65 @@ func generateWithPrefix(t *testing.T, prefix string) string {
 	require.NoError(t, err)
 	return prefix + raw[len(Prefix):]
 }
+
+// TestIntrospectorBacksOffAfterFailures pins that a failing provider is not
+// called again until its backoff passes, so an outage or a bad token cannot
+// turn every uncached request into an outbound call (and trip the
+// provider's per-IP rate limit for every replica sharing our egress).
+func TestIntrospectorBacksOffAfterFailures(t *testing.T) {
+	for name, tc := range map[string]struct {
+		status     int
+		retryAfter string
+		token      string
+		backoff    time.Duration
+	}{
+		"429 with Retry-After":   {http.StatusTooManyRequests, "7", testServiceToken, 7 * time.Second},
+		"429 Retry-After capped": {http.StatusTooManyRequests, "3600", testServiceToken, backoffMax},
+		"429 without header":     {http.StatusTooManyRequests, "", testServiceToken, backoffThrottled},
+		"503":                    {http.StatusServiceUnavailable, "", testServiceToken, backoffTransient},
+		"rejected token":         {http.StatusOK, "", "wrong", backoffCredentials},
+		"invalid key":            {http.StatusOK, "", testServiceToken, 0},
+		"400":                    {http.StatusBadRequest, "", testServiceToken, 0},
+	} {
+		t.Run(name, func(t *testing.T) {
+			calls := 0
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				if r.Header.Get("Authorization") != "Bearer "+testServiceToken {
+					w.WriteHeader(http.StatusUnauthorized)
+					return
+				}
+				if tc.retryAfter != "" {
+					w.Header().Set("Retry-After", tc.retryAfter)
+				}
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(`{"valid":false}`))
+			}))
+			t.Cleanup(srv.Close)
+			in := introspectorFor(srv, tc.token)
+			clk := &fakeClock{t: time.Date(2026, 10, 30, 12, 0, 0, 0, time.UTC)}
+			in.now = clk.now
+
+			_, err := in.GetAPIKeyByHash(context.Background(), Hash("x"))
+			require.Error(t, err)
+			require.Equal(t, 1, calls)
+
+			_, err = in.GetAPIKeyByHash(context.Background(), Hash("y"))
+			require.Error(t, err)
+			if tc.backoff == 0 {
+				require.Equal(t, 2, calls, "no backoff: the next key is looked up")
+				return
+			}
+			require.ErrorIs(t, err, errIntrospectionBackoff)
+			require.NotErrorIs(t, err, store.ErrAPIKeyNotFound, "backing off is unavailable, never unknown")
+			require.Equal(t, 1, calls, "backing off: the provider is not called")
+
+			clk.advance(tc.backoff - time.Millisecond)
+			_, err = in.GetAPIKeyByHash(context.Background(), Hash("y"))
+			require.ErrorIs(t, err, errIntrospectionBackoff)
+			clk.advance(time.Millisecond)
+			_, _ = in.GetAPIKeyByHash(context.Background(), Hash("y"))
+			require.Equal(t, 2, calls, "called again once the backoff has passed")
+		})
+	}
+}
