@@ -502,6 +502,16 @@ auth:
   #   mongodb:
   #     uri: ""              # BSV_BROADCASTER_AUTH_STORE_MONGODB_URI
   #     database: bsv_broadcaster_auth
+  # Optional external providers that verify the keys they issue under their
+  # own prefix (bsvb_ keys always come from the key store). Each returned tier
+  # must exist under ratelimit.tiers, or the key falls back to free.
+  # See docs/api-keys.md.
+  # introspection:
+  #   woc:
+  #     key_prefix: bsv_
+  #     url: https://api-ovh.whatsonchain.com/v1/bsv/main/products/introspect
+  #     token_env: WOC_INTROSPECTION_TOKEN   # or token: <literal>
+  #     timeout_ms: 3000
 admin:
   enabled: false
   host: 127.0.0.1       # kubectl port-forward works with this; set 0.0.0.0 to opt in to in-cluster tooling reaching it directly

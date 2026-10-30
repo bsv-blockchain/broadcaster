@@ -243,6 +243,66 @@ When several deployments share one auth store:
   fails open to a per-replica bucket. Host it where every region reaches it
   within `op_timeout_ms`.
 
+### Keys verified by an external provider (`auth.introspection`)
+
+A deployment can also accept keys issued by another service, such as
+WhatsOnChain's `bsv_` keys. Each provider is configured with the prefix its keys
+carry and an introspection endpoint. Keys under that prefix are verified there
+and never reach the key store. Keys under `bsvb_` (the broadcaster's own)
+always resolve from the key store, and a key with any other prefix gets `401`.
+
+```yaml
+auth:
+  enabled: true                       # required when auth.introspection is set
+  introspection:
+    woc:                              # provider name: metrics label and logs
+      key_prefix: bsv_
+      url: https://api-ovh.whatsonchain.com/v1/bsv/main/products/introspect
+      token_env: WOC_INTROSPECTION_TOKEN   # or token: <literal>; exactly one
+      timeout_ms: 3000                # default 3000, max 4500
+```
+
+Provider keys must use the broadcaster's key format under their own prefix:
+the prefix, 43 base62 characters, `_`, then a 6-character base62 CRC32 of the
+body. Malformed keys are rejected before any network call.
+
+**Protocol.** For a key it has not seen (or whose cached answer is older than
+`key_cache_ttl_ms`), the api-server sends:
+
+```
+POST <url>
+Authorization: Bearer <service token>
+Content-Type: application/json
+
+{"key_hash": "<hex SHA-256 of the full key, prefix included>"}
+```
+
+The key itself never leaves the broadcaster. The provider answers:
+
+| Response | Meaning |
+|---|---|
+| `200 {"valid": true, "key_id", "tier", "limit_id"?, "expires_at"?}` | Usable key. `key_id` is logged and identifies the caller. `tier` names a tier under `ratelimit.tiers`. A tier missing from config falls back to `free`, so configure every tier the provider issues. `expires_at` (ISO 8601, or null) is enforced on every request, even from cache. |
+| `200 {"valid": false}` | Unknown, revoked or out-of-scope key: `401`, cached for `key_cache_ttl_ms`. |
+| `401` / `403` | The provider rejected the service token. The api-server logs an error and treats it as an outage (cached keys keep working up to `key_cache_stale_max_ms`, uncached keys get `503`), never as an unknown key. |
+| anything else, or a timeout | Outage, handled as above. |
+
+Other response fields, such as WoC's `rate_limit_per_sec` and
+`rate_limit_per_day`, are ignored. Limits come from this deployment's
+`ratelimit.tiers` entry for the returned `tier`. Redirects are not followed,
+so the service token goes only to `url`.
+
+**Shared allowances.** When the answer carries a `limit_id`, every key with
+that `limit_id` shares one quota window, one `max_in_flight` budget and one
+fail-open bucket. A customer cannot raise their limits by creating more keys.
+Without a `limit_id`, each key is its own allowance, like a `bsvb_` key.
+
+Revoking a provider key takes effect within the provider's own propagation
+delay plus `key_cache_ttl_ms`. The admin endpoints (`/admin/keys`) manage
+only `bsvb_` keys.
+
+Metric: `bsv_broadcaster_apikey_introspect_total{provider,result}`, where
+`result` is `valid`, `invalid`, `unauthorized` (bad service token) or `error`.
+
 ### Managing keys
 
 ```bash

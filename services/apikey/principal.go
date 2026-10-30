@@ -11,7 +11,11 @@ const ctxPrincipal = "apikey.principal"
 
 // Principal is the identified caller of a request.
 type Principal struct {
-	KeyID    string // "" for anonymous callers
+	KeyID string // "" for anonymous callers
+	// QuotaID is the allowance the key draws from (store.APIKey.QuotaID):
+	// the WoC limit_id shared by every key on a plan, else KeyID. "" for
+	// anonymous callers.
+	QuotaID  string
 	Tier     string // the key's tier; config.TierAnonymous for anonymous callers
 	ClientIP string
 }
@@ -21,6 +25,8 @@ func (p Principal) Anonymous() bool { return p.KeyID == "" }
 
 // Subject identifies the principal for per-caller accounting: the anonymous
 // quota bucket, the fail-open bucket, and the in-flight concurrency map.
+// Keyed callers are accounted by QuotaID, so keys sharing a plan's limit
+// share one bucket: creating more keys must not multiply the allowance.
 // Anonymous callers are keyed by NormalizeClientIP(ClientIP), not the raw
 // address -- an IPv6 client rotating addresses within its own /64 (privacy
 // extensions, CGNAT) must share one bucket, not get a fresh one on every
@@ -30,7 +36,16 @@ func (p Principal) Subject() string {
 	if p.Anonymous() {
 		return "ip:" + NormalizeClientIP(p.ClientIP)
 	}
-	return "key:" + p.KeyID
+	return "key:" + p.QuotaKey()
+}
+
+// QuotaKey is the shared quota-store key for a keyed principal: QuotaID,
+// falling back to KeyID for a principal built without one.
+func (p Principal) QuotaKey() string {
+	if p.QuotaID != "" {
+		return p.QuotaID
+	}
+	return p.KeyID
 }
 
 // WithPrincipal stores p on the request. Middleware calls it; tests use it
@@ -59,5 +74,9 @@ func LogFields(c *gin.Context) []zap.Field {
 	if !ok || p.Anonymous() {
 		return nil
 	}
-	return []zap.Field{zap.String("key_id", p.KeyID), zap.String("tier", p.Tier)}
+	fs := []zap.Field{zap.String("key_id", p.KeyID), zap.String("tier", p.Tier)}
+	if p.QuotaID != "" && p.QuotaID != p.KeyID {
+		fs = append(fs, zap.String("limit_id", p.QuotaID))
+	}
+	return fs
 }

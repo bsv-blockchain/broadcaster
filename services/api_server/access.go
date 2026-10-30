@@ -2,6 +2,8 @@ package api_server
 
 import (
 	"fmt"
+	"maps"
+	"slices"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -79,7 +81,8 @@ func (s *Server) initAccessControl() error {
 	rl := s.cfg.RateLimit
 	s.keyResolver = apikey.NewResolver(keys,
 		time.Duration(rl.KeyCacheTTLMs)*time.Millisecond,
-		time.Duration(rl.KeyCacheStaleMaxMs)*time.Millisecond)
+		time.Duration(rl.KeyCacheStaleMaxMs)*time.Millisecond,
+		apikey.WithRoutes(s.introspectionRoutes()...))
 	s.identify = apikey.Middleware(s.keyResolver)
 	// Export the apikey-identification series at 0 from the first scrape
 	// whenever auth is on, independent of ratelimit.enabled: identification
@@ -94,6 +97,25 @@ func (s *Server) initAccessControl() error {
 	}
 	s.limiter = ratelimit.New(rl, quota, s.logger)
 	return nil
+}
+
+// introspectionRoutes builds a resolver route per auth.introspection
+// provider, in name order. Config validation has already checked prefixes,
+// URLs and tokens.
+func (s *Server) introspectionRoutes() []apikey.Route {
+	names := slices.Sorted(maps.Keys(s.cfg.Auth.Introspection))
+	routes := make([]apikey.Route, 0, len(names))
+	for _, name := range names {
+		p := s.cfg.Auth.Introspection[name]
+		routes = append(routes, apikey.Route{
+			Prefix: p.KeyPrefix,
+			Lookup: apikey.NewIntrospector(name, p.URL, p.ServiceToken(), p.Timeout(), s.logger),
+		})
+		s.logger.Info("api keys under prefix verified by introspection provider",
+			zap.String("provider", name), zap.String("key_prefix", p.KeyPrefix))
+	}
+	metrics.PreRegisterIntrospection(names)
+	return routes
 }
 
 // guarded prefixes h with the identify and rate-limit middleware the config
