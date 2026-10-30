@@ -3,6 +3,7 @@ package api_server
 import (
 	"bytes"
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -83,6 +84,7 @@ func TestHandleSubmitTransaction_PublishesReceivedWithTokenHint(t *testing.T) {
 // above zero means a verdict could have overtaken RECEIVED on a live stream.
 type orderingPub struct {
 	recordingCallbackPub
+
 	broker      *kafka.RecordingBroker
 	sendsBefore []int
 }
@@ -292,5 +294,145 @@ func TestPublishReceived_NoopWithoutPublisherOrTxIDs(t *testing.T) {
 	(&Server{logger: zap.NewNop(), publisher: pub}).publishReceived(context.Background(), nil, submitOptions{})
 	if len(pub.publishes) != 0 || len(pub.bulkPublishes) != 0 {
 		t.Errorf("empty txid list published events")
+	}
+}
+
+// staleReceivedSnapshot reproduces the concurrent-duplicate window: this
+// request's CAS observes the RECEIVED row an earlier attempt inserted, and by
+// the time it resumes that attempt's REJECTED verdict is already on the
+// stream (publishing it through pub records it ahead of anything this request
+// publishes). Txids not listed are inserted.
+func staleReceivedSnapshot(pub *orderingPub, txids ...string) *mockStore {
+	return &mockStore{
+		getOrInsertFn: func(in *models.TransactionStatus) (*models.TransactionStatus, bool, error) {
+			for _, id := range txids {
+				if in.TxID == id {
+					_ = pub.recordingCallbackPub.Publish(context.Background(), &models.TransactionStatus{TxID: id, Status: models.StatusRejected})
+					return &models.TransactionStatus{TxID: id, Status: models.StatusReceived}, false, nil
+				}
+			}
+			return nil, true, nil
+		},
+	}
+}
+
+// assertNoReceivedAfterRejected fails when any RECEIVED event (single or
+// bulk) names a txid whose REJECTED was already published.
+func assertNoReceivedAfterRejected(t *testing.T, pub *orderingPub) {
+	t.Helper()
+	rejected := map[string]bool{}
+	for _, st := range pub.publishes {
+		switch {
+		case st.Status == models.StatusRejected:
+			rejected[st.TxID] = true
+		case st.Status == models.StatusReceived && rejected[st.TxID]:
+			t.Errorf("RECEIVED for %s published after its REJECTED", st.TxID)
+		}
+	}
+	for _, b := range pub.bulkPublishes {
+		for _, id := range b.TxIDs {
+			if b.Status == models.StatusReceived && rejected[id] {
+				t.Errorf("bulk RECEIVED names %s after its REJECTED", id)
+			}
+		}
+	}
+}
+
+// TestHandleSubmitTransaction_ConcurrentDuplicatePublishesNoReceived: a
+// duplicate whose CAS saw the earlier attempt's RECEIVED row re-queues the tx
+// but must not publish RECEIVED — the earlier attempt's verdict may already be
+// on the stream, and a repeat rejection would never correct the stale frame.
+func TestHandleSubmitTransaction_ConcurrentDuplicatePublishesNoReceived(t *testing.T) {
+	raw := makeMinimalTx()
+	parsed, _, err := sdkTx.NewTransactionFromStream(raw)
+	if err != nil {
+		t.Fatalf("parsing test tx: %v", err)
+	}
+	ms := &mockStore{}
+	pub, broker, router := newReceivedServer(ms)
+	*ms = *staleReceivedSnapshot(pub, parsed.TxID().String())
+	postSubmit(t, router, "/tx", raw)
+
+	assertNoReceivedAfterRejected(t, pub)
+	if len(pub.publishes) != 1 || len(pub.bulkPublishes) != 0 {
+		t.Errorf("expected only the earlier attempt's REJECTED, got single=%+v bulk=%+v", pub.publishes, pub.bulkPublishes)
+	}
+	if len(broker.Sends) != 1 {
+		t.Errorf("stranded RECEIVED retry must still re-queue propagation, got %d sends", len(broker.Sends))
+	}
+}
+
+// TestHandleSubmitTransactions_ConcurrentDuplicateExcludedFromReceived: the
+// same window in a batch — the duplicate is re-queued with the new tx, and
+// only the tx this request inserted gets RECEIVED.
+func TestHandleSubmitTransactions_ConcurrentDuplicateExcludedFromReceived(t *testing.T) {
+	rawA, rawB, txidA, txidB := twoDistinctTxs(t)
+	ms := &mockStore{}
+	pub, broker, router := newReceivedServer(ms)
+	*ms = *staleReceivedSnapshot(pub, txidA)
+	postSubmit(t, router, "/txs", append(append([]byte(nil), rawA...), rawB...))
+
+	assertNoReceivedAfterRejected(t, pub)
+	var received []string
+	for _, st := range pub.publishes {
+		if st.Status == models.StatusReceived {
+			received = append(received, st.TxID)
+		}
+	}
+	if len(pub.bulkPublishes) != 0 || len(received) != 1 || received[0] != txidB {
+		t.Errorf("expected RECEIVED for %s only, got single=%v bulk=%+v", txidB, received, pub.bulkPublishes)
+	}
+	if len(broker.Batches) != 1 || len(broker.Batches[0]) != 2 {
+		t.Errorf("expected both txs re-queued in one batch, got %+v", broker.Batches)
+	}
+}
+
+// TestHandleSubmitTransactions_AllConcurrentDuplicatesPublishNoReceived: a
+// batch made only of duplicates that lost the CAS publishes no RECEIVED.
+func TestHandleSubmitTransactions_AllConcurrentDuplicatesPublishNoReceived(t *testing.T) {
+	rawA, rawB, txidA, txidB := twoDistinctTxs(t)
+	ms := &mockStore{}
+	pub, broker, router := newReceivedServer(ms)
+	*ms = *staleReceivedSnapshot(pub, txidA, txidB)
+	postSubmit(t, router, "/txs", append(append([]byte(nil), rawA...), rawB...))
+
+	assertNoReceivedAfterRejected(t, pub)
+	if len(pub.bulkPublishes) != 0 || len(pub.publishes) != 2 {
+		t.Errorf("expected only the two earlier REJECTEDs, got single=%+v bulk=%+v", pub.publishes, pub.bulkPublishes)
+	}
+	if broker.BatchCalls != 1 {
+		t.Errorf("duplicates must still re-queue propagation, got %d batches", broker.BatchCalls)
+	}
+}
+
+// TestHandleSubmit_DedupErrorPublishesNoReceived: when the CAS errors the
+// handler cannot tell whether it is the first attempt, so it queues the tx
+// best-effort but publishes no RECEIVED, on either endpoint.
+func TestHandleSubmit_DedupErrorPublishesNoReceived(t *testing.T) {
+	failing := func() *mockStore {
+		return &mockStore{
+			getOrInsertFn: func(*models.TransactionStatus) (*models.TransactionStatus, bool, error) {
+				return nil, false, errors.New("store unavailable")
+			},
+		}
+	}
+	rawA, rawB, _, _ := twoDistinctTxs(t)
+	for _, tc := range []struct {
+		path string
+		body []byte
+	}{
+		{"/tx", rawA},
+		{"/txs", append(append([]byte(nil), rawA...), rawB...)},
+	} {
+		t.Run(tc.path, func(t *testing.T) {
+			pub, broker, router := newReceivedServer(failing())
+			postSubmit(t, router, tc.path, tc.body)
+			if len(pub.publishes) != 0 || len(pub.bulkPublishes) != 0 {
+				t.Errorf("CAS error published events: single=%+v bulk=%+v", pub.publishes, pub.bulkPublishes)
+			}
+			if len(broker.Sends)+broker.BatchCalls != 1 {
+				t.Errorf("CAS error must still queue propagation, got sends=%d batches=%d", len(broker.Sends), broker.BatchCalls)
+			}
+		})
 	}
 }

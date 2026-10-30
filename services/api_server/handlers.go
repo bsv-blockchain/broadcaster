@@ -955,6 +955,10 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 	inputTXIDs := collectInputTXIDs(parsedTx)
 	partitionKey, ownSeen := s.partitionKeyForSubmit(c.Request.Context(), txid, inputTXIDs)
 	submitResult := "new"
+	// inserted reports whether THIS request's CAS created the row; only then
+	// does it publish RECEIVED (see below). Without a store there is no CAS
+	// to coordinate with, so every submission counts as the first.
+	inserted := s.store == nil
 	if s.store != nil {
 		row := &models.TransactionStatus{
 			TxID:      txid,
@@ -967,7 +971,9 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 			// Persist the key so a child submitted later can follow it.
 			PartitionKey: partitionKey,
 		}
-		existing, inserted, dedupErr := s.store.GetOrInsertStatus(c.Request.Context(), row)
+		var existing *models.TransactionStatus
+		var dedupErr error
+		existing, inserted, dedupErr = s.store.GetOrInsertStatus(c.Request.Context(), row)
 		switch {
 		case dedupErr != nil:
 			s.logger.Error("dedup CAS failed", logfields.TxID(txid), zap.Error(dedupErr))
@@ -1021,10 +1027,13 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 	// RECEIVED goes out BEFORE the propagation message: once that message is
 	// queued the propagator can publish ACCEPTED_BY_NETWORK or REJECTED, and a
 	// RECEIVED published after it could reach a live stream as a stale frame
-	// behind the verdict. A REJECTED resubmit is skipped — its row stays
-	// REJECTED, so a repeat rejection is not a transition and would never
-	// correct a RECEIVED frame.
-	if submitResult != "retry_rejected" {
+	// behind the verdict. Only the request whose CAS created the row publishes
+	// it. Any other attempt — a REJECTED resubmit, a retry of a stranded
+	// RECEIVED row, an attempt whose CAS errored — may run after an earlier
+	// attempt's verdict was already published, and its RECEIVED would then
+	// follow that verdict; a repeat rejection is not a transition, so nothing
+	// would correct it.
+	if inserted {
 		s.publishReceived(c.Request.Context(), []string{txid}, opts)
 	}
 
@@ -1065,13 +1074,15 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 // RECEIVED row is durable and before the propagation message is queued, so a
 // subscriber that opened its stream before submitting sees the lifecycle from
 // its first state rather than from ACCEPTED_BY_NETWORK (hosted-service
-// report, issue 6d), and never sees RECEIVED behind a verdict. Callers pass
-// only txids whose stored row is RECEIVED. The request's callback token rides
+// report, issue 6d), and never sees RECEIVED behind a verdict. The request's callback token rides
 // along as a hint because the submission row is written by the asynchronous
 // recorder and may not exist yet when the SSE pod resolves the txid's
-// subscribers. Best-effort: the row is already durable, and connect-time
-// catchup covers a lost event. A failed Kafka send after this leaves the row
-// at RECEIVED, which the client's retry re-queues, so the frame stays true.
+// subscribers. Callers pass only txids whose row this request's CAS inserted:
+// the first attempt is the one attempt no verdict for the txid can precede.
+// Best-effort: the row is already durable, and connect-time catchup covers a
+// lost event. A failed Kafka send after this leaves the row at RECEIVED, which
+// the client's retry re-queues without a second RECEIVED, so the frame stays
+// true.
 func (s *Server) publishReceived(ctx context.Context, txids []string, opts submitOptions) {
 	if s.publisher == nil || len(txids) == 0 {
 		return
@@ -1384,8 +1395,10 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 	// that selected them; their stored keys win over this request's choice
 	// (adoptStoredFamilyKeys).
 	republished := make(map[string]models.Status)
-	// receivedTxIDs is toPublish minus REJECTED resubmits: only txids whose
-	// stored row is RECEIVED get a RECEIVED event (see handleSubmitTransaction).
+	// receivedTxIDs is the subset of toPublish whose row this request's CAS
+	// inserted: only the first attempt publishes RECEIVED, since any other
+	// attempt can run after an earlier attempt's verdict was published (see
+	// handleSubmitTransaction).
 	receivedTxIDs := make([]string, 0, len(parsed))
 	duplicates := 0
 	newSubmits, retryRejected := 0, 0
@@ -1407,15 +1420,12 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 				s.logger.Error("dedup CAS failed", logfields.TxID(p.txid), zap.Error(dedupErr))
 				newSubmits++
 				toPublish = append(toPublish, p)
-				receivedTxIDs = append(receivedTxIDs, p.txid)
 			case !inserted && existing != nil && shouldRepublishExisting(existing.Status):
 				// REJECTED resubmit and stranded RECEIVED (Kafka send failed
 				// after insert) both re-enter toPublish. Mirrors
 				// handleSubmitTransaction. Seen/accepted rows stay duplicates.
 				if existing.Status == models.StatusRejected {
 					retryRejected++
-				} else {
-					receivedTxIDs = append(receivedTxIDs, p.txid)
 				}
 				toPublish = append(toPublish, p)
 				republished[p.txid] = existing.Status
@@ -1429,6 +1439,12 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 					s.txTracker.Add(p.txid, existing.Status)
 				}
 				s.recordSubmission(ctx, p.txid, opts)
+			case !inserted:
+				// Neither inserted nor an existing row: the row state is
+				// unknown, so queue best-effort (as for a CAS error) but
+				// leave RECEIVED to whichever attempt created the row.
+				newSubmits++
+				toPublish = append(toPublish, p)
 			default:
 				newSubmits++
 				toPublish = append(toPublish, p)
