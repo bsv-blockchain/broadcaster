@@ -3,6 +3,7 @@ package chaintracks_server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -23,8 +24,11 @@ type fakeChaintracks struct {
 	height  uint32
 	tip     *chaintracks.BlockHeader
 	headers map[uint32]*chaintracks.BlockHeader
-	tipCh   chan *chaintracks.BlockHeader
-	reorgCh chan *chaintracks.ReorgEvent
+	// heightErr fails GetHeaderByHeight at those heights with the given
+	// error — a lookup failure, as opposed to a header that does not exist.
+	heightErr map[uint32]error
+	tipCh     chan *chaintracks.BlockHeader
+	reorgCh   chan *chaintracks.ReorgEvent
 }
 
 func newFakeChaintracks() *fakeChaintracks {
@@ -48,6 +52,9 @@ func (f *fakeChaintracks) GetTip(context.Context) *chaintracks.BlockHeader {
 }
 
 func (f *fakeChaintracks) GetHeaderByHeight(_ context.Context, h uint32) (*chaintracks.BlockHeader, error) {
+	if err, ok := f.heightErr[h]; ok {
+		return nil, err
+	}
 	if hdr, ok := f.headers[h]; ok {
 		return hdr, nil
 	}
@@ -211,4 +218,34 @@ func TestChaintracksRoutes_TipStream_ForwardsUpdates(t *testing.T) {
 	}
 
 	reqCancel()
+}
+
+// TestChaintracksRoutes_HeaderByHeight_404OnlyWhenNotFound: remote readers
+// (bump-builder's reconciler in microservice mode) read a 404 as "no header
+// at this height" — the end of an upward walk — so only a header that does
+// not exist may answer 404. Any other lookup failure must be a 5xx the
+// reader retries, not absence it acts on.
+func TestChaintracksRoutes_HeaderByHeight_404OnlyWhenNotFound(t *testing.T) {
+	f := newFakeChaintracks()
+	f.heightErr = map[uint32]error{7: errors.New("storage unavailable")}
+	r, _ := setupChaintracksRouter(t, f)
+
+	for _, tc := range []struct {
+		path string
+		want int
+	}{
+		{"/chaintracks/v2/header/height/6", http.StatusNotFound},
+		{"/chaintracks/v2/header/height/7", http.StatusInternalServerError},
+		{"/chaintracks/v2/header/height/6.bin", http.StatusNotFound},
+		{"/chaintracks/v2/header/height/7.bin", http.StatusInternalServerError},
+		{"/chaintracks/v1/findHeaderHexForHeight?height=6", http.StatusNotFound},
+		{"/chaintracks/v1/findHeaderHexForHeight?height=7", http.StatusInternalServerError},
+	} {
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, tc.path, nil)
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		if w.Code != tc.want {
+			t.Errorf("%s: status=%d, want %d", tc.path, w.Code, tc.want)
+		}
+	}
 }

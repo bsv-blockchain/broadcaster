@@ -14,6 +14,7 @@ package chaintracks_server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -293,7 +294,7 @@ func (r *Routes) handleGetHeaderByHeight(c *gin.Context) {
 
 	header, err := r.cm.GetHeaderByHeight(ctx, uint32(height))
 	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{jsonKeyError: "Header not found"})
+		c.JSON(headerLookupStatus(err), gin.H{jsonKeyError: headerLookupMessage(err)})
 		return
 	}
 	c.JSON(http.StatusOK, header)
@@ -310,7 +311,7 @@ func (r *Routes) handleGetHeaderByHash(c *gin.Context) {
 	ctx := c.Request.Context()
 	header, err := r.cm.GetHeaderByHash(ctx, hash)
 	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{jsonKeyError: "Header not found"})
+		c.JSON(headerLookupStatus(err), gin.H{jsonKeyError: headerLookupMessage(err)})
 		return
 	}
 	r.setHeightCache(ctx, c, header.Height)
@@ -375,7 +376,7 @@ func (r *Routes) handleGetHeaderByHeightBinary(c *gin.Context) {
 
 	header, err := r.cm.GetHeaderByHeight(ctx, uint32(height))
 	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{jsonKeyError: "Header not found"})
+		c.JSON(headerLookupStatus(err), gin.H{jsonKeyError: headerLookupMessage(err)})
 		return
 	}
 	c.Header("X-Block-Height", strconv.FormatUint(uint64(header.Height), 10))
@@ -392,7 +393,7 @@ func (r *Routes) handleGetHeaderByHashBinary(c *gin.Context) {
 	ctx := c.Request.Context()
 	header, err := r.cm.GetHeaderByHash(ctx, hash)
 	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{jsonKeyError: "Header not found"})
+		c.JSON(headerLookupStatus(err), gin.H{jsonKeyError: headerLookupMessage(err)})
 		return
 	}
 	r.setHeightCache(ctx, c, header.Height)
@@ -601,6 +602,10 @@ func (r *Routes) handleLegacyFindHeaderHexForHeight(c *gin.Context) {
 
 	header, err := r.cm.GetHeaderByHeight(ctx, uint32(height))
 	if err != nil {
+		if !errors.Is(err, chaintracks.ErrHeaderNotFound) {
+			c.JSON(http.StatusInternalServerError, legacyError("ERR_INTERNAL", "Header lookup failed at height "+heightStr))
+			return
+		}
 		c.JSON(http.StatusNotFound, legacyError("ERR_NOT_FOUND", "Header not found at height "+heightStr))
 		return
 	}
@@ -621,6 +626,10 @@ func (r *Routes) handleLegacyFindHeaderHexForBlockHash(c *gin.Context) {
 	ctx := c.Request.Context()
 	header, err := r.cm.GetHeaderByHash(ctx, hash)
 	if err != nil {
+		if !errors.Is(err, chaintracks.ErrHeaderNotFound) {
+			c.JSON(http.StatusInternalServerError, legacyError("ERR_INTERNAL", "Header lookup failed for hash "+hashStr))
+			return
+		}
 		c.JSON(http.StatusNotFound, legacyError("ERR_NOT_FOUND", "Header not found for hash "+hashStr))
 		return
 	}
@@ -657,4 +666,24 @@ func (r *Routes) handleLegacyGetHeaders(c *gin.Context) {
 		data = append(data, h.Bytes()...)
 	}
 	c.JSON(http.StatusOK, legacySuccess(fmt.Sprintf("%x", data)))
+}
+
+// headerLookupStatus answers 404 only for a header that positively does not
+// exist (chaintracks.ErrHeaderNotFound) and 500 for any other lookup failure.
+// Remote readers (bump-builder's reconciler and anchor guard in microservice
+// mode) treat a 404 as absence — the ordinary end of an upward walk — so a
+// real failure reported as 404 would make them act on a missing header
+// instead of retrying.
+func headerLookupStatus(err error) int {
+	if errors.Is(err, chaintracks.ErrHeaderNotFound) {
+		return http.StatusNotFound
+	}
+	return http.StatusInternalServerError
+}
+
+func headerLookupMessage(err error) string {
+	if errors.Is(err, chaintracks.ErrHeaderNotFound) {
+		return "Header not found"
+	}
+	return "Header lookup failed"
 }
