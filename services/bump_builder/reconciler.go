@@ -104,6 +104,12 @@ type Reconciler struct {
 	// the same trade-off the watchdog makes with its attempt state.
 	defers map[string]int
 
+	// rewatched records, per orphan, the generation (orphaned_at) whose txs
+	// have had their merkle-service watch refreshed — see rewatchOrphanTxs.
+	// In-memory like defers: a restart re-sends one idempotent /watch per
+	// anchored tx for each still-queued orphan, nothing worse.
+	rewatched map[string]time.Time
+
 	// startupScanDone flips true only after a startup full-scan that ran while
 	// the chain-header source was synced to the store's active tip. Until then
 	// the tick loop keeps re-attempting it (lease-gated) so the deep backstop
@@ -176,6 +182,7 @@ func NewReconciler(
 		leaser:        leaser,
 		holderID:      fmt.Sprintf("%s-%d", host, os.Getpid()),
 		defers:        make(map[string]int),
+		rewatched:     make(map[string]time.Time),
 		pendingRemine: make(map[string]uint64),
 		now:           time.Now,
 		done:          make(chan struct{}),
@@ -837,7 +844,7 @@ func (r *Reconciler) fullScanResurrect(ctx context.Context, set map[string]*mode
 			logger.Info("startup full-scan: row changed since it was judged; not reactivated")
 			continue
 		}
-		delete(r.defers, hash)
+		r.forgetOrphan(hash)
 		metrics.BlockStatusTransitionsTotal.
 			WithLabelValues(metrics.BlockTransitionReactivated, metrics.BlockTransitionSourceFullScan).
 			Inc()
@@ -1037,6 +1044,12 @@ func (r *Reconciler) reconcileBlock(ctx context.Context, row *models.BlockProces
 		return r.resurrect(ctx, logger, orphan, height, orphanedAt, batchSize)
 	}
 
+	// Keep merkle-service watching O's txs before anything below can defer
+	// or park: parking relies on a LATER block's STUMPs re-anchoring them,
+	// and merkle-service stops reporting a tx postMineTTL (30 min) after it
+	// first saw it mined — O's own mine (mainnet 973522, 2026-10-31).
+	r.rewatchOrphanTxs(ctx, logger, orphan, orphanedAt)
+
 	// The canonical block at O's height: re-mine its FULL BUMP set first.
 	// This simultaneously (a) re-anchors O's txs that are in it, (b) mines
 	// txs the anchor guard correctly refused while the canonical block was
@@ -1155,7 +1168,7 @@ func (r *Reconciler) reconcileBlock(ctx context.Context, row *models.BlockProces
 		logger.Warn("failed to stamp reconciled_at", zap.Error(err))
 		return outcomeError
 	}
-	delete(r.defers, orphan)
+	r.forgetOrphan(orphan)
 	// Observe the tx work BEFORE the stale check: those writes landed
 	// regardless of whether this pass got to stamp the row.
 	metrics.ReconcilerTxsReanchoredTotal.Add(float64(reanchored))
@@ -1258,7 +1271,7 @@ func (r *Reconciler) resurrect(ctx context.Context, logger *zap.Logger, orphan s
 	if !applied {
 		return r.staleOutcome(logger, height)
 	}
-	delete(r.defers, orphan)
+	r.forgetOrphan(orphan)
 	metrics.BlockStatusTransitionsTotal.
 		WithLabelValues(metrics.BlockTransitionReactivated, metrics.BlockTransitionSourceReconciler).
 		Inc()
@@ -1542,7 +1555,7 @@ func (r *Reconciler) drainPendingRemines(ctx context.Context) {
 			} else {
 				logger.Warn("pending re-mine: the block has no stored BUMP any more; nothing left to re-mine from")
 			}
-			delete(r.defers, hash)
+			r.forgetOrphan(hash)
 			delete(r.pendingRemine, hash)
 		case errors.Is(err, errMalformedBUMP):
 			// A corrupt BUMP on a canonical, active row: ask for the rebuild
@@ -1556,7 +1569,7 @@ func (r *Reconciler) drainPendingRemines(ctx context.Context) {
 			}
 			logger.Error("pending re-mine: stored BUMP still malformed at the rebuild-request cap; "+
 				"leaving the block to the BLOCK_PROCESSED redelivery", zap.Error(err))
-			delete(r.defers, hash)
+			r.forgetOrphan(hash)
 			delete(r.pendingRemine, hash)
 		default:
 			logger.Warn("pending re-mine: re-mine failed again", zap.Int("txs_reanchored", n), zap.Error(err))
@@ -1594,7 +1607,7 @@ func (r *Reconciler) parkBlock(ctx context.Context, logger *zap.Logger, orphan s
 		logger.Warn("failed to stamp reconciled_at on parked block", zap.Error(err))
 		return outcomeError
 	}
-	delete(r.defers, orphan)
+	r.forgetOrphan(orphan)
 	// As above: the re-anchors and the park already happened.
 	metrics.ReconcilerTxsReanchoredTotal.Add(float64(reanchored))
 	metrics.ReconcilerTxsParkedTotal.Add(float64(parked))
@@ -1611,6 +1624,84 @@ func (r *Reconciler) parkBlock(ctx context.Context, logger *zap.Logger, orphan s
 		zap.Int("txs_parked", parked),
 	)
 	return outcomeParked
+}
+
+// rewatchOrphanTxs re-registers every tx still anchored to an orphan with
+// merkle-service, once per orphan generation.
+//
+// When merkle-service finds a registered tx in a block it emits the STUMP and
+// then touches the registration with block.postMineTTLSec (1800 s deployed),
+// so it stops reporting the tx 30 minutes after that first mine. A reorg
+// that orphans the block does not reach merkle-service, and nothing else on
+// the broadcaster re-registers a tx it already holds as MINED. A tx re-mined
+// in a later block after the TTL ran out therefore produces no STUMP: the
+// later block's compound BUMP is built without it, the neighborhood walk
+// cannot claim it, and the park leaves it MINED against the orphan for good.
+// That is what stranded ~8,750 txs at mainnet 973522 (orphaned 22:09,
+// re-mined in 973524 at 22:31:40, 80 s after their registrations lapsed). A
+// fresh /watch rewrites the registration without that TTL, so the block that
+// re-mines the tx reports it through the normal STUMP → mine path, which
+// moves it off the orphan (MINED@O → MINED@N is lattice-legal).
+//
+// Best-effort: a failure never holds the pass up, and the generation is only
+// recorded once every registration landed, so a failed one is retried on the
+// next tick. Disabled with the rest of the merkle integration.
+func (r *Reconciler) rewatchOrphanTxs(ctx context.Context, logger *zap.Logger, orphan string, orphanedAt time.Time) {
+	if r.merkle == nil || r.cfg.CallbackURL == "" {
+		return
+	}
+	if gen, ok := r.rewatched[orphan]; ok && gen.Equal(orphanedAt) {
+		return
+	}
+	txids, err := r.store.GetTxIDsByBlockHash(ctx, orphan)
+	if err != nil {
+		logger.Warn("failed to read the orphan's txids to refresh their merkle-service watch; retrying next tick",
+			zap.Error(err))
+		return
+	}
+	if len(txids) == 0 {
+		r.rewatched[orphan] = orphanedAt
+		return
+	}
+	regs := make([]merkleservice.Registration, len(txids))
+	for i, txid := range txids {
+		regs[i] = merkleservice.Registration{
+			TxID:          txid,
+			CallbackURL:   r.cfg.CallbackURL,
+			CallbackToken: r.cfg.CallbackToken,
+		}
+	}
+	concurrency := r.cfg.Propagation.MerkleConcurrency
+	if concurrency <= 0 {
+		concurrency = 10
+	}
+	failed := 0
+	var firstErr error
+	for _, regErr := range r.merkle.RegisterBatchWithResults(ctx, regs, concurrency) {
+		if regErr == nil {
+			continue
+		}
+		if firstErr == nil {
+			firstErr = regErr
+		}
+		failed++
+	}
+	metrics.ReconcilerTxsRewatchedTotal.WithLabelValues("ok").Add(float64(len(txids) - failed))
+	if failed > 0 {
+		metrics.ReconcilerTxsRewatchedTotal.WithLabelValues("failed").Add(float64(failed))
+		logger.Warn("failed to refresh the merkle-service watch for some of the orphan's txs; retrying next tick",
+			zap.Int("txs", len(txids)), zap.Int("failed", failed), zap.Error(firstErr))
+		return
+	}
+	logger.Info("refreshed the merkle-service watch for the orphan's txs", zap.Int("txs", len(txids)))
+	r.rewatched[orphan] = orphanedAt
+}
+
+// forgetOrphan drops the per-orphan in-memory bookkeeping once a block has
+// left the reconcile queue (stamped, reactivated, or healed).
+func (r *Reconciler) forgetOrphan(hash string) {
+	delete(r.defers, hash)
+	delete(r.rewatched, hash)
 }
 
 // staleOutcome is returned when the reconciled_at CAS found a different

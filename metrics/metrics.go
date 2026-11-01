@@ -655,6 +655,16 @@ var ReconcilerTxsParkedTotal = promauto.NewCounter(prometheus.CounterOpts{
 	Help: "Transactions left MINED against an orphan because no canonical BUMP was available (not reverted).",
 })
 
+// ReconcilerTxsRewatchedTotal counts transactions anchored to an orphaned
+// block whose merkle-service watch the reconciler refreshed, by outcome
+// (ok|failed). The refresh keeps merkle-service reporting a tx past its
+// post-mine TTL so a later block that re-mines it re-anchors it; a climbing
+// "failed" series means orphans are parking without that cover.
+var ReconcilerTxsRewatchedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "bsv_broadcaster_reconciler_txs_rewatched_total",
+	Help: "Orphan-anchored transactions re-registered with merkle-service by the reconciler, by outcome.",
+}, []string{"outcome"})
+
 // ReconcilerRemineRequeuedTotal counts canonical block rows the reconciler
 // re-orphaned in order to retry a re-mine that failed — part-way, before it
 // could read the block's BUMP, or on a BUMP that does not parse — AFTER the
