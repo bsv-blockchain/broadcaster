@@ -121,7 +121,7 @@ func newTestReconciler(st store.Store, pub *capturePublisher, stub *stubChaintra
 		publisher:     pub,
 		chainHeader:   stub,
 		defers:        make(map[string]int),
-		rewatched:     make(map[string]time.Time),
+		rewatch:       make(map[string]*orphanRewatch),
 		pendingRemine: make(map[string]uint64),
 		now:           time.Now,
 		done:          make(chan struct{}),

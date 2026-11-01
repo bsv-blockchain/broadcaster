@@ -12,6 +12,7 @@ import (
 	"github.com/bsv-blockchain/broadcaster/config"
 	"github.com/bsv-blockchain/broadcaster/merkleservice"
 	"github.com/bsv-blockchain/broadcaster/models"
+	"github.com/bsv-blockchain/broadcaster/store"
 )
 
 // merkleTTLStub models the merkle-service registration lifetime that the
@@ -29,6 +30,8 @@ type merkleTTLStub struct {
 	expiresAt map[string]time.Time
 	watches   map[string]int
 	fail      bool
+	failTx    map[string]bool // /watch refused for these txids only
+	reprocess []string
 	srv       *httptest.Server
 }
 
@@ -40,12 +43,9 @@ func newMerkleTTLStub(t *testing.T) *merkleTTLStub {
 		watches:     make(map[string]int),
 	}
 	s.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		if req.URL.Path != "/watch" {
-			w.WriteHeader(http.StatusAccepted) // /reprocess: accepted, nothing to redeliver
-			return
-		}
 		var body struct {
-			TxID string `json:"txid"`
+			TxID      string `json:"txid"`
+			BlockHash string `json:"blockHash"`
 		}
 		if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
 			w.WriteHeader(http.StatusBadRequest)
@@ -53,7 +53,12 @@ func newMerkleTTLStub(t *testing.T) *merkleTTLStub {
 		}
 		s.mu.Lock()
 		defer s.mu.Unlock()
-		if s.fail {
+		if req.URL.Path == "/reprocess" {
+			s.reprocess = append(s.reprocess, body.BlockHash)
+			w.WriteHeader(http.StatusAccepted) // accepted, nothing to redeliver
+			return
+		}
+		if s.fail || s.failTx[body.TxID] {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			return
 		}
@@ -97,6 +102,21 @@ func (s *merkleTTLStub) watchCount(txid string) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.watches[txid]
+}
+
+func (s *merkleTTLStub) setFailTx(txid string, fail bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.failTx == nil {
+		s.failTx = make(map[string]bool)
+	}
+	s.failTx[txid] = fail
+}
+
+func (s *merkleTTLStub) reprocessed() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.reprocess...)
 }
 
 func (s *merkleTTLStub) setFail(fail bool) {
@@ -222,30 +242,21 @@ func TestReconciler_OrphanRewatchOncePerGenerationRetriesOnFailure(t *testing.T)
 	}
 }
 
-// TestReconciler_NoParkUntilOrphanRewatched: merkle-service unreachable for
-// the whole defer window must not let the cap park the block — a park with
-// the watches lapsed strands its txs exactly as at 973522, because nothing
-// re-registers them once the block is off the queue. The block stays queued
-// until the re-watch lands, then parks as usual.
+// TestReconciler_NoParkUntilOrphanRewatched: merkle-service unreachable
+// through the defer window must not let the cap park the block straight
+// away — a park with the watches lapsed strands its txs exactly as at
+// 973522, because nothing re-registers them once the block is off the
+// queue. The block is held while the re-watch retries, then parks as usual
+// once it lands.
 func TestReconciler_NoParkUntilOrphanRewatched(t *testing.T) {
 	ctx := context.Background()
-	st := newPebbleForTest(t)
-	pub := &capturePublisher{}
-	chain := &stubChaintracks{}
-	merkle := newMerkleTTLStub(t)
-	chain.setHeightHeader(10, headerWithHash(t, recCanonical, 10))
-
-	seedMined(t, st, recOrphan, 10, recShared1)
-	_ = st.UpsertBlockHeaderSeen(ctx, recOrphan, 10, time.Now())
-	_, _ = st.MarkBlocksOrphaned(ctx, []string{recOrphan}, time.Now())
-
-	r := newTestReconciler(st, pub, chain, func(c *config.ReconcilerConfig) { c.MaxDeferAttempts = 1 })
-	withMerkleTTLStub(r, merkle)
+	st, merkle, r := newRewatchFixture(t, 2, recShared1)
 
 	merkle.setFail(true)
-	r.tick(ctx) // defer 1/1
-	r.tick(ctx) // cap reached, re-watch still failing → must NOT park
-	r.tick(ctx)
+	r.tick(ctx) // defer 1/2
+	r.tick(ctx) // defer 2/2
+	r.tick(ctx) // cap reached, re-watch still failing → held (1/2)
+	r.tick(ctx) // held (2/2)
 	if rows, _ := st.ListOrphanedBlocksToReconcile(ctx, 10); len(rows) != 1 {
 		t.Fatalf("an orphan whose txs were never re-watched must stay queued, got %d rows", len(rows))
 	}
@@ -261,4 +272,95 @@ func TestReconciler_NoParkUntilOrphanRewatched(t *testing.T) {
 	if got := statusOf(t, st, recShared1); got.Status != models.StatusMined || got.BlockHash != recOrphan {
 		t.Fatalf("parked tx stays MINED@orphan, got %s@%s", got.Status, got.BlockHash)
 	}
+}
+
+// TestReconciler_RewatchHoldIsBounded: a merkle-service that never accepts
+// the re-watch (an outage, a rotated token) must not pin the orphan in the
+// queue forever — the queue is oldest-first, so a few pinned rows would
+// starve every newer orphan. Past the defer cap's worth of holds the block
+// is retired anyway.
+func TestReconciler_RewatchHoldIsBounded(t *testing.T) {
+	ctx := context.Background()
+	st, merkle, r := newRewatchFixture(t, 2, recShared1)
+
+	merkle.setFail(true)
+	for range 5 { // 2 defers + 2 holds, then retired
+		r.tick(ctx)
+	}
+	if rows, _ := st.ListOrphanedBlocksToReconcile(ctx, 10); len(rows) != 0 {
+		t.Fatalf("a re-watch that never lands must not hold the orphan past the cap, got %d rows", len(rows))
+	}
+}
+
+// TestReconciler_NoCanonicalReprocessUntilRewatched: the defer path's
+// /reprocess of the canonical block must wait for the re-watch, or
+// merkle-service rebuilds the canonical BUMP without the orphan's unwatched
+// txs — which the next pass then reads as proof they are in no canonical
+// block and reverts.
+func TestReconciler_NoCanonicalReprocessUntilRewatched(t *testing.T) {
+	ctx := context.Background()
+	_, merkle, r := newRewatchFixture(t, 5, recShared1)
+
+	merkle.setFail(true)
+	r.tick(ctx)
+	if got := merkle.reprocessed(); len(got) != 0 {
+		t.Fatalf("no canonical /reprocess while the orphan's txs are unwatched, got %v", got)
+	}
+	if r.defers[recOrphan] != 1 {
+		t.Fatalf("the skipped poke must still count as a defer attempt, defers=%d", r.defers[recOrphan])
+	}
+
+	merkle.setFail(false)
+	r.tick(ctx)
+	if got := merkle.reprocessed(); len(got) != 1 || got[0] != recCanonical {
+		t.Fatalf("once re-watched the canonical block must be reprocessed, got %v", got)
+	}
+}
+
+// TestReconciler_RewatchRetriesOnlyFailedTxs: a partial failure retries the
+// txids that failed, not the whole orphan — and each tx counts once.
+func TestReconciler_RewatchRetriesOnlyFailedTxs(t *testing.T) {
+	ctx := context.Background()
+	_, merkle, r := newRewatchFixture(t, 5, recShared1, recAOnly)
+
+	merkle.setFailTx(recAOnly, true)
+	r.tick(ctx)
+	merkle.setFailTx(recAOnly, false)
+	r.tick(ctx)
+	r.tick(ctx)
+	for _, id := range []string{recShared1, recAOnly} {
+		if n := merkle.watchCount(id); n != 1 {
+			t.Fatalf("tx %s: want exactly one successful /watch, got %d", id, n)
+		}
+	}
+	if !r.orphanWatched(recOrphan, *mustOrphanedAt(t, r)) {
+		t.Fatal("the orphan must count as re-watched once the failed tx landed")
+	}
+}
+
+// newRewatchFixture is an orphan at height 10 holding txids, whose canonical
+// competitor has no stored BUMP (the defer path), with a reconciler wired to
+// a merkleTTLStub.
+func newRewatchFixture(t *testing.T, maxDefer int, txids ...string) (store.Store, *merkleTTLStub, *Reconciler) {
+	t.Helper()
+	ctx := context.Background()
+	st := newPebbleForTest(t)
+	chain := &stubChaintracks{}
+	merkle := newMerkleTTLStub(t)
+	chain.setHeightHeader(10, headerWithHash(t, recCanonical, 10))
+	seedMined(t, st, recOrphan, 10, txids...)
+	_ = st.UpsertBlockHeaderSeen(ctx, recOrphan, 10, time.Now())
+	_, _ = st.MarkBlocksOrphaned(ctx, []string{recOrphan}, time.Now())
+	r := newTestReconciler(st, &capturePublisher{}, chain, func(c *config.ReconcilerConfig) { c.MaxDeferAttempts = maxDefer })
+	withMerkleTTLStub(r, merkle)
+	return st, merkle, r
+}
+
+func mustOrphanedAt(t *testing.T, r *Reconciler) *time.Time {
+	t.Helper()
+	bp, err := r.store.GetBlockProcessingStatus(context.Background(), recOrphan)
+	if err != nil || bp.OrphanedAt == nil {
+		t.Fatalf("orphan row: %+v err=%v", bp, err)
+	}
+	return bp.OrphanedAt
 }
