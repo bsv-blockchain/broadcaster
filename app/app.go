@@ -13,8 +13,10 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"path"
+	"strings"
 	"sync"
 	"time"
 
@@ -779,8 +781,26 @@ func (a chaintracksHeaderReader) GetHeaderByHash(ctx context.Context, hash *chai
 	return a.ct.GetHeaderByHash(ctx, hash)
 }
 
+// GetHeaderByHeight maps a remote chaintracks 404 to ErrHeaderNotFound, the
+// absence sentinel ChainHeaderReader promises. The embedded ChainManager
+// already returns the sentinel above its tip; the go-chaintracks HTTP client
+// (microservice mode) reports the same answer as "server request failed:
+// status 404", which the reconciler's neighborhood walk read as a failed
+// lookup and retried every tick until the tip outgrew the walk (mainnet
+// 973522, 2026-10-31). Any other failed request stays a failure.
 func (a chaintracksHeaderReader) GetHeaderByHeight(ctx context.Context, height uint32) (*chaintrackslib.BlockHeader, error) {
-	return a.ct.GetHeaderByHeight(ctx, height)
+	h, err := a.ct.GetHeaderByHeight(ctx, height)
+	if isRemoteHeaderNotFound(err) {
+		return nil, fmt.Errorf("%w: %w", chaintrackslib.ErrHeaderNotFound, err)
+	}
+	return h, err
+}
+
+// isRemoteHeaderNotFound recognizes the go-chaintracks client's 404, which it
+// only exposes as ErrServerRequestFailed wrapped with "status <code>".
+func isRemoteHeaderNotFound(err error) bool {
+	return errors.Is(err, chaintrackslib.ErrServerRequestFailed) &&
+		strings.HasSuffix(err.Error(), fmt.Sprintf("status %d", http.StatusNotFound))
 }
 
 // endpointSourceValidationTTL is how long a discovered URL that passed
