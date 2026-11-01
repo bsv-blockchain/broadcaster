@@ -1044,12 +1044,6 @@ func (r *Reconciler) reconcileBlock(ctx context.Context, row *models.BlockProces
 		return r.resurrect(ctx, logger, orphan, height, orphanedAt, batchSize)
 	}
 
-	// Keep merkle-service watching O's txs before anything below can defer
-	// or park: parking relies on a LATER block's STUMPs re-anchoring them,
-	// and merkle-service stops reporting a tx postMineTTL (30 min) after it
-	// first saw it mined — O's own mine (mainnet 973522, 2026-10-31).
-	r.rewatchOrphanTxs(ctx, logger, orphan, orphanedAt)
-
 	// The canonical block at O's height: re-mine its FULL BUMP set first.
 	// This simultaneously (a) re-anchors O's txs that are in it, (b) mines
 	// txs the anchor guard correctly refused while the canonical block was
@@ -1089,6 +1083,14 @@ func (r *Reconciler) reconcileBlock(ctx context.Context, row *models.BlockProces
 			canonicalReady = bumpOK
 		}
 	}
+	// Keep merkle-service watching the txs still anchored to O (the canonical
+	// re-mine above has moved the ones its BUMP proves) before this pass can
+	// defer, park or revert: either end state relies on a LATER block's
+	// STUMPs re-anchoring them, and merkle-service stops reporting a tx
+	// postMineTTL (30 min) after it first saw it mined — O's own mine
+	// (mainnet 973522, 2026-10-31).
+	r.rewatchOrphanTxs(ctx, logger, orphan, orphanedAt)
+
 	if !canonicalReady && canonicalHash != "" {
 		if r.deferForCanonicalBUMP(ctx, logger, orphan, canonicalHash) {
 			metrics.ReconcilerTxsReanchoredTotal.Add(float64(reanchored))
@@ -1117,6 +1119,17 @@ func (r *Reconciler) reconcileBlock(ctx context.Context, row *models.BlockProces
 		metrics.ReconcilerTxsReanchoredTotal.Add(float64(reanchored))
 		logger.Warn("neighborhood re-anchor failed; leaving the block queued for retry",
 			zap.Int("txs_reanchored", reanchored), zap.Error(neighborErr))
+		return outcomeError
+	}
+
+	// Neither terminal step may run before the re-watch has landed: both
+	// retire the block, after which nothing re-registers its txs, and a park
+	// with the watches lapsed is the 973522 incident over again. Stay queued
+	// — the next tick retries the re-watch.
+	if !r.orphanWatched(orphan, orphanedAt) {
+		metrics.ReconcilerTxsReanchoredTotal.Add(float64(reanchored))
+		logger.Warn("merkle-service watch for the orphan's txs not refreshed yet; leaving the block queued for retry",
+			logfields.BlockHeight(height), zap.Int("txs_reanchored", reanchored))
 		return outcomeError
 	}
 
@@ -1643,14 +1656,12 @@ func (r *Reconciler) parkBlock(ctx context.Context, logger *zap.Logger, orphan s
 // re-mines the tx reports it through the normal STUMP → mine path, which
 // moves it off the orphan (MINED@O → MINED@N is lattice-legal).
 //
-// Best-effort: a failure never holds the pass up, and the generation is only
+// A failure does not hold up the defer ticks, and the generation is only
 // recorded once every registration landed, so a failed one is retried on the
-// next tick. Disabled with the rest of the merkle integration.
+// next tick; reconcileBlock keeps the block queued (no park, no revert) until
+// it has landed. Disabled with the rest of the merkle integration.
 func (r *Reconciler) rewatchOrphanTxs(ctx context.Context, logger *zap.Logger, orphan string, orphanedAt time.Time) {
-	if r.merkle == nil || r.cfg.CallbackURL == "" {
-		return
-	}
-	if gen, ok := r.rewatched[orphan]; ok && gen.Equal(orphanedAt) {
+	if r.merkle == nil || r.cfg.CallbackURL == "" || r.orphanWatched(orphan, orphanedAt) {
 		return
 	}
 	txids, err := r.store.GetTxIDsByBlockHash(ctx, orphan)
@@ -1695,6 +1706,16 @@ func (r *Reconciler) rewatchOrphanTxs(ctx context.Context, logger *zap.Logger, o
 	}
 	logger.Info("refreshed the merkle-service watch for the orphan's txs", zap.Int("txs", len(txids)))
 	r.rewatched[orphan] = orphanedAt
+}
+
+// orphanWatched reports whether rewatchOrphanTxs has landed for this orphan
+// generation — trivially true when the merkle integration is disabled.
+func (r *Reconciler) orphanWatched(orphan string, orphanedAt time.Time) bool {
+	if r.merkle == nil || r.cfg.CallbackURL == "" {
+		return true
+	}
+	gen, ok := r.rewatched[orphan]
+	return ok && gen.Equal(orphanedAt)
 }
 
 // forgetOrphan drops the per-orphan in-memory bookkeeping once a block has

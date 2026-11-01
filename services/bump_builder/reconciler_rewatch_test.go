@@ -221,3 +221,44 @@ func TestReconciler_OrphanRewatchOncePerGenerationRetriesOnFailure(t *testing.T)
 		}
 	}
 }
+
+// TestReconciler_NoParkUntilOrphanRewatched: merkle-service unreachable for
+// the whole defer window must not let the cap park the block — a park with
+// the watches lapsed strands its txs exactly as at 973522, because nothing
+// re-registers them once the block is off the queue. The block stays queued
+// until the re-watch lands, then parks as usual.
+func TestReconciler_NoParkUntilOrphanRewatched(t *testing.T) {
+	ctx := context.Background()
+	st := newPebbleForTest(t)
+	pub := &capturePublisher{}
+	chain := &stubChaintracks{}
+	merkle := newMerkleTTLStub(t)
+	chain.setHeightHeader(10, headerWithHash(t, recCanonical, 10))
+
+	seedMined(t, st, recOrphan, 10, recShared1)
+	_ = st.UpsertBlockHeaderSeen(ctx, recOrphan, 10, time.Now())
+	_, _ = st.MarkBlocksOrphaned(ctx, []string{recOrphan}, time.Now())
+
+	r := newTestReconciler(st, pub, chain, func(c *config.ReconcilerConfig) { c.MaxDeferAttempts = 1 })
+	withMerkleTTLStub(r, merkle)
+
+	merkle.setFail(true)
+	r.tick(ctx) // defer 1/1
+	r.tick(ctx) // cap reached, re-watch still failing → must NOT park
+	r.tick(ctx)
+	if rows, _ := st.ListOrphanedBlocksToReconcile(ctx, 10); len(rows) != 1 {
+		t.Fatalf("an orphan whose txs were never re-watched must stay queued, got %d rows", len(rows))
+	}
+
+	merkle.setFail(false)
+	r.tick(ctx) // re-watch lands → park
+	if rows, _ := st.ListOrphanedBlocksToReconcile(ctx, 10); len(rows) != 0 {
+		t.Fatalf("once re-watched the orphan must park and leave the queue, got %d rows", len(rows))
+	}
+	if n := merkle.watchCount(recShared1); n != 1 {
+		t.Fatalf("want one re-watch before the park, got %d", n)
+	}
+	if got := statusOf(t, st, recShared1); got.Status != models.StatusMined || got.BlockHash != recOrphan {
+		t.Fatalf("parked tx stays MINED@orphan, got %s@%s", got.Status, got.BlockHash)
+	}
+}
