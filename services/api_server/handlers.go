@@ -1335,9 +1335,10 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 	// A dedup error logs but doesn't drop the tx — matches single-tx
 	// best-effort behavior.
 	toPublish := make([]parsedItem, 0, len(parsed))
-	// republished collects CAS losers re-entering toPublish; their stored
-	// keys win over this request's choice (adoptStoredFamilyKeys).
-	var republished []string
+	// republished collects CAS losers re-entering toPublish, with the status
+	// that selected them; their stored keys win over this request's choice
+	// (adoptStoredFamilyKeys).
+	republished := make(map[string]models.Status)
 	duplicates := 0
 	newSubmits, retryRejected := 0, 0
 	if s.store != nil {
@@ -1366,7 +1367,7 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 					retryRejected++
 				}
 				toPublish = append(toPublish, p)
-				republished = append(republished, p.txid)
+				republished[p.txid] = existing.Status
 			case !inserted && existing != nil:
 				duplicates++
 				// Idempotent re-submit at a non-REJECTED status: register

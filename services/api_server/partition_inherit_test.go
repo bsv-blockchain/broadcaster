@@ -230,7 +230,7 @@ func TestAdoptStoredFamilyKeys(t *testing.T) {
 	}}
 	keyByTxid := map[string]string{"c1": "c1", "c2": "c1", "d1": "d1", "e1": "e1"}
 	famByTxid := map[string]string{"c1": "c1", "c2": "c1", "d1": "d1", "e1": "e1"}
-	keyingServer(st, 8).adoptStoredFamilyKeys(context.Background(), keyByTxid, famByTxid, []string{"d1", "c1"})
+	keyingServer(st, 8).adoptStoredFamilyKeys(context.Background(), keyByTxid, famByTxid, selectedAt(st, "d1", "c1"))
 	want := map[string]string{"c1": "kP", "c2": "kP", "d1": "d1", "e1": "e1"}
 	for txid, k := range want {
 		if keyByTxid[txid] != k {
@@ -239,7 +239,7 @@ func TestAdoptStoredFamilyKeys(t *testing.T) {
 	}
 
 	st.asked = nil
-	keyingServer(st, 0).adoptStoredFamilyKeys(context.Background(), keyByTxid, famByTxid, []string{"c1"})
+	keyingServer(st, 0).adoptStoredFamilyKeys(context.Background(), keyByTxid, famByTxid, selectedAt(st, "c1"))
 	if len(st.asked) != 0 {
 		t.Errorf("disabled lookup still asked the store: %v", st.asked)
 	}
@@ -255,7 +255,7 @@ func TestAdoptStoredFamilyKeys_SharedRoutingKey(t *testing.T) {
 	}}
 	keyByTxid := map[string]string{"a": "kR", "a2": "kR", "b": "kR", "b2": "kR"}
 	famByTxid := map[string]string{"a": "a", "a2": "a", "b": "b", "b2": "b"}
-	keyingServer(st, 8).adoptStoredFamilyKeys(context.Background(), keyByTxid, famByTxid, []string{"a", "b"})
+	keyingServer(st, 8).adoptStoredFamilyKeys(context.Background(), keyByTxid, famByTxid, selectedAt(st, "a", "b"))
 	want := map[string]string{"a": "kA", "a2": "kA", "b": "kR", "b2": "kR"}
 	for txid, k := range want {
 		if keyByTxid[txid] != k {
@@ -308,7 +308,7 @@ func TestAdoptStoredFamilyKeys_AgreeingPendingMemberLocksFamily(t *testing.T) {
 	}}
 	keyByTxid := map[string]string{"a": "kP", "b": "kP"}
 	famByTxid := map[string]string{"a": "a", "b": "a"}
-	keyingServer(st, 8).adoptStoredFamilyKeys(context.Background(), keyByTxid, famByTxid, []string{"b", "a"})
+	keyingServer(st, 8).adoptStoredFamilyKeys(context.Background(), keyByTxid, famByTxid, selectedAt(st, "b", "a"))
 	if keyByTxid["a"] != "kP" || keyByTxid["b"] != "kP" {
 		t.Fatalf("keys = %v, want the family locked on a's kP", keyByTxid)
 	}
@@ -345,10 +345,60 @@ func TestBatchPartitionKeyLookupsAreChunked(t *testing.T) {
 	for id := range keyByTxid {
 		ids = append(ids, id)
 	}
-	keyingServer(st, 8).adoptStoredFamilyKeys(context.Background(), keyByTxid, maps.Clone(keyByTxid), ids)
+	keyingServer(st, 8).adoptStoredFamilyKeys(context.Background(), keyByTxid, maps.Clone(keyByTxid), selectedAt(st, ids...))
 	for i, got := range st.asked {
 		if len(got) > partitionKeyLookupChunk {
 			t.Fatalf("adopt lookup %d carried %d txids, cap %d", i, len(got), partitionKeyLookupChunk)
 		}
+	}
+}
+
+// selectedAt maps ids to the status the CAS would have selected them at: the
+// stored row's, or RECEIVED for a row the store does not hold.
+func selectedAt(st *keyLookupStore, ids ...string) map[string]models.Status {
+	out := make(map[string]models.Status, len(ids))
+	for _, id := range ids {
+		r, ok := st.rows[id]
+		if !ok {
+			r.Status = models.StatusReceived
+		}
+		out[id] = r.Status
+	}
+	return out
+}
+
+// TestAdoptStoredFamilyKeys_SelectedStatusBinds: c1 lost the CAS at RECEIVED
+// and has since advanced to a status that would not bind on its own; its
+// stored key still binds because the CAS selected it for republication.
+func TestAdoptStoredFamilyKeys_SelectedStatusBinds(t *testing.T) {
+	for _, now := range []models.Status{models.StatusAcceptedByNetwork, models.StatusPendingRetry, models.StatusMined} {
+		st := &keyLookupStore{rows: map[string]store.ParentKey{
+			"c1": {Status: now, PartitionKey: "kW"},
+		}}
+		keyByTxid := map[string]string{"c1": "kP", "c2": "kP"}
+		famByTxid := map[string]string{"c1": "c1", "c2": "c1"}
+		keyingServer(st, 8).adoptStoredFamilyKeys(context.Background(), keyByTxid, famByTxid,
+			map[string]models.Status{"c1": models.StatusReceived})
+		if keyByTxid["c1"] != "kW" || keyByTxid["c2"] != "kW" {
+			t.Errorf("%s: keys = %v, want the family on c1's stored kW", now, keyByTxid)
+		}
+	}
+}
+
+// TestAdoptStoredFamilyKeys_LookupStatusStillBinds: both members were selected
+// at REJECTED; b has since been picked up again and is RECEIVED, with a
+// message pending under kP. The lookup's stronger status must still rank b
+// above a's stale key, though a sorts first.
+func TestAdoptStoredFamilyKeys_LookupStatusStillBinds(t *testing.T) {
+	st := &keyLookupStore{rows: map[string]store.ParentKey{
+		"a": {Status: models.StatusRejected, PartitionKey: "kStale"},
+		"b": {Status: models.StatusReceived, PartitionKey: "kP"},
+	}}
+	keyByTxid := map[string]string{"a": "a", "b": "a"}
+	famByTxid := map[string]string{"a": "a", "b": "a"}
+	keyingServer(st, 8).adoptStoredFamilyKeys(context.Background(), keyByTxid, famByTxid,
+		map[string]models.Status{"a": models.StatusRejected, "b": models.StatusRejected})
+	if keyByTxid["a"] != "kP" || keyByTxid["b"] != "kP" {
+		t.Fatalf("keys = %v, want the family on b's pending kP", keyByTxid)
 	}
 }

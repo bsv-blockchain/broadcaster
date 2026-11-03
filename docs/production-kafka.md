@@ -65,7 +65,7 @@ flight joins that parent's partition the same way.
 A resubmission keeps the key its row was stored with, so it rejoins its earlier
 message even if a parent has been accepted in between: a single `POST /tx`
 retry, the loser of two identical concurrent submissions (it republishes under
-the winner's stored key), and a `POST /txs` retry, whose whole family follows
+the winner's stored key, even if that row has advanced since the CAS), and a `POST /txs` retry, whose whole family follows
 any member still in flight or being republished. The one gap is two concurrent
 batches that straddle a parent's acceptance and share a family: a member the
 losing batch inserted keeps the key it chose, and a later child following it

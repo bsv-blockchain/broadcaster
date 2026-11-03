@@ -34,6 +34,9 @@ type keyedMemStore struct {
 	// beforeCAS runs once per txid ahead of its first GetOrInsertStatus, to
 	// model a concurrent request inserting between lookup and CAS.
 	beforeCAS map[string]func()
+	// afterCAS runs once per txid right after its first GetOrInsertStatus, to
+	// model the row advancing between the CAS and a later key read.
+	afterCAS map[string]func()
 	// lookups counts LookupPartitionKeys round-trips.
 	lookups int
 }
@@ -43,6 +46,7 @@ func newKeyedMemStore() *keyedMemStore {
 		mockStore: &mockStore{},
 		rows:      map[string]*models.TransactionStatus{},
 		beforeCAS: map[string]func(){},
+		afterCAS:  map[string]func(){},
 	}
 }
 
@@ -65,11 +69,15 @@ func (s *keyedMemStore) storedKey(t *testing.T, txid string) string {
 
 func (s *keyedMemStore) GetOrInsertStatus(_ context.Context, in *models.TransactionStatus) (*models.TransactionStatus, bool, error) {
 	s.mu.Lock()
-	hook := s.beforeCAS[in.TxID]
+	hook, after := s.beforeCAS[in.TxID], s.afterCAS[in.TxID]
 	delete(s.beforeCAS, in.TxID)
+	delete(s.afterCAS, in.TxID)
 	s.mu.Unlock()
 	if hook != nil {
 		hook()
+	}
+	if after != nil {
+		defer after()
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -353,5 +361,35 @@ func TestSubmitTransactions_AdoptionKeepsSeparateFamiliesApart(t *testing.T) {
 	}
 	if got := st.storedKey(t, bid); got != "kR" {
 		t.Errorf("B persisted key %q, want kR", got)
+	}
+}
+
+// TestSubmitTransactions_SelectedLoserKeepsStoredKeyAfterAdvancing: the batch
+// keys child c1 under its in-flight parent's kP. Before c1's CAS the parent is
+// accepted and a concurrent POST /tx inserts c1 under its own txid; the CAS
+// returns RECEIVED, selecting c1 for republication. c1 then advances before
+// adoption reads its key. The republish must still carry the winner's stored
+// key: the status the CAS selected it at binds, not the one read later.
+func TestSubmitTransactions_SelectedLoserKeepsStoredKeyAfterAdvancing(t *testing.T) {
+	for _, next := range []models.Status{models.StatusAcceptedByNetwork, models.StatusPendingRetry} {
+		t.Run(string(next), func(t *testing.T) {
+			p, c1, _, _ := externalParentChain()
+			c1id := c1.TxID().String()
+			st := newKeyedMemStore()
+			st.put(p, models.StatusReceived, "kP")
+			st.beforeCAS[c1id] = func() {
+				st.put(p, models.StatusAcceptedByNetwork, "kP")
+				st.put(c1id, models.StatusReceived, c1id)
+			}
+			st.afterCAS[c1id] = func() { st.put(c1id, next, c1id) }
+			broker, router := keyedServer(t, st)
+
+			if code := postKeyed(t, router, "/txs", joinRaw(c1)); code != http.StatusAccepted {
+				t.Fatalf("POST /txs = %d", code)
+			}
+			if got := batchKeys(t, broker)[c1id]; got != c1id {
+				t.Errorf("c1 republished under %q, want the winner's stored %s", got, c1id)
+			}
+		})
 	}
 }

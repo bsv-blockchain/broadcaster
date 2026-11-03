@@ -131,8 +131,8 @@ func (s *Server) inheritStoredPartitionKeys(ctx context.Context, keyByTxid map[s
 		s.logger.Warn("batch partition-key lookup failed; keying by family", zap.Int("txs", len(txids)), zap.Int("parents", len(external)), zap.Error(err))
 		return
 	}
-	remap := bindingKeys(txids, keyByTxid, rows) // 1: a member's own stored key
-	for _, txid := range txids {                 // 2: the first in-flight external parent
+	remap := bindingKeys(txids, keyByTxid, rows, nil) // 1: a member's own stored key
+	for _, txid := range txids {                      // 2: the first in-flight external parent
 		fam, ok := keyByTxid[txid]
 		if !ok {
 			continue
@@ -197,22 +197,28 @@ func (s *Server) storedPartitionKey(ctx context.Context, txid, fallback string, 
 // when that key is the one already chosen, so a REJECTED member's stale key
 // sorting later cannot move the family off it.
 //
+// republished maps each loser to the status its CAS returned, the one that
+// selected it for republication. A member ranks by that status or the one the
+// lookup reads, whichever binds harder: the row can advance in between (the
+// concurrent winner's message reaches ACCEPTED_BY_NETWORK or parks), but this
+// request still republishes it, and only under the stored key does that copy
+// rejoin the winner's message rather than reach a second dispatcher.
+//
 // Residual: a member of that family that THIS request inserted has already
 // persisted the pre-CAS key, and a child later following it can miss the
 // dispatcher. That needs two concurrent batches straddling a parent's
 // acceptance, and falls back to the missing-parent safety net.
-func (s *Server) adoptStoredFamilyKeys(ctx context.Context, keyByTxid, famByTxid map[string]string, republished []string) {
+func (s *Server) adoptStoredFamilyKeys(ctx context.Context, keyByTxid, famByTxid map[string]string, republished map[string]models.Status) {
 	if s.store == nil || s.cfg.Propagation.ParentKeyLookupMaxInputs <= 0 || len(republished) == 0 {
 		return
 	}
-	ids := append([]string(nil), republished...)
-	sort.Strings(ids) // deterministic precedence when members disagree
+	ids := slices.Sorted(maps.Keys(republished)) // deterministic precedence when members disagree
 	rows, err := s.lookupPartitionKeys(ctx, ids)
 	if err != nil {
 		s.logger.Warn("republish partition-key lookup failed; keeping computed keys", zap.Int("txs", len(ids)), zap.Error(err))
 		return
 	}
-	remap := bindingKeys(ids, famByTxid, rows) // natural family key -> stored key
+	remap := bindingKeys(ids, famByTxid, rows, republished) // natural family key -> stored key
 	for txid, fam := range famByTxid {
 		if nk, ok := remap[fam]; ok {
 			keyByTxid[txid] = nk
@@ -223,8 +229,9 @@ func (s *Server) adoptStoredFamilyKeys(ctx context.Context, keyByTxid, famByTxid
 // bindingKeys picks, per family (famOf), the stored key the family must carry:
 // that of the best-ranked member among txids (keyBindRank), the first in
 // txids order on a tie. Members with no stored key or a non-binding status
-// pick nothing; a family with no pick is absent from the result.
-func bindingKeys(txids []string, famOf map[string]string, rows map[string]store.ParentKey) map[string]string {
+// pick nothing; a family with no pick is absent from the result. selectedAt,
+// when non-nil, gives a member an earlier-observed status that ranks it too.
+func bindingKeys(txids []string, famOf map[string]string, rows map[string]store.ParentKey, selectedAt map[string]models.Status) map[string]string {
 	picked := make(map[string]string)
 	rank := make(map[string]int)
 	for _, txid := range txids {
@@ -236,7 +243,11 @@ func bindingKeys(txids []string, famOf map[string]string, rows map[string]store.
 		if !ok || r.PartitionKey == "" {
 			continue
 		}
-		if rk := keyBindRank(r.Status); rk > rank[fam] {
+		rk := keyBindRank(r.Status)
+		if sel, ok := selectedAt[txid]; ok {
+			rk = max(rk, keyBindRank(sel))
+		}
+		if rk > rank[fam] {
 			rank[fam] = rk
 			picked[fam] = r.PartitionKey
 		}
