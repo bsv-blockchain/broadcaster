@@ -89,10 +89,10 @@ func TestTokenSetWithHint(t *testing.T) {
 	}
 }
 
-// TestFanOutHintedReceivedSkipsTokenLookup: a hinted RECEIVED names its only
-// subscriber, so neither fan-out asks the store; an unhinted RECEIVED and any
-// other status still resolve through the index.
-func TestFanOutHintedReceivedSkipsTokenLookup(t *testing.T) {
+// TestFanOutReceivedSkipsTokenLookup: a RECEIVED's subscriber is its hint
+// alone (none without one, even for a txid the index knows), so neither
+// fan-out asks the store; any other status still resolves through the index.
+func TestFanOutReceivedSkipsTokenLookup(t *testing.T) {
 	mgr, st, cancel := newFanOutFixture(t, []string{"tok-1"}, []string{"tx-known"})
 	defer cancel()
 	c := mgr.NewClient("tok-1")
@@ -101,11 +101,12 @@ func TestFanOutHintedReceivedSkipsTokenLookup(t *testing.T) {
 
 	mgr.fanOut(context.Background(), &models.TransactionStatus{TxID: "tx-new", Status: models.StatusReceived, Timestamp: time.Now(), CallbackTokenHint: "tok-1"})
 	mgr.fanOutBulk(context.Background(), &models.TransactionStatus{TxIDs: []string{"b1", "b2"}, Status: models.StatusReceived, Timestamp: time.Now(), CallbackTokenHint: "tok-1"})
+	mgr.fanOut(context.Background(), &models.TransactionStatus{TxID: "tx-known", Status: models.StatusReceived, Timestamp: time.Now()})
 	if st.tokenCalls != 0 {
-		t.Errorf("hinted RECEIVED made %d token lookups, want 0", st.tokenCalls)
+		t.Errorf("RECEIVED made %d token lookups, want 0", st.tokenCalls)
 	}
 	if got := len(c.Ch); got != 3 {
-		t.Errorf("hinted token received %d frames, want 3", got)
+		t.Errorf("hinted token received %d frames, want 3 (none for the unhinted RECEIVED)", got)
 	}
 
 	mgr.fanOut(context.Background(), &models.TransactionStatus{TxID: "tx-known", Status: models.StatusAcceptedByNetwork, Timestamp: time.Now(), CallbackTokenHint: "tok-1"})

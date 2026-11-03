@@ -105,10 +105,12 @@ func TestSSE_E2E_LiveDelivery(t *testing.T) {
 
 	time.Sleep(100 * time.Millisecond)
 
+	// Intake's RECEIVED carries the submitting request's token as its hint.
 	h.publishAndPersist(t, &models.TransactionStatus{
-		TxID:      txid,
-		Status:    models.StatusReceived,
-		Timestamp: time.Now().UTC(),
+		TxID:              txid,
+		Status:            models.StatusReceived,
+		Timestamp:         time.Now().UTC(),
+		CallbackTokenHint: token,
 	})
 
 	frame, err := readNextSSEFrame(resp.Body, 3*time.Second)

@@ -239,7 +239,10 @@ func (s *Service) Start(ctx context.Context) error {
 			if !ok {
 				return nil
 			}
-			if status == nil {
+			// RECEIVED is never posted (see handleUpdate); dropping it here
+			// keeps the per-tx intake event out of the bounded work queue,
+			// where it would compete with verdicts for slots.
+			if status == nil || status.Status == models.StatusReceived {
 				continue
 			}
 			select {

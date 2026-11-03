@@ -505,3 +505,40 @@ func TestHandleSubmitTransactions_RowsKeepOwnTimestamps(t *testing.T) {
 		t.Errorf("RECEIVED timestamp %v, want the inserted row's %v", got, rows[txidB])
 	}
 }
+
+// TestHandleSubmitTransactions_BulkReceivedSitsBelowEveryRow: a bulk RECEIVED's
+// id must be below every batch row even at a millisecond-precision store, so a
+// Last-Event-ID reconnect mid-burst replays the rows rather than skipping them.
+func TestHandleSubmitTransactions_BulkReceivedSitsBelowEveryRow(t *testing.T) {
+	rawA, rawB, txidA, txidB := twoDistinctTxs(t)
+	rows := map[string]time.Time{}
+	ms := &mockStore{getOrInsertFn: func(in *models.TransactionStatus) (*models.TransactionStatus, bool, error) {
+		rows[in.TxID] = in.Timestamp
+		return nil, true, nil
+	}}
+	pub, _, router := newReceivedServer(ms)
+	postSubmit(t, router, "/txs", append(append([]byte(nil), rawA...), rawB...))
+
+	if len(pub.bulkPublishes) != 1 {
+		t.Fatalf("expected one bulk RECEIVED, got %d", len(pub.bulkPublishes))
+	}
+	at := pub.bulkPublishes[0].Timestamp
+	for _, id := range []string{txidA, txidB} {
+		if !at.Before(rows[id].Truncate(time.Millisecond)) {
+			t.Errorf("event at %v is not below row %s stored at ms precision (%v)", at, id, rows[id].Truncate(time.Millisecond))
+		}
+	}
+	if want := rows[txidA].Truncate(time.Millisecond).Add(-time.Nanosecond); !at.Equal(want) {
+		t.Errorf("event at %v, want just below the earliest row: %v", at, want)
+	}
+}
+
+func TestBulkReceivedAt(t *testing.T) {
+	ts := time.Date(2026, 11, 3, 12, 0, 0, 123_456_789, time.UTC)
+	if got := bulkReceivedAt(ts, 1); !got.Equal(ts) {
+		t.Errorf("single: %v, want %v", got, ts)
+	}
+	if got, want := bulkReceivedAt(ts, 2), time.Date(2026, 11, 3, 12, 0, 0, 122_999_999, time.UTC); !got.Equal(want) {
+		t.Errorf("bulk: %v, want %v", got, want)
+	}
+}

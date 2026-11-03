@@ -1122,6 +1122,19 @@ func (s *Server) publishReceived(ctx context.Context, txids []string, receivedAt
 	}
 }
 
+// bulkReceivedAt is the timestamp a POST /txs RECEIVED event carries. Its SSE
+// id is a reconnect's Last-Event-ID, and catchup replays rows strictly after
+// it, so it must sit below every row of the batch at the precision the store
+// keeps (milliseconds on Aerospike and MongoDB): the earliest row's
+// millisecond, minus 1ns. A row replayed twice is harmless; one skipped never
+// gets its RECEIVED frame. A single-tx event keeps the row's own timestamp.
+func bulkReceivedAt(earliest time.Time, n int) time.Time {
+	if n < 2 {
+		return earliest
+	}
+	return earliest.Truncate(time.Millisecond).Add(-time.Nanosecond)
+}
+
 // maxTxIDsPerReceivedEvent caps the txids in one bulk RECEIVED event so a
 // large POST /txs stays under the Kafka producer's 1 MiB default
 // MaxMessageBytes (~67 bytes of JSON per txid). Mirrors bump_builder's
@@ -1472,9 +1485,10 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 				newSubmits++
 				toPublish = append(toPublish, p)
 				// Each row keeps its own timestamp, so a large batch is not one
-				// equal-timestamp run for catchup to drain; the event carries
-				// the earliest, so a Last-Event-ID reconnect mid-burst replays
-				// the rest instead of skipping them.
+				// equal-timestamp run for catchup to drain; the event is
+				// stamped just below the earliest (bulkReceivedAt), so a
+				// Last-Event-ID reconnect mid-burst replays the rest instead
+				// of skipping them.
 				receivedAt = cmp.Or(receivedAt, row.Timestamp)
 				receivedTxIDs = append(receivedTxIDs, p.txid)
 			}
@@ -1518,7 +1532,7 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 	if len(toPublish) > 0 {
 		s.adoptStoredFamilyKeys(ctx, keyByTxid, famByTxid, republished)
 		// Before SendBatch, for the ordering reason in handleSubmitTransaction.
-		s.publishReceived(ctx, receivedTxIDs, receivedAt, opts)
+		s.publishReceived(ctx, receivedTxIDs, bulkReceivedAt(receivedAt, len(receivedTxIDs)), opts)
 
 		msgs := propagationMessages(toPublish, keyByTxid, inputsByTxid)
 		if err := s.producer.SendBatch(ctx, kafka.TopicPropagation, msgs); err != nil {

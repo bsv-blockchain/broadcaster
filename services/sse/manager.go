@@ -328,12 +328,11 @@ func (m *Manager) fanOut(ctx context.Context, status *models.TransactionStatus) 
 	hint := status.CallbackTokenHint
 	status.CallbackTokenHint = ""
 	var tokens tokenSet
-	switch {
-	case !tokenScoped(clients):
-	case hintedReceived(status, hint):
-		tokens = tokenSet{hint}
-	default:
-		tokens = m.tokens.lookup(ctx, status.TxID).withHint(hint)
+	if tokenScoped(clients) {
+		var intake bool
+		if tokens, intake = intakeTokens(status, hint); !intake {
+			tokens = m.tokens.lookup(ctx, status.TxID).withHint(hint)
+		}
 	}
 	m.deliver(ctx, clients, status, tokens)
 	m.observeFanout("single", start)
@@ -360,17 +359,16 @@ func (m *Manager) fanOutBulk(ctx context.Context, status *models.TransactionStat
 	hint := status.CallbackTokenHint
 	status.CallbackTokenHint = ""
 	var resolved map[string]tokenSet
-	hinted := hintedReceived(status, hint)
-	if tokenScoped(clients) && !hinted {
+	hintOnly, intake := intakeTokens(status, hint)
+	if tokenScoped(clients) && !intake {
 		resolved = m.tokens.resolveBatch(ctx, status.TxIDs)
 	}
-	hintOnly := tokenSet{hint}
 	for _, txid := range status.TxIDs {
 		perTx := *status
 		perTx.TxID = txid
 		perTx.TxIDs = nil
 		tokens := hintOnly
-		if !hinted {
+		if !intake {
 			tokens = resolved[txid].withHint(hint)
 		}
 		m.deliver(ctx, clients, &perTx, tokens)
@@ -378,14 +376,21 @@ func (m *Manager) fanOutBulk(ctx context.Context, status *models.TransactionStat
 	m.observeFanout("bulk", start)
 }
 
-// hintedReceived reports whether an event's subscriber set is its hint alone,
-// so the token index need not be asked. Only the request that inserted the
-// row publishes RECEIVED, and its submission is the one the hint names; a
-// duplicate racing it gets no RECEIVED by design, and the row being new, no
-// earlier submission can name the txid. The lookup would also almost always
-// miss, the submission row being written asynchronously.
-func hintedReceived(status *models.TransactionStatus, hint string) bool {
-	return hint != "" && status.Status == models.StatusReceived
+// intakeTokens returns the subscriber set of an intake RECEIVED without asking
+// the token index: the hinted token alone, or none when the submission carried
+// no callback token. Only the request that inserted the row publishes
+// RECEIVED, and its submission is the one the hint names; a duplicate racing
+// it gets no RECEIVED by design, and the row being new, no earlier submission
+// can name the txid. The lookup would also almost always miss, the submission
+// row being written asynchronously. ok is false for every other status.
+func intakeTokens(status *models.TransactionStatus, hint string) (tokens tokenSet, ok bool) {
+	if status.Status != models.StatusReceived {
+		return nil, false
+	}
+	if hint == "" {
+		return nil, true
+	}
+	return tokenSet{hint}, true
 }
 
 // deliver pushes one status to every client subscribed to it. tokens is the
