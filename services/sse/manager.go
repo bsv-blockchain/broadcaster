@@ -18,6 +18,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/bsv-blockchain/broadcaster/events"
+	"github.com/bsv-blockchain/broadcaster/logfields"
 	"github.com/bsv-blockchain/broadcaster/metrics"
 	"github.com/bsv-blockchain/broadcaster/models"
 	"github.com/bsv-blockchain/broadcaster/store"
@@ -312,6 +313,12 @@ func (m *Manager) deliver(ctx context.Context, clients []*Client, status *models
 		if c.Token != "" && !tokens.has(c.Token) {
 			continue
 		}
+		// First recipient: a RECEIVED the stored row has already moved past is
+		// dropped for every client, before anyone is sent it.
+		if !enriched && status.Status == models.StatusReceived && m.receivedIsStale(ctx, status.TxID) {
+			metrics.APISSEDroppedTotal.WithLabelValues("stale_received").Inc()
+			return
+		}
 		// This client will receive the frame, so attach the merkle proof — once
 		// per event (the status pointer is shared across the sends below) and
 		// lazily after the token match, so we only pay for txids a connected
@@ -331,6 +338,48 @@ func (m *Manager) deliver(ctx context.Context, clients []*Client, status *models
 			metrics.APISSEDroppedTotal.WithLabelValues("slow_client").Inc()
 			m.recordDrop(c, status)
 		}
+	}
+}
+
+// receivedIsStale reports whether a RECEIVED event must be dropped because
+// the transaction's stored row has already moved past RECEIVED. Intake
+// publishes RECEIVED from a different process than the one that produces the
+// verdict, so on the events topic it can land after that verdict: an inserter
+// that paused between its CAS and its publish, a concurrent duplicate whose
+// propagation attempt was rejected in that pause, or a RECEIVED and a verdict
+// on different partitions under consumer lag. Ordering it at the producer
+// would need one atomic step across replicas; the store gives a sufficient
+// order instead, because the propagator writes a verdict's row before it
+// publishes the verdict. So on this single fan-out goroutine:
+//   - the row still RECEIVED means no verdict has been published yet, so none
+//     can already be on any stream ahead of this frame — deliver it;
+//   - the row past RECEIVED means a verdict exists (delivered, in flight, or
+//     served by connect-time catchup) — drop the frame, which would only
+//     regress the stream to an in-flight state with nothing to correct it
+//     when a repeated rejection is suppressed as a non-transition.
+//
+// No store or no row (reaped, or never stored) leaves nothing to contradict
+// the event, so it is delivered. A store error drops it: RECEIVED is the
+// least informative frame in the lifecycle and the next verdict or a
+// reconnect's catchup supersedes it, while a stale one after a terminal
+// verdict is wrong for good. Called at most once per event, and only once a
+// client wants the txid, so a token-scoped pod pays nothing for txids nobody
+// is watching.
+func (m *Manager) receivedIsStale(ctx context.Context, txid string) bool {
+	if m.store == nil {
+		return false
+	}
+	row, err := m.store.GetStatus(ctx, txid)
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		return false
+	case err != nil:
+		m.logger.Warn("dropping RECEIVED frame: status lookup failed", logfields.TxID(txid), zap.Error(err))
+		return true
+	case row == nil:
+		return false
+	default:
+		return row.Status != models.StatusReceived
 	}
 }
 

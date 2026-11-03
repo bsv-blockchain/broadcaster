@@ -1024,15 +1024,17 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 	// any status events fired on this txid can find a matching row.
 	s.recordSubmission(c.Request.Context(), txid, opts)
 
-	// RECEIVED goes out BEFORE the propagation message: once that message is
-	// queued the propagator can publish ACCEPTED_BY_NETWORK or REJECTED, and a
-	// RECEIVED published after it could reach a live stream as a stale frame
-	// behind the verdict. Only the request whose CAS created the row publishes
-	// it. Any other attempt — a REJECTED resubmit, a retry of a stranded
-	// RECEIVED row, an attempt whose CAS errored — may run after an earlier
-	// attempt's verdict was already published, and its RECEIVED would then
-	// follow that verdict; a repeat rejection is not a transition, so nothing
-	// would correct it.
+	// RECEIVED goes out before this request's propagation message, and only
+	// from the request whose CAS created the row: any other attempt — a
+	// REJECTED resubmit, a retry of a stranded RECEIVED row, an attempt whose
+	// CAS errored — can run after an earlier attempt's verdict. Neither rule
+	// orders RECEIVED against a verdict produced by ANOTHER request's
+	// propagation (this request can pause between its CAS and this publish),
+	// and nothing here can across replicas. What keeps the stream true is the
+	// consumer: SSE fan-out and webhook dispatch drop a RECEIVED whose stored
+	// row has already moved past RECEIVED (sse.Manager.receivedIsStale). These
+	// rules just keep the topic from carrying RECEIVED events that would
+	// nearly always be dropped.
 	if inserted {
 		s.publishReceived(c.Request.Context(), []string{txid}, opts)
 	}
@@ -1074,15 +1076,15 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 // RECEIVED row is durable and before the propagation message is queued, so a
 // subscriber that opened its stream before submitting sees the lifecycle from
 // its first state rather than from ACCEPTED_BY_NETWORK (hosted-service
-// report, issue 6d), and never sees RECEIVED behind a verdict. The request's callback token rides
-// along as a hint because the submission row is written by the asynchronous
-// recorder and may not exist yet when the SSE pod resolves the txid's
-// subscribers. Callers pass only txids whose row this request's CAS inserted:
-// the first attempt is the one attempt no verdict for the txid can precede.
-// Best-effort: the row is already durable, and connect-time catchup covers a
-// lost event. A failed Kafka send after this leaves the row at RECEIVED, which
-// the client's retry re-queues without a second RECEIVED, so the frame stays
-// true.
+// report, issue 6d). The request's callback token rides along as a hint
+// because the submission row is written by the asynchronous recorder and may
+// not exist yet when the SSE pod resolves the txid's subscribers. Callers pass
+// only txids whose row this request's CAS inserted. The event can still trail
+// a verdict another request's attempt produced; consumers drop it then (see
+// handleSubmitTransaction). Best-effort: the row is already durable, and
+// connect-time catchup covers a lost event. A failed Kafka send after this
+// leaves the row at RECEIVED, which the client's retry re-queues without a
+// second RECEIVED, so the frame stays true.
 func (s *Server) publishReceived(ctx context.Context, txids []string, opts submitOptions) {
 	if s.publisher == nil || len(txids) == 0 {
 		return
