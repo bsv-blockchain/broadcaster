@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/hashicorp/golang-lru/v2/simplelru"
 	"go.uber.org/zap"
 
 	"github.com/bsv-blockchain/broadcaster/events"
@@ -77,6 +78,84 @@ type Client struct {
 	// hints are disabled). Per-client rather than shared because a single
 	// shared delay relocates a reconnect herd instead of dispersing it.
 	drainRetryMS atomic.Int64
+
+	// progressed and mined hold txids this stream has already been written a
+	// status past RECEIVED for, so a RECEIVED that reaches the writer
+	// afterwards is skipped (see admit). Block statuses get their own ring so
+	// a big block's burst cannot evict the txids whose verdicts just went out.
+	// Owned by the writer goroutine; no locking.
+	progressed *txidRing
+	mined      *txidRing
+}
+
+// admit reports whether status may be written to this client's stream, and
+// records it. RECEIVED is the only status that can reach the stream out of
+// lifecycle order: intake publishes it from the api-server while the
+// propagator publishes the verdict, so on the events topic it can trail that
+// verdict — the inserting request paused between its CAS and its publish
+// while a concurrent duplicate's attempt was rejected, or the two events sit
+// on different partitions under consumer lag. Written after the verdict, it
+// would regress the stream to an in-flight state, and a repeated rejection is
+// a non-transition that publishes nothing to correct it. So a RECEIVED is
+// skipped once this stream has carried any later status for the txid, live or
+// from catchup. The check is per stream, not against the store: a verdict
+// already stored but not yet written here must not suppress the RECEIVED
+// ahead of it. Runs on the writer goroutine only.
+func (c *Client) admit(status *models.TransactionStatus) bool {
+	if c == nil || status.TxID == "" {
+		return true
+	}
+	switch status.Status {
+	case models.StatusReceived:
+		if c.progressed.has(status.TxID) || c.mined.has(status.TxID) {
+			metrics.APISSEDroppedTotal.WithLabelValues("stale_received").Inc()
+			return false
+		}
+	case models.StatusMined, models.StatusImmutable:
+		// The inserting request can pause while a duplicate's attempt carries
+		// the tx into a block, and a reconnect's catchup serves the MINED row
+		// before that RECEIVED arrives.
+		if c.mined == nil {
+			c.mined = newTxidRing(progressedCapacity)
+		}
+		c.mined.add(status.TxID)
+	default:
+		if c.progressed == nil {
+			c.progressed = newTxidRing(progressedCapacity)
+		}
+		c.progressed.add(status.TxID)
+	}
+	return true
+}
+
+// progressedCapacity bounds each of Client.progressed and Client.mined. A
+// trailing RECEIVED arrives within the intake pause or partition skew of its
+// verdict, so only the most recent txids matter; at ~100 B per entry this caps
+// a firehose client in the low megabytes, and a token-scoped client's sets
+// stay at its own txids.
+const progressedCapacity = 16384
+
+// txidRing is a bounded set that evicts its least recently recorded txid when
+// full. It grows with what is recorded, so a token-scoped stream pays only for
+// its own txids, not for the capacity.
+type txidRing struct {
+	lru *simplelru.LRU[string, struct{}]
+}
+
+func newTxidRing(capacity int) *txidRing {
+	l, err := simplelru.NewLRU[string, struct{}](capacity, nil)
+	if err != nil {
+		panic(err) // capacity is a positive constant
+	}
+	return &txidRing{lru: l}
+}
+
+func (r *txidRing) has(txid string) bool {
+	return r != nil && r.lru.Contains(txid)
+}
+
+func (r *txidRing) add(txid string) {
+	r.lru.Add(txid, struct{}{})
 }
 
 // Manager owns the per-pod registry of SSE clients listening on
@@ -244,9 +323,16 @@ func (m *Manager) fanOut(ctx context.Context, status *models.TransactionStatus) 
 	if len(clients) == 0 {
 		return // nobody listening — skip token resolution and enrichment
 	}
+	// The hint is consumed here and never travels further: it is another
+	// subscriber's token, and the frame builder would not serialize it anyway.
+	hint := status.CallbackTokenHint
+	status.CallbackTokenHint = ""
 	var tokens tokenSet
 	if tokenScoped(clients) {
-		tokens = m.tokens.lookup(ctx, status.TxID)
+		var intake bool
+		if tokens, intake = intakeTokens(status, hint); !intake {
+			tokens = m.tokens.lookup(ctx, status.TxID).withHint(hint)
+		}
 	}
 	m.deliver(ctx, clients, status, tokens)
 	m.observeFanout("single", start)
@@ -270,17 +356,41 @@ func (m *Manager) fanOutBulk(ctx context.Context, status *models.TransactionStat
 	if len(clients) == 0 {
 		return
 	}
+	hint := status.CallbackTokenHint
+	status.CallbackTokenHint = ""
 	var resolved map[string]tokenSet
-	if tokenScoped(clients) {
+	hintOnly, intake := intakeTokens(status, hint)
+	if tokenScoped(clients) && !intake {
 		resolved = m.tokens.resolveBatch(ctx, status.TxIDs)
 	}
 	for _, txid := range status.TxIDs {
 		perTx := *status
 		perTx.TxID = txid
 		perTx.TxIDs = nil
-		m.deliver(ctx, clients, &perTx, resolved[txid])
+		tokens := hintOnly
+		if !intake {
+			tokens = resolved[txid].withHint(hint)
+		}
+		m.deliver(ctx, clients, &perTx, tokens)
 	}
 	m.observeFanout("bulk", start)
+}
+
+// intakeTokens returns the subscriber set of an intake RECEIVED without asking
+// the token index: the hinted token alone, or none when the submission carried
+// no callback token. Only the request that inserted the row publishes
+// RECEIVED, and its submission is the one the hint names; a duplicate racing
+// it gets no RECEIVED by design, and the row being new, no earlier submission
+// can name the txid. The lookup would also almost always miss, the submission
+// row being written asynchronously. ok is false for every other status.
+func intakeTokens(status *models.TransactionStatus, hint string) (tokens tokenSet, ok bool) {
+	if status.Status != models.StatusReceived {
+		return nil, false
+	}
+	if hint == "" {
+		return nil, true
+	}
+	return tokenSet{hint}, true
 }
 
 // deliver pushes one status to every client subscribed to it. tokens is the
@@ -545,7 +655,7 @@ func (s *Service) handleEvents(c *gin.Context) {
 			writeShutdown(writer, client)
 			return
 		case status := <-client.Ch:
-			if status != nil {
+			if status != nil && client.admit(status) {
 				if err := writeStatusBuffered(writer, status); err != nil {
 					outcome = "write_error"
 					return
@@ -785,6 +895,9 @@ func (s *Service) sendCatchup(ctx context.Context, w *sseWriter, token string, s
 				}
 			}
 		}
+		if !client.admit(status) {
+			return nil
+		}
 		if err := writeStatus(w, status); err != nil {
 			res.writeFailed = true
 			return err
@@ -957,7 +1070,7 @@ func drainLive(w *sseWriter, client *Client) (int, error) {
 	for {
 		select {
 		case status := <-client.Ch:
-			if status == nil {
+			if status == nil || !client.admit(status) {
 				continue
 			}
 			if err := writeStatusBuffered(w, status); err != nil {

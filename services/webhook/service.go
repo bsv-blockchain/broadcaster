@@ -239,7 +239,10 @@ func (s *Service) Start(ctx context.Context) error {
 			if !ok {
 				return nil
 			}
-			if status == nil {
+			// RECEIVED is never posted (see handleUpdate); dropping it here
+			// keeps the per-tx intake event out of the bounded work queue,
+			// where it would compete with verdicts for slots.
+			if status == nil || status.Status == models.StatusReceived {
 				continue
 			}
 			select {
@@ -281,6 +284,16 @@ func (s *Service) Stop() error {
 // channel. The expensive bit — N store.GetSubmissionsByTxID calls — runs
 // inside the worker, never blocking the channel reader.
 func (s *Service) handleUpdate(ctx context.Context, status *models.TransactionStatus) {
+	// RECEIVED is intake's SSE-facing event and is never posted to a webhook
+	// (callbacks have never carried it). Skipped before the submission
+	// lookup, so the per-tx intake event costs every replica nothing. It
+	// would also be unsafe: it reaches the delivery pool moments before
+	// ACCEPTED_BY_NETWORK, and if both claim from the same empty
+	// LastDeliveredStatus and RECEIVED wins the CAS, ACCEPTED_BY_NETWORK
+	// loses it and is never posted. Intake's REJECTED is unaffected.
+	if status.Status == models.StatusReceived {
+		return
+	}
 	if len(status.TxIDs) == 0 {
 		s.dispatchOne(ctx, status)
 		return
@@ -392,7 +405,11 @@ func (s *Service) deliver(ctx context.Context, sub *models.Submission, status *m
 		metrics.MinedPushWithoutMerklePathTotal.WithLabelValues("webhook").Inc()
 	}
 
-	body, err := json.Marshal(status)
+	// The event-only CallbackTokenHint must never reach a receiver: it is an
+	// SSE subscriber's token, not part of the status.
+	payload := *status
+	payload.CallbackTokenHint = ""
+	body, err := json.Marshal(&payload)
 	if err != nil {
 		logger.Warn("encoding status payload failed", zap.Error(err))
 		return

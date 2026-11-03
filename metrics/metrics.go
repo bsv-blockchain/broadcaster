@@ -834,12 +834,16 @@ var APIRequestBytes = promauto.NewHistogramVec(prometheus.HistogramOpts{
 //     SSEConnectedClients before attributing fault to a consumer.
 //   - "client_gone": the client was unregistering concurrently and its context
 //     had already been canceled by the time fan-out reached it.
+//   - "stale_received": a RECEIVED reached a client's writer after that
+//     stream had already carried a later status for the txid (it trailed
+//     the verdict on the events topic), so it was skipped rather than
+//     regress the stream. Counted per client.
 //
 // A non-zero "client_gone" rate is normal under churn.
 var APISSEDroppedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "bsv_broadcaster_api_sse_dropped_total",
 	Help: "SSE fan-out events dropped without delivery, by reason.",
-}, []string{"reason"}) // slow_client, client_gone
+}, []string{"reason"}) // slow_client, client_gone, stale_received
 
 // SSEFanoutDuration measures how long the manager's single fan-out goroutine
 // spends on one event, split by kind:

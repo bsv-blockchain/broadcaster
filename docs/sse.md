@@ -45,6 +45,7 @@ data: {"txid":"abc...","txStatus":"SEEN_ON_NETWORK","timestamp":"2026-04-28T18:2
 
 - `id` is a Unix nanosecond timestamp. Clients should remember the most recent `id` and send it back as `Last-Event-ID` on reconnect (browser `EventSource` does this automatically).
 - `event: status` is the only event type emitted for transaction updates.
+- The first frame for a submitted txid is `RECEIVED`, published once intake has stored the transaction; `ACCEPTED_BY_NETWORK`, `SEEN_ON_NETWORK`, `SEEN_MULTIPLE_NODES` and `MINED` follow as the network reports them (`PENDING_RETRY` and `REJECTED` are the side states). Open the stream before submitting to see the lifecycle from its first state. `RECEIVED` does not follow a later status for the same txid on a stream: if it reaches the server after the stream has already carried a later status for the transaction, live or from catchup, including `MINED` (for example when a duplicate submission racing the first one got the verdict first), it is skipped, so the stream starts at that status instead. The check is per connection and remembers the most recent 16384 txids per status class, so it does not reach across a reconnect whose catchup did not replay the later status. `RECEIVED` is an SSE frame only; webhook callbacks never carry it, even with `X-FullStatusUpdates`. Only the submission that first stores the transaction publishes `RECEIVED`. A resubmission (a retry of a `REJECTED` transaction, a retry after a failed `503`/`500`, or a duplicate racing the first attempt) re-broadcasts it without a new `RECEIVED` frame; the next frame is the network's new verdict, or none if it is rejected again. A stream opened after the first submission gets its current state from the connect-time catchup.
 - `data` is one JSON object per frame. Every frame carries `txid`, `txStatus`, and `timestamp` (RFC 3339, with fractional seconds when the event has sub-second precision — the same instant as `id`, so latency can be measured from the payload alone). Fractional seconds are optional in RFC 3339; a whole-second timestamp is still rendered as `2026-04-28T18:20:56Z`.
 - A blank line terminates each frame.
 
@@ -186,5 +187,5 @@ Unknown `event:` types must be ignored by conformant clients, so this frame is s
 1. Generate a `callbackToken` once per session (e.g. `crypto.randomUUID()`).
 2. Open `GET /events?callbackToken=<token>` and start handling `event: status` frames.
 3. Submit transactions via `POST /tx` (or `POST /txs`) with `X-CallbackToken: <token>`.
-4. Each submitted txid will produce a sequence of status frames on the open stream as it propagates and gets mined.
+4. Each submitted txid will produce a sequence of status frames on the open stream, starting with `RECEIVED` and continuing as it propagates and gets mined.
 5. On reconnect, your client (or `EventSource`) sends `Last-Event-ID` automatically, and the server fills in any updates you missed.
