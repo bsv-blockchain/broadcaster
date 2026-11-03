@@ -130,7 +130,7 @@ services:
   # Pin is the current 7.0 line (same as deploy/aerospike.yaml), not :latest
   # (F-038 / #96). Digest is the multi-arch index for 7.0.0.26.
   aerospike:
-    image: docker.io/aerospike/aerospike-server:8.2.0.0@sha256:84999457c37800f711b195f562504710f7150d02134bb0c741563168a8105365
+    image: docker.io/aerospike/aerospike-server:8.2.0.1@sha256:02dd8cfffd32abd1f925f2100a942ad1df5a02da293d5a781afb1a3300d28a96
     profiles: ["aerospike"]
     ports:
       - "3200:3000"
@@ -175,7 +175,7 @@ services:
   # RFC1918 and merkle-service's SSRF guard would otherwise reject it. BSV Broadcaster
   # forwards callback_url + callback_token per tx registration.
   merkle-service:
-    image: ${MERKLE_IMAGE:-ghcr.io/bsv-blockchain/merkle-service@sha256:d8bb51e30e4e0828a948b8048f58921ee64a86154e99afb69b34ecb287e6c4da}
+    image: ${MERKLE_IMAGE:-ghcr.io/bsv-blockchain/merkle-service@sha256:1ef4431b6c3cb64f90b456b5dcebee6f018f8cf4c001e149803b3a944cadc9f2}
     environment:
       MODE: all-in-one
       LOG_LEVEL: info
@@ -205,7 +205,7 @@ services:
   # OTLP sink for the telemetry env above (tools/otel-collector.yaml
   # unchanged; debug exporter dumps traces/metrics to its logs).
   otel-collector:
-    image: docker.io/otel/opentelemetry-collector-contrib:0.163.2-386
+    image: docker.io/otel/opentelemetry-collector-contrib:0.164.0
     command: ["--config=/etc/otel-collector.yaml"]
     volumes:
       - ./tools/otel-collector.yaml:/etc/otel-collector.yaml:Z
