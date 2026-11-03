@@ -9,6 +9,7 @@ import (
 	"errors"
 	"html/template"
 	"io"
+	"maps"
 	"net/http"
 	"strings"
 	"time"
@@ -1325,6 +1326,7 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 	// retry rejoins its earlier messages), else joins the partition of an
 	// in-flight parent outside this batch (inheritStoredPartitionKeys).
 	keyByTxid, inputsByTxid := familyKeysBySubmittedTxid(parsed)
+	famByTxid := maps.Clone(keyByTxid) // family identity; inheritance may merge routing keys
 	s.inheritStoredPartitionKeys(c.Request.Context(), keyByTxid, inputsByTxid)
 
 	// Phase 3: dedup CAS per tx. Duplicates are skipped from the
@@ -1412,7 +1414,7 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 	// multi-partition topic a whole family lands on one partition and
 	// per-partition order still delivers parents before children.
 	if len(toPublish) > 0 {
-		s.adoptStoredFamilyKeys(ctx, keyByTxid, republished)
+		s.adoptStoredFamilyKeys(ctx, keyByTxid, famByTxid, republished)
 		msgs := propagationMessages(toPublish, keyByTxid, inputsByTxid)
 		if err := s.producer.SendBatch(ctx, kafka.TopicPropagation, msgs); err != nil {
 			if errors.Is(err, kafka.ErrBrokerBackpressure) {

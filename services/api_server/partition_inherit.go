@@ -177,11 +177,16 @@ func (s *Server) storedPartitionKey(ctx context.Context, txid, fallback string) 
 // whole family moves to the stored key so the republish rejoins the earlier
 // message and the family stays together. keyByTxid is updated in place.
 //
+// Families are grouped by famByTxid, the natural family keys taken before
+// inheritance, not by the current routing key: inheritance can give separate
+// families the same key (two children of one in-flight parent), and moving
+// one of them must not drag the other off the key its rows were stored under.
+//
 // Residual: a member of that family that THIS request inserted has already
 // persisted the pre-CAS key, and a child later following it can miss the
 // dispatcher. That needs two concurrent batches straddling a parent's
 // acceptance, and falls back to the missing-parent safety net.
-func (s *Server) adoptStoredFamilyKeys(ctx context.Context, keyByTxid map[string]string, republished []string) {
+func (s *Server) adoptStoredFamilyKeys(ctx context.Context, keyByTxid, famByTxid map[string]string, republished []string) {
 	if s.store == nil || s.cfg.Propagation.ParentKeyLookupMaxInputs <= 0 || len(republished) == 0 {
 		return
 	}
@@ -192,20 +197,20 @@ func (s *Server) adoptStoredFamilyKeys(ctx context.Context, keyByTxid map[string
 		s.logger.Warn("republish partition-key lookup failed; keeping computed keys", zap.Int("txs", len(ids)), zap.Error(err))
 		return
 	}
-	remap := make(map[string]string) // computed family key -> stored key
+	remap := make(map[string]string) // natural family key -> stored key
 	for _, txid := range ids {
-		fam, ok := keyByTxid[txid]
+		fam, ok := famByTxid[txid]
 		if !ok {
 			continue
 		}
 		if _, done := remap[fam]; done {
 			continue
 		}
-		if r, ok := rows[txid]; ok && r.PartitionKey != "" && r.PartitionKey != fam {
+		if r, ok := rows[txid]; ok && r.PartitionKey != "" && r.PartitionKey != keyByTxid[txid] {
 			remap[fam] = r.PartitionKey
 		}
 	}
-	for txid, fam := range keyByTxid {
+	for txid, fam := range famByTxid {
 		if nk, ok := remap[fam]; ok {
 			keyByTxid[txid] = nk
 		}

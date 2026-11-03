@@ -215,7 +215,8 @@ func TestAdoptStoredFamilyKeys(t *testing.T) {
 		"d1": {Status: models.StatusReceived}, // stored before keys were persisted
 	}}
 	keyByTxid := map[string]string{"c1": "c1", "c2": "c1", "d1": "d1", "e1": "e1"}
-	keyingServer(st, 8).adoptStoredFamilyKeys(context.Background(), keyByTxid, []string{"d1", "c1"})
+	famByTxid := map[string]string{"c1": "c1", "c2": "c1", "d1": "d1", "e1": "e1"}
+	keyingServer(st, 8).adoptStoredFamilyKeys(context.Background(), keyByTxid, famByTxid, []string{"d1", "c1"})
 	want := map[string]string{"c1": "kP", "c2": "kP", "d1": "d1", "e1": "e1"}
 	for txid, k := range want {
 		if keyByTxid[txid] != k {
@@ -224,9 +225,28 @@ func TestAdoptStoredFamilyKeys(t *testing.T) {
 	}
 
 	st.asked = nil
-	keyingServer(st, 0).adoptStoredFamilyKeys(context.Background(), keyByTxid, []string{"c1"})
+	keyingServer(st, 0).adoptStoredFamilyKeys(context.Background(), keyByTxid, famByTxid, []string{"c1"})
 	if len(st.asked) != 0 {
 		t.Errorf("disabled lookup still asked the store: %v", st.asked)
+	}
+}
+
+// TestAdoptStoredFamilyKeys_SharedRoutingKey: families a and b both inherited
+// kR. a's stored key moved to kA; b's is still kR. Grouping by routing key
+// would drag b (and b2) to kA.
+func TestAdoptStoredFamilyKeys_SharedRoutingKey(t *testing.T) {
+	st := &keyLookupStore{rows: map[string]store.ParentKey{
+		"a": {Status: models.StatusReceived, PartitionKey: "kA"},
+		"b": {Status: models.StatusReceived, PartitionKey: "kR"},
+	}}
+	keyByTxid := map[string]string{"a": "kR", "a2": "kR", "b": "kR", "b2": "kR"}
+	famByTxid := map[string]string{"a": "a", "a2": "a", "b": "b", "b2": "b"}
+	keyingServer(st, 8).adoptStoredFamilyKeys(context.Background(), keyByTxid, famByTxid, []string{"a", "b"})
+	want := map[string]string{"a": "kA", "a2": "kA", "b": "kR", "b2": "kR"}
+	for txid, k := range want {
+		if keyByTxid[txid] != k {
+			t.Errorf("%s: key = %q, want %q", txid, keyByTxid[txid], k)
+		}
 	}
 }
 

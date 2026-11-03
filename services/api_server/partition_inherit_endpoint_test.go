@@ -289,3 +289,43 @@ func TestSubmitTransactions_CASLoserAdoptsStoredFamilyKey(t *testing.T) {
 		}
 	}
 }
+
+// TestSubmitTransactions_AdoptionKeepsSeparateFamiliesApart: independent A
+// and B both spend in-flight R, so the batch keys both families kR — A by
+// inheritance, B by its own row, persisted under kR after an earlier failed
+// send. Between lookup and CAS, R is accepted and a concurrent POST /tx wins
+// A's CAS under A's own txid. A's family adopts that stored key; B shares
+// only the routing key kR, not the family, and must stay on its stored kR.
+func TestSubmitTransactions_AdoptionKeepsSeparateFamiliesApart(t *testing.T) {
+	rt := sdkTx.NewTransaction()
+	rt.AddOutput(&sdkTx.TransactionOutput{Satoshis: 1, LockingScript: &script.Script{}})
+	rt.AddOutput(&sdkTx.TransactionOutput{Satoshis: 1, LockingScript: &script.Script{}})
+	r := rt.TxID().String()
+	a := spendOutput0(rt.TxID())
+	b := spendOutput0(rt.TxID())
+	b.Inputs[0].SourceTxOutIndex = 1
+	aid, bid := a.TxID().String(), b.TxID().String()
+
+	st := newKeyedMemStore()
+	st.put(r, models.StatusReceived, "kR")
+	st.put(bid, models.StatusReceived, "kR")
+	st.beforeCAS[aid] = func() {
+		st.put(r, models.StatusAcceptedByNetwork, "kR")
+		st.put(aid, models.StatusReceived, aid)
+	}
+	broker, router := keyedServer(t, st)
+
+	if code := postKeyed(t, router, "/txs", joinRaw(a, b)); code != http.StatusAccepted {
+		t.Fatalf("POST /txs = %d", code)
+	}
+	keys := batchKeys(t, broker)
+	if keys[aid] != aid {
+		t.Errorf("A published under %q, want the concurrent winner's stored %s", keys[aid], aid)
+	}
+	if keys[bid] != "kR" {
+		t.Errorf("B published under %q, want its stored kR", keys[bid])
+	}
+	if got := st.storedKey(t, bid); got != "kR" {
+		t.Errorf("B persisted key %q, want kR", got)
+	}
+}
