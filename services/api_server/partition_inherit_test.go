@@ -3,6 +3,8 @@ package api_server
 import (
 	"context"
 	"errors"
+	"fmt"
+	"maps"
 	"testing"
 
 	"go.uber.org/zap"
@@ -64,11 +66,20 @@ func TestPartitionKeyForSubmit(t *testing.T) {
 			want:   "root",
 		},
 		{
-			name:   "parked parent lends its key",
-			rows:   map[string]store.ParentKey{"p1": {Status: models.StatusPendingRetry, PartitionKey: "root"}},
+			name:   "sent parent lends its key",
+			rows:   map[string]store.ParentKey{"p1": {Status: models.StatusSentToNetwork, PartitionKey: "root"}},
 			inputs: []string{"p1"},
 			max:    8,
 			want:   "root",
+		},
+		{
+			// The dispatcher drops a parked tx from its in-flight set and the
+			// reaper rebroadcasts it outside Kafka: its key holds nothing.
+			name:   "parked parent does not",
+			rows:   map[string]store.ParentKey{"p1": {Status: models.StatusPendingRetry, PartitionKey: "root"}},
+			inputs: []string{"p1"},
+			max:    8,
+			want:   child,
 		},
 		{
 			name:   "accepted parent does not",
@@ -124,9 +135,12 @@ func TestPartitionKeyForSubmit(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			st := &keyLookupStore{rows: tc.rows, err: tc.err}
-			got := keyingServer(st, tc.max).partitionKeyForSubmit(context.Background(), child, tc.inputs)
+			got, ownSeen := keyingServer(st, tc.max).partitionKeyForSubmit(context.Background(), child, tc.inputs)
 			if got != tc.want {
 				t.Fatalf("key = %q, want %q", got, tc.want)
+			}
+			if _, has := tc.rows[child]; ownSeen != (has && tc.err == nil && tc.max > 0) {
+				t.Fatalf("ownSeen = %v with own row present = %v", ownSeen, has)
 			}
 			if tc.max == 0 && len(st.asked) != 0 {
 				t.Fatalf("disabled lookup still asked the store: %v", st.asked)
@@ -138,7 +152,7 @@ func TestPartitionKeyForSubmit(t *testing.T) {
 func TestPartitionKeyForSubmit_CapsLookups(t *testing.T) {
 	st := &keyLookupStore{rows: map[string]store.ParentKey{"p9": {Status: models.StatusReceived, PartitionKey: "late"}}}
 	inputs := []string{"p1", "p1", "", "p2", "p3", "p4", "p5", "p6", "p7", "p8", "p9"}
-	got := keyingServer(st, 3).partitionKeyForSubmit(context.Background(), "cc", inputs)
+	got, _ := keyingServer(st, 3).partitionKeyForSubmit(context.Background(), "cc", inputs)
 	if got != "cc" {
 		t.Fatalf("key = %q, want own txid (p9 is beyond the cap)", got)
 	}
@@ -257,12 +271,84 @@ func TestStoredPartitionKey(t *testing.T) {
 	}}
 	srv := keyingServer(st, 8)
 	for _, tc := range []struct{ txid, want string }{{"a", "kA"}, {"b", "fallback"}, {"z", "fallback"}} {
-		if got := srv.storedPartitionKey(context.Background(), tc.txid, "fallback"); got != tc.want {
+		if got := srv.storedPartitionKey(context.Background(), tc.txid, "fallback", false); got != tc.want {
 			t.Errorf("%s: key = %q, want %q", tc.txid, got, tc.want)
 		}
 	}
 	st.err = errors.New("down")
-	if got := srv.storedPartitionKey(context.Background(), "a", "fallback"); got != "fallback" {
+	if got := srv.storedPartitionKey(context.Background(), "a", "fallback", false); got != "fallback" {
 		t.Errorf("lookup error: key = %q, want fallback", got)
+	}
+}
+
+// TestInheritStoredPartitionKeys_PendingMemberBeatsRejected: family {a, b},
+// a sorts first and is REJECTED with a stale key; b is RECEIVED and its
+// earlier message is pending under kP. The family must stay on kP — moving it
+// to a's key would republish b onto a second partition.
+func TestInheritStoredPartitionKeys_PendingMemberBeatsRejected(t *testing.T) {
+	st := &keyLookupStore{rows: map[string]store.ParentKey{
+		"a": {Status: models.StatusRejected, PartitionKey: "kStale"},
+		"b": {Status: models.StatusReceived, PartitionKey: "kP"},
+	}}
+	keyByTxid := map[string]string{"a": "a", "b": "a"}
+	keyingServer(st, 8).inheritStoredPartitionKeys(context.Background(), keyByTxid, map[string][]string{"a": {}, "b": {"a"}})
+	if keyByTxid["a"] != "kP" || keyByTxid["b"] != "kP" {
+		t.Fatalf("keys = %v, want the family on the pending member's kP", keyByTxid)
+	}
+}
+
+// TestAdoptStoredFamilyKeys_AgreeingPendingMemberLocksFamily: both members lost
+// the CAS. a is RECEIVED and its stored key kP already matches the routing key;
+// b sorts later and is REJECTED with kB. The agreeing pending member must lock
+// the family on kP rather than let b's key move it.
+func TestAdoptStoredFamilyKeys_AgreeingPendingMemberLocksFamily(t *testing.T) {
+	st := &keyLookupStore{rows: map[string]store.ParentKey{
+		"a": {Status: models.StatusReceived, PartitionKey: "kP"},
+		"b": {Status: models.StatusRejected, PartitionKey: "kB"},
+	}}
+	keyByTxid := map[string]string{"a": "kP", "b": "kP"}
+	famByTxid := map[string]string{"a": "a", "b": "a"}
+	keyingServer(st, 8).adoptStoredFamilyKeys(context.Background(), keyByTxid, famByTxid, []string{"b", "a"})
+	if keyByTxid["a"] != "kP" || keyByTxid["b"] != "kP" {
+		t.Fatalf("keys = %v, want the family locked on a's kP", keyByTxid)
+	}
+}
+
+// TestBatchPartitionKeyLookupsAreChunked: a large POST /txs never sends one
+// unbounded LookupPartitionKeys, and the chunked results are merged.
+func TestBatchPartitionKeyLookupsAreChunked(t *testing.T) {
+	n := 2*partitionKeyLookupChunk + 7
+	keyByTxid := make(map[string]string, n)
+	inputsByTxid := make(map[string][]string, n)
+	for i := range n {
+		id := fmt.Sprintf("t%06d", i)
+		keyByTxid[id] = id
+		inputsByTxid[id] = nil
+	}
+	last := fmt.Sprintf("t%06d", n-1)
+	st := &keyLookupStore{rows: map[string]store.ParentKey{last: {Status: models.StatusReceived, PartitionKey: "kLast"}}}
+	keyingServer(st, 8).inheritStoredPartitionKeys(context.Background(), keyByTxid, inputsByTxid)
+	if len(st.asked) != 3 {
+		t.Fatalf("lookups = %d, want 3 chunks", len(st.asked))
+	}
+	for i, ids := range st.asked {
+		if len(ids) > partitionKeyLookupChunk {
+			t.Fatalf("lookup %d carried %d txids, cap %d", i, len(ids), partitionKeyLookupChunk)
+		}
+	}
+	if keyByTxid[last] != "kLast" {
+		t.Fatalf("row from the last chunk was not merged: key = %q", keyByTxid[last])
+	}
+
+	st.asked = nil
+	ids := make([]string, 0, n)
+	for id := range keyByTxid {
+		ids = append(ids, id)
+	}
+	keyingServer(st, 8).adoptStoredFamilyKeys(context.Background(), keyByTxid, maps.Clone(keyByTxid), ids)
+	for i, got := range st.asked {
+		if len(got) > partitionKeyLookupChunk {
+			t.Fatalf("adopt lookup %d carried %d txids, cap %d", i, len(got), partitionKeyLookupChunk)
+		}
 	}
 }

@@ -34,6 +34,8 @@ type keyedMemStore struct {
 	// beforeCAS runs once per txid ahead of its first GetOrInsertStatus, to
 	// model a concurrent request inserting between lookup and CAS.
 	beforeCAS map[string]func()
+	// lookups counts LookupPartitionKeys round-trips.
+	lookups int
 }
 
 func newKeyedMemStore() *keyedMemStore {
@@ -82,6 +84,7 @@ func (s *keyedMemStore) GetOrInsertStatus(_ context.Context, in *models.Transact
 func (s *keyedMemStore) LookupPartitionKeys(_ context.Context, txids []string) (map[string]store.ParentKey, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.lookups++
 	out := map[string]store.ParentKey{}
 	for _, id := range txids {
 		if r, ok := s.rows[id]; ok {
@@ -224,6 +227,29 @@ func TestSubmitTransaction_CASLoserRepublishesUnderStoredKey(t *testing.T) {
 	}
 	if got := lastSendKey(t, broker); got != "kP" {
 		t.Errorf("loser republished under %q, want the winner's stored kP", got)
+	}
+}
+
+// TestSubmitTransaction_RetryOfSeenRowReadsKeyOnce: a retry of a stranded
+// RECEIVED row already got the row's stored key from the pre-CAS lookup, so
+// the CAS loser republishes under it without a second read.
+func TestSubmitTransaction_RetryOfSeenRowReadsKeyOnce(t *testing.T) {
+	_, c1, _, _ := externalParentChain()
+	c1id := c1.TxID().String()
+	st := newKeyedMemStore()
+	st.put(c1id, models.StatusReceived, "kOld")
+	broker, router := keyedServer(t, st)
+
+	if code := postKeyed(t, router, "/tx", c1.Bytes()); code != http.StatusAccepted {
+		t.Fatalf("POST /tx = %d", code)
+	}
+	if got := lastSendKey(t, broker); got != "kOld" {
+		t.Errorf("retry republished under %q, want the stored kOld", got)
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.lookups != 1 {
+		t.Errorf("partition-key lookups = %d, want 1", st.lookups)
 	}
 }
 

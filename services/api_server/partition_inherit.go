@@ -2,18 +2,27 @@ package api_server
 
 import (
 	"context"
+	"maps"
+	"slices"
 	"sort"
 
 	"go.uber.org/zap"
 
 	"github.com/bsv-blockchain/broadcaster/logfields"
 	"github.com/bsv-blockchain/broadcaster/models"
+	"github.com/bsv-blockchain/broadcaster/store"
 )
 
 // maxBatchParentLookups caps the external parents one POST /txs consults. The
-// batch's own txids are always looked up (their stored keys bind resubmits),
-// so one projected read covers at most the batch plus this many parents.
+// batch's own txids are always looked up (their stored keys bind resubmits).
 const maxBatchParentLookups = 256
+
+// partitionKeyLookupChunk bounds the txids of one LookupPartitionKeys call. A
+// POST /txs body may carry hundreds of thousands of transactions; a single
+// read over all of them would build a Mongo $in past the 16 MB BSON document
+// limit (failing the lookup, so inheritance silently falls back) or one
+// unbounded Aerospike BatchGet.
+const partitionKeyLookupChunk = 1000
 
 // partitionKeyForSubmit decides the propagation partition key of a single
 // POST /tx submission.
@@ -28,8 +37,8 @@ const maxBatchParentLookups = 256
 // hops 22–50 parked for minutes).
 //
 // The fix: look the submission's parents up in the store and, when one is
-// still at a status the network may not have acknowledged (RECEIVED or
-// PENDING_RETRY), reuse the partition key that parent was published with.
+// still held by a dispatcher (RECEIVED or SENT_TO_NETWORK), reuse the
+// partition key that parent was published with.
 // Same key ⇒ same partition ⇒ the dep-aware dispatcher holds the child behind
 // its in-flight parent exactly as it does within one request. A parent at
 // ACCEPTED_BY_NETWORK or beyond is already known to Teranode, so the child
@@ -39,29 +48,36 @@ const maxBatchParentLookups = 256
 //
 // Best-effort: a lookup failure, a parent written before keys were persisted,
 // or more parents than ParentKeyLookupMaxInputs all fall back to the own-txid
-// key and the missing-parent safety net.
-func (s *Server) partitionKeyForSubmit(ctx context.Context, txid string, inputs []string) string {
+// key and the missing-parent safety net. So does a parent being resubmitted
+// after REJECTED: its row stays REJECTED until the rebroadcast's verdict, so
+// it does not count as in flight.
+//
+// ownSeen reports whether the lookup found txid's own row: a CAS loser then
+// already holds the stored key (or the row has none) and need not read it
+// again (storedPartitionKey).
+func (s *Server) partitionKeyForSubmit(ctx context.Context, txid string, inputs []string) (key string, ownSeen bool) {
 	maxInputs := s.cfg.Propagation.ParentKeyLookupMaxInputs
 	if s.store == nil || maxInputs <= 0 {
-		return txid
+		return txid, false
 	}
 	parents := distinctParents(txid, inputs, maxInputs)
 	rows, err := s.store.LookupPartitionKeys(ctx, append(parents, txid))
 	if err != nil {
 		s.logger.Warn("parent partition-key lookup failed; keying by txid", logfields.TxID(txid), zap.Error(err))
-		return txid
+		return txid, false
 	}
-	if own, ok := rows[txid]; ok && own.PartitionKey != "" {
-		return own.PartitionKey
+	own, ownSeen := rows[txid]
+	if ownSeen && own.PartitionKey != "" {
+		return own.PartitionKey, true
 	}
 	for _, p := range parents {
 		if pk, ok := rows[p]; ok && pk.PartitionKey != "" && parentStillPending(pk.Status) {
 			s.logger.Debug("partition key inherited from in-flight parent",
 				logfields.TxID(txid), zap.String("parent", p), zap.String("parent_status", string(pk.Status)))
-			return pk.PartitionKey
+			return pk.PartitionKey, ownSeen
 		}
 	}
-	return txid
+	return txid, ownSeen
 }
 
 // inheritStoredPartitionKeys re-keys the dependency families of a POST /txs
@@ -73,7 +89,9 @@ func (s *Server) partitionKeyForSubmit(ctx context.Context, txid string, inputs 
 //     An unchanged retry of a batch whose first send failed therefore
 //     publishes under the stored keys even if an external parent has since
 //     been accepted, rather than recomputing a natural key that a child
-//     following the stored key would miss.
+//     following the stored key would miss. When members disagree, one whose
+//     message is still held by a dispatcher beats a REJECTED one, whose key
+//     no message is pending under (bindingKeys).
 //  2. Otherwise a family whose parent OUTSIDE the batch is still in flight
 //     joins that parent's partition.
 //  3. Otherwise the family keeps its natural key.
@@ -108,25 +126,13 @@ func (s *Server) inheritStoredPartitionKeys(ctx context.Context, keyByTxid map[s
 		}
 		parentsOf[txid] = ext
 	}
-	rows, err := s.store.LookupPartitionKeys(ctx, append(append(make([]string, 0, len(txids)+len(external)), txids...), external...))
+	rows, err := s.lookupPartitionKeys(ctx, append(append(make([]string, 0, len(txids)+len(external)), txids...), external...))
 	if err != nil {
 		s.logger.Warn("batch partition-key lookup failed; keying by family", zap.Int("txs", len(txids)), zap.Int("parents", len(external)), zap.Error(err))
 		return
 	}
-	remap := make(map[string]string) // family key -> inherited key
-	for _, txid := range txids {     // 1: a member's own stored key
-		fam, ok := keyByTxid[txid]
-		if !ok {
-			continue
-		}
-		if _, done := remap[fam]; done {
-			continue
-		}
-		if r, ok := rows[txid]; ok && r.PartitionKey != "" && ownKeyBinds(r.Status) {
-			remap[fam] = r.PartitionKey
-		}
-	}
-	for _, txid := range txids { // 2: the first in-flight external parent
+	remap := bindingKeys(txids, keyByTxid, rows) // 1: a member's own stored key
+	for _, txid := range txids {                 // 2: the first in-flight external parent
 		fam, ok := keyByTxid[txid]
 		if !ok {
 			continue
@@ -156,8 +162,12 @@ func (s *Server) inheritStoredPartitionKeys(ctx context.Context, keyByTxid map[s
 // choice would put the same tx on two partitions. GetOrInsertStatus's
 // existing row is not used because not every backend's status read carries the
 // key; LookupPartitionKeys is the one read path for it.
-func (s *Server) storedPartitionKey(ctx context.Context, txid, fallback string) string {
-	if s.store == nil || s.cfg.Propagation.ParentKeyLookupMaxInputs <= 0 {
+//
+// seen means partitionKeyForSubmit already read the row, so fallback is its
+// stored key (or the row has none) and no second read is made. Only a row a
+// concurrent request inserted after that lookup needs one.
+func (s *Server) storedPartitionKey(ctx context.Context, txid, fallback string, seen bool) string {
+	if seen || s.store == nil || s.cfg.Propagation.ParentKeyLookupMaxInputs <= 0 {
 		return fallback
 	}
 	rows, err := s.store.LookupPartitionKeys(ctx, []string{txid})
@@ -182,6 +192,11 @@ func (s *Server) storedPartitionKey(ctx context.Context, txid, fallback string) 
 // families the same key (two children of one in-flight parent), and moving
 // one of them must not drag the other off the key its rows were stored under.
 //
+// The family settles on the key of its best-ranked republished member
+// (bindingKeys): a RECEIVED member's pending message pins the family even
+// when that key is the one already chosen, so a REJECTED member's stale key
+// sorting later cannot move the family off it.
+//
 // Residual: a member of that family that THIS request inserted has already
 // persisted the pre-CAS key, and a child later following it can miss the
 // dispatcher. That needs two concurrent batches straddling a parent's
@@ -192,29 +207,59 @@ func (s *Server) adoptStoredFamilyKeys(ctx context.Context, keyByTxid, famByTxid
 	}
 	ids := append([]string(nil), republished...)
 	sort.Strings(ids) // deterministic precedence when members disagree
-	rows, err := s.store.LookupPartitionKeys(ctx, ids)
+	rows, err := s.lookupPartitionKeys(ctx, ids)
 	if err != nil {
 		s.logger.Warn("republish partition-key lookup failed; keeping computed keys", zap.Int("txs", len(ids)), zap.Error(err))
 		return
 	}
-	remap := make(map[string]string) // natural family key -> stored key
-	for _, txid := range ids {
-		fam, ok := famByTxid[txid]
-		if !ok {
-			continue
-		}
-		if _, done := remap[fam]; done {
-			continue
-		}
-		if r, ok := rows[txid]; ok && r.PartitionKey != "" && r.PartitionKey != keyByTxid[txid] {
-			remap[fam] = r.PartitionKey
-		}
-	}
+	remap := bindingKeys(ids, famByTxid, rows) // natural family key -> stored key
 	for txid, fam := range famByTxid {
 		if nk, ok := remap[fam]; ok {
 			keyByTxid[txid] = nk
 		}
 	}
+}
+
+// bindingKeys picks, per family (famOf), the stored key the family must carry:
+// that of the best-ranked member among txids (keyBindRank), the first in
+// txids order on a tie. Members with no stored key or a non-binding status
+// pick nothing; a family with no pick is absent from the result.
+func bindingKeys(txids []string, famOf map[string]string, rows map[string]store.ParentKey) map[string]string {
+	picked := make(map[string]string)
+	rank := make(map[string]int)
+	for _, txid := range txids {
+		fam, ok := famOf[txid]
+		if !ok {
+			continue
+		}
+		r, ok := rows[txid]
+		if !ok || r.PartitionKey == "" {
+			continue
+		}
+		if rk := keyBindRank(r.Status); rk > rank[fam] {
+			rank[fam] = rk
+			picked[fam] = r.PartitionKey
+		}
+	}
+	return picked
+}
+
+// lookupPartitionKeys is LookupPartitionKeys in partitionKeyLookupChunk-sized
+// reads, merged. Any chunk's error fails the whole lookup, as a single read
+// would.
+func (s *Server) lookupPartitionKeys(ctx context.Context, txids []string) (map[string]store.ParentKey, error) {
+	if len(txids) <= partitionKeyLookupChunk {
+		return s.store.LookupPartitionKeys(ctx, txids)
+	}
+	out := make(map[string]store.ParentKey, len(txids))
+	for chunk := range slices.Chunk(txids, partitionKeyLookupChunk) {
+		rows, err := s.store.LookupPartitionKeys(ctx, chunk)
+		if err != nil {
+			return nil, err
+		}
+		maps.Copy(out, rows)
+	}
+	return out, nil
 }
 
 // distinctParents returns up to limit distinct source txids of a transaction,
@@ -238,23 +283,36 @@ func distinctParents(txid string, inputs []string, limit int) []string {
 	return out
 }
 
-// ownKeyBinds reports whether a batch member's stored key must carry over to
-// this submission: its earlier message may still be in flight (a child in the
-// family must follow it), or the row is republished (RECEIVED, REJECTED) and
-// must keep the key it went out under. An ACCEPTED-or-later member is on the
-// network and does not hold its family.
-func ownKeyBinds(st models.Status) bool {
-	return parentStillPending(st) || st == models.StatusRejected
+// keyBindRank ranks how strongly a batch member's stored key must carry over
+// to this submission; 0 means it does not bind. A member whose earlier message
+// is still held by a dispatcher (parentStillPending) ranks highest: a second
+// copy under another key would reach a second dispatcher, and the family's
+// children must follow it. A REJECTED member is republished and keeps the key
+// it went out under, but no message is pending under that key, so it yields
+// to a pending member. An ACCEPTED-or-later or parked member does not hold its
+// family.
+func keyBindRank(st models.Status) int {
+	switch {
+	case parentStillPending(st):
+		return 2
+	case st == models.StatusRejected:
+		return 1
+	default:
+		return 0
+	}
 }
 
-// parentStillPending reports whether a parent's row is at a status the network
-// may not have acknowledged yet, so its child must reach the same dispatcher
-// to be held behind it. ACCEPTED_BY_NETWORK and beyond mean Teranode has the
-// parent and the child can go anywhere; a REJECTED parent is left to the
+// parentStillPending reports whether a parent's message is still held by a
+// dispatcher, so its child must reach the same dispatcher to be held behind
+// it. ACCEPTED_BY_NETWORK and beyond mean Teranode has the parent and the
+// child can go anywhere. PENDING_RETRY does not count: the dispatcher drops a
+// parked tx from its in-flight set and the reaper rebroadcasts it from the
+// store, not through Kafka, so following its key holds nothing and only
+// funnels a parked chain onto one partition. A REJECTED parent is left to the
 // missing-parent cascade, which rejects the child from the store.
 func parentStillPending(st models.Status) bool {
 	switch st {
-	case models.StatusReceived, models.StatusSentToNetwork, models.StatusPendingRetry:
+	case models.StatusReceived, models.StatusSentToNetwork:
 		return true
 	default:
 		return false

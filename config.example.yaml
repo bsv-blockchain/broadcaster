@@ -314,7 +314,7 @@ health:
 #   partitions: 1
 #
 #   # A single-transaction POST /tx keys its propagation message like an
-#   # in-flight (RECEIVED / PENDING_RETRY) parent it spends, so a chain
+#   # in-flight (RECEIVED / SENT_TO_NETWORK) parent it spends, so a chain
 #   # submitted one request at a time lands on one partition and the
 #   # dependency-aware dispatcher holds each child behind its parent instead
 #   # of letting it draw TX_MISSING_PARENT and park. This is how many of the

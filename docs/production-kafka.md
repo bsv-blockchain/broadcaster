@@ -51,9 +51,12 @@ delivers parents before children.
 
 Chains that span requests get the same treatment through the store: every row
 persists the partition key its message was published with, and a single
-`POST /tx` whose input spends a transaction still in flight (`RECEIVED` or
-`PENDING_RETRY`) reuses that parent's key (`propagation.parent_key_lookup_max_inputs`
-bounds how many inputs are consulted). A wallet paying out of its own
+`POST /tx` whose input spends a transaction still held by a dispatcher
+(`RECEIVED` or `SENT_TO_NETWORK`) reuses that parent's key
+(`propagation.parent_key_lookup_max_inputs` bounds how many inputs are
+consulted). A parent parked at `PENDING_RETRY` is not followed: the dispatcher
+has released it and the reaper rebroadcasts it outside Kafka, so a child of a
+parked parent goes through the missing-parent safety net. A wallet paying out of its own
 unconfirmed change one request at a time therefore lands its whole chain on
 one partition, and each hop is held behind the previous one instead of racing
 it to the datahub. A `POST /txs` family whose parent outside the batch is in

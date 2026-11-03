@@ -579,8 +579,9 @@ type PropagationConfig struct {
 	// Since the hosted-service report (issue 2) a single-tx POST /tx also
 	// keys like an in-flight parent it spends: the api-server looks the
 	// parents up in the store (LookupPartitionKeys) and reuses the key a
-	// RECEIVED/PENDING_RETRY parent was published with, so a chain submitted
-	// one request at a time still lands on one partition. A resubmission
+	// parent still held by a dispatcher (RECEIVED/SENT_TO_NETWORK) was
+	// published with, so a chain submitted one request at a time still lands
+	// on one partition. A resubmission
 	// (single or batch) reuses the key its row was stored with. Bounded by
 	// ParentKeyLookupMaxInputs.
 	Partitions int `mapstructure:"partitions"`

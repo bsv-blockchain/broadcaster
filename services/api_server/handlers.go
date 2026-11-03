@@ -953,7 +953,7 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 	// same txid both attempt the insert; the loser sees inserted=false
 	// and returns 202 idempotently without re-publishing.
 	inputTXIDs := collectInputTXIDs(parsedTx)
-	partitionKey := s.partitionKeyForSubmit(c.Request.Context(), txid, inputTXIDs)
+	partitionKey, ownSeen := s.partitionKeyForSubmit(c.Request.Context(), txid, inputTXIDs)
 	submitResult := "new"
 	if s.store != nil {
 		row := &models.TransactionStatus{
@@ -984,7 +984,8 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 			}
 			// Republish under the key the row was stored with: a concurrent
 			// identical submission may have won the CAS with a different key.
-			partitionKey = s.storedPartitionKey(c.Request.Context(), txid, partitionKey)
+			// A row seen by the pre-CAS lookup already supplied its key.
+			partitionKey = s.storedPartitionKey(c.Request.Context(), txid, partitionKey, ownSeen)
 		case !inserted && existing != nil:
 			// Idempotent re-submit: row already exists at a non-REJECTED
 			// status. Register the txid with the in-process TxTracker so
