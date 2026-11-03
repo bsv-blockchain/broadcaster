@@ -2,6 +2,7 @@ package sse
 
 import (
 	"bufio"
+	"fmt"
 	"net/http"
 	"strings"
 	"testing"
@@ -33,6 +34,13 @@ type staleStream struct {
 // its stream, closed when the test ends.
 func openStaleStream(t *testing.T, h *e2eHarness, txids ...string) staleStream {
 	t.Helper()
+	return openStaleStreamFrom(t, h, "", txids...)
+}
+
+// openStaleStreamFrom is openStaleStream with a Last-Event-ID, as a reconnect
+// sends; empty means a fresh connect.
+func openStaleStreamFrom(t *testing.T, h *e2eHarness, lastEventID string, txids ...string) staleStream {
+	t.Helper()
 	subs := make([]*models.Submission, 0, len(txids)+1)
 	for _, txid := range append(txids, staleSentinel) {
 		subs = append(subs, &models.Submission{TxID: txid, CallbackToken: staleTok})
@@ -41,6 +49,9 @@ func openStaleStream(t *testing.T, h *e2eHarness, txids ...string) staleStream {
 	h.store.subsByToken[staleTok] = subs
 	h.store.mu.Unlock()
 	req, _ := http.NewRequestWithContext(t.Context(), http.MethodGet, h.httpSrv.URL+"/events?callbackToken="+staleTok, nil)
+	if lastEventID != "" {
+		req.Header.Set("Last-Event-ID", lastEventID)
+	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("GET /events: %v", err)
@@ -186,9 +197,49 @@ func TestSSE_StaleReceived_AfterCatchupIsSkipped(t *testing.T) {
 	assertStream(t, readUntilSentinel(t, h, body))
 }
 
+// TestSSE_StaleReceived_AfterReconnectCatchupMinedIsSkipped is the reviewer's
+// reproduction: request A inserts the row and pauses while a duplicate's
+// attempt carries the tx into a block. A reconnect with Last-Event-ID gets the
+// stored MINED row from catchup; A's RECEIVED arriving afterwards must not
+// regress the stream.
+func TestSSE_StaleReceived_AfterReconnectCatchupMinedIsSkipped(t *testing.T) {
+	h := newE2EHarness(t)
+	t.Cleanup(h.Close)
+	waitForSubscriberReady()
+	since := time.Now().UTC().Add(-time.Minute)
+	h.store.setStatus("tx-a", ev("tx-a", models.StatusMined))
+	body := openStaleStreamFrom(t, h, fmt.Sprintf("%d", since.UnixNano()), "tx-a")
+
+	frame, err := readNextSSEFrame(body.reader, 3*time.Second)
+	if err != nil {
+		t.Fatalf("read catchup frame: %v", err)
+	}
+	if got := framePair(frame); got != "tx-a:MINED" {
+		t.Fatalf("catchup frame = %s, want tx-a:MINED", got)
+	}
+	publish(t, h, ev("tx-a", models.StatusReceived), false)
+
+	assertStream(t, readUntilSentinel(t, h, body))
+}
+
+// TestSSE_StaleReceived_AfterLiveMinedIsSkipped: the same race on an open
+// stream — MINED is written live, then the delayed inserter's RECEIVED.
+func TestSSE_StaleReceived_AfterLiveMinedIsSkipped(t *testing.T) {
+	h := newE2EHarness(t)
+	t.Cleanup(h.Close)
+	waitForSubscriberReady()
+	body := openStaleStream(t, h, "tx-a")
+	time.Sleep(100 * time.Millisecond)
+
+	publish(t, h, ev("tx-a", models.StatusMined), true)
+	publish(t, h, ev("tx-a", models.StatusReceived), false)
+
+	assertStream(t, readUntilSentinel(t, h, body), "tx-a:MINED")
+}
+
 // TestClientAdmit covers the rules the stream tests rely on, including the
-// ones they cannot reach cheaply: block statuses are not recorded, and the
-// set is bounded.
+// ones they cannot reach cheaply: block statuses are recorded in their own
+// ring, and each ring is bounded.
 func TestClientAdmit(t *testing.T) {
 	st := func(txid string, s models.Status) *models.TransactionStatus {
 		return &models.TransactionStatus{TxID: txid, Status: s}
@@ -200,8 +251,18 @@ func TestClientAdmit(t *testing.T) {
 	if !c.admit(st("a", models.StatusSeenOnNetwork)) || c.admit(st("a", models.StatusReceived)) {
 		t.Fatal("RECEIVED after SEEN_ON_NETWORK admitted")
 	}
-	if !c.admit(st("m", models.StatusMined)) || !c.admit(st("m", models.StatusReceived)) {
-		t.Fatal("MINED must not be recorded")
+	if !c.admit(st("m", models.StatusMined)) || c.admit(st("m", models.StatusReceived)) {
+		t.Fatal("RECEIVED after MINED admitted")
+	}
+	if !c.admit(st("i", models.StatusImmutable)) || c.admit(st("i", models.StatusReceived)) {
+		t.Fatal("RECEIVED after IMMUTABLE admitted")
+	}
+	// A block burst fills its own ring and leaves verdict txids in place.
+	for i := range progressedCapacity + 1 {
+		c.admit(st(fmt.Sprintf("blk-%d", i), models.StatusMined))
+	}
+	if c.admit(st("a", models.StatusReceived)) {
+		t.Fatal("a block burst evicted a verdict txid")
 	}
 	if !(*Client)(nil).admit(st("a", models.StatusReceived)) {
 		t.Fatal("nil client must admit")

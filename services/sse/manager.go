@@ -78,10 +78,13 @@ type Client struct {
 	// shared delay relocates a reconnect herd instead of dispersing it.
 	drainRetryMS atomic.Int64
 
-	// progressed holds txids this stream has already been written a status
-	// past RECEIVED for, so a RECEIVED that reaches the writer afterwards is
-	// skipped (see admit). Owned by the writer goroutine; no locking.
+	// progressed and mined hold txids this stream has already been written a
+	// status past RECEIVED for, so a RECEIVED that reaches the writer
+	// afterwards is skipped (see admit). Block statuses get their own ring so
+	// a big block's burst cannot evict the txids whose verdicts just went out.
+	// Owned by the writer goroutine; no locking.
 	progressed *txidRing
+	mined      *txidRing
 }
 
 // admit reports whether status may be written to this client's stream, and
@@ -103,14 +106,18 @@ func (c *Client) admit(status *models.TransactionStatus) bool {
 	}
 	switch status.Status {
 	case models.StatusReceived:
-		if c.progressed != nil && c.progressed.has(status.TxID) {
+		if c.progressed.has(status.TxID) || c.mined.has(status.TxID) {
 			metrics.APISSEDroppedTotal.WithLabelValues("stale_received").Inc()
 			return false
 		}
 	case models.StatusMined, models.StatusImmutable:
-		// A RECEIVED trailing a block event by a whole block interval does
-		// not happen; leaving block bursts out keeps a big block from
-		// evicting the txids whose verdicts just went out.
+		// The inserting request can pause while a duplicate's attempt carries
+		// the tx into a block, and a reconnect's catchup serves the MINED row
+		// before that RECEIVED arrives.
+		if c.mined == nil {
+			c.mined = newTxidRing(progressedCapacity)
+		}
+		c.mined.add(status.TxID)
 	default:
 		if c.progressed == nil {
 			c.progressed = newTxidRing(progressedCapacity)
@@ -120,10 +127,11 @@ func (c *Client) admit(status *models.TransactionStatus) bool {
 	return true
 }
 
-// progressedCapacity bounds Client.progressed. A trailing RECEIVED arrives
-// within the intake pause or partition skew of its verdict, so only the most
-// recent txids matter; at ~100 B per entry this caps a firehose client's set
-// near 1.6 MB, and a token-scoped client's set stays at its own txids.
+// progressedCapacity bounds each of Client.progressed and Client.mined. A
+// trailing RECEIVED arrives within the intake pause or partition skew of its
+// verdict, so only the most recent txids matter; at ~100 B per entry this caps
+// a firehose client near 3.2 MB, and a token-scoped client's sets stay at its
+// own txids.
 const progressedCapacity = 16384
 
 // txidRing is a fixed-capacity set that evicts its oldest entry when full.
@@ -138,6 +146,9 @@ func newTxidRing(capacity int) *txidRing {
 }
 
 func (r *txidRing) has(txid string) bool {
+	if r == nil {
+		return false
+	}
 	_, ok := r.set[txid]
 	return ok
 }
