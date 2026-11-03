@@ -342,6 +342,9 @@ func (s *Store) GetOrInsertStatus(ctx context.Context, status *models.Transactio
 	if status.ExtraInfo != "" {
 		bins["extra_info"] = status.ExtraInfo
 	}
+	if status.PartitionKey != "" {
+		bins["partition_key"] = status.PartitionKey
+	}
 
 	policy := s.writePolicy(ctx)
 	policy.RecordExistsAction = aero.CREATE_ONLY
@@ -3523,6 +3526,7 @@ func recordToStatus(rec *aero.Record, txid string) *models.TransactionStatus {
 	if ms := getInt64(rec, "next_retry_at"); ms > 0 {
 		status.NextRetryAt = time.UnixMilli(ms)
 	}
+	status.PartitionKey = getString(rec, "partition_key")
 	for _, a := range orphanedAnchorsFromRecord(rec) {
 		status.OrphanedProofs = append(status.OrphanedProofs, models.OrphanedAnchor{
 			BlockHash:   a.BlockHash,
@@ -3759,4 +3763,33 @@ func getInt64(rec *aero.Record, bin string) int64 {
 		}
 	}
 	return 0
+}
+
+// LookupPartitionKeys implements store.Store with one batch read of two bins.
+func (s *Store) LookupPartitionKeys(ctx context.Context, txids []string) (map[string]store.ParentKey, error) {
+	out := make(map[string]store.ParentKey, len(txids))
+	keys := make([]*aero.Key, 0, len(txids))
+	ids := make([]string, 0, len(txids))
+	for _, txid := range txids {
+		key, err := s.key(setTransactions, txid)
+		if err != nil {
+			continue
+		}
+		keys = append(keys, key)
+		ids = append(ids, txid)
+	}
+	if len(keys) == 0 {
+		return out, nil
+	}
+	recs, err := s.client.BatchGet(s.batchPolicy(ctx), keys, "status", "partition_key")
+	if err != nil {
+		return nil, fmt.Errorf("lookup partition keys: %w", err)
+	}
+	for i, rec := range recs {
+		if rec == nil || i >= len(ids) {
+			continue
+		}
+		out[ids[i]] = store.ParentKey{Status: models.Status(getString(rec, "status")), PartitionKey: getString(rec, "partition_key")}
+	}
+	return out, nil
 }

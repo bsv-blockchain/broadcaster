@@ -133,8 +133,8 @@ func (s *Store) GetOrInsertStatus(ctx context.Context, status *models.Transactio
 	const q = `
 INSERT INTO transactions (txid, status, status_code, block_hash, block_height,
     merkle_path, extra_info, competing_txs, raw_tx, retry_count,
-    next_retry_at, timestamp_at, created_at, merkle_registered_at)
-VALUES ($1,$2,NULLIF($3,0),NULLIF($4,''),NULLIF($5,0),$6,NULLIF($7,''),$8,$9,$10,$11,$12,$13,$14)
+    next_retry_at, timestamp_at, created_at, merkle_registered_at, partition_key)
+VALUES ($1,$2,NULLIF($3,0),NULLIF($4,''),NULLIF($5,0),$6,NULLIF($7,''),$8,$9,$10,$11,$12,$13,$14,NULLIF($15,''))
 ON CONFLICT (txid) DO NOTHING`
 
 	var nextRetry any
@@ -153,6 +153,7 @@ ON CONFLICT (txid) DO NOTHING`
 		[]byte(status.MerklePath), status.ExtraInfo, competing,
 		[]byte(status.RawTx), status.RetryCount,
 		nextRetry, status.Timestamp, status.CreatedAt, merkleRegisteredAt,
+		status.PartitionKey,
 	)
 	if err != nil {
 		return nil, false, fmt.Errorf("insert tx %s: %w", status.TxID, err)
@@ -171,7 +172,7 @@ ON CONFLICT (txid) DO NOTHING`
 // columnsPerInsertRow is how many placeholders one row in the multi-row
 // INSERT VALUES list consumes. Matches the column list in the static SQL
 // fragment built by BatchGetOrInsertStatus.
-const columnsPerInsertRow = 14
+const columnsPerInsertRow = 15
 
 // BatchGetOrInsertStatus is the multi-row form of GetOrInsertStatus. It uses
 // the "xmax = 0" trick: ON CONFLICT DO UPDATE SET txid = excluded.txid is a
@@ -240,6 +241,7 @@ func (s *Store) BatchGetOrInsertStatus(ctx context.Context, statuses []*models.T
 			[]byte(st.MerklePath), st.ExtraInfo, competing,
 			[]byte(st.RawTx), st.RetryCount,
 			nextRetry, ts, now, merkleRegisteredAt,
+			st.PartitionKey,
 		)
 	}
 
@@ -253,16 +255,16 @@ func (s *Store) BatchGetOrInsertStatus(ctx context.Context, statuses []*models.T
 		base := i * columnsPerInsertRow
 		fmt.Fprintf(
 			&values,
-			"($%d,$%d,NULLIF($%d,0),NULLIF($%d,''),NULLIF($%d,0),$%d,NULLIF($%d,''),$%d,$%d,$%d,$%d,$%d,$%d,$%d)",
+			"($%d,$%d,NULLIF($%d,0),NULLIF($%d,''),NULLIF($%d,0),$%d,NULLIF($%d,''),$%d,$%d,$%d,$%d,$%d,$%d,$%d,NULLIF($%d,''))",
 			base+1, base+2, base+3, base+4, base+5, base+6, base+7,
-			base+8, base+9, base+10, base+11, base+12, base+13, base+14,
+			base+8, base+9, base+10, base+11, base+12, base+13, base+14, base+15,
 		)
 	}
 
 	q := `
 INSERT INTO transactions (txid, status, status_code, block_hash, block_height,
     merkle_path, extra_info, competing_txs, raw_tx, retry_count,
-    next_retry_at, timestamp_at, created_at, merkle_registered_at)
+    next_retry_at, timestamp_at, created_at, merkle_registered_at, partition_key)
 VALUES ` + values.String() + `
 ON CONFLICT (txid) DO UPDATE SET txid = transactions.txid
 RETURNING txid, status, status_code, block_hash, block_height, merkle_path,
@@ -2320,4 +2322,26 @@ func (s *Store) DeleteBUMPByBlockHash(ctx context.Context, blockHash string) err
 	}
 	s.bumpCache.Remove(blockHash)
 	return nil
+}
+
+// LookupPartitionKeys implements store.Store with one projected query.
+func (s *Store) LookupPartitionKeys(ctx context.Context, txids []string) (map[string]store.ParentKey, error) {
+	if len(txids) == 0 {
+		return nil, nil
+	}
+	rows, err := s.pool.Query(ctx,
+		`SELECT txid, status, COALESCE(partition_key, '') FROM transactions WHERE txid = ANY($1)`, txids)
+	if err != nil {
+		return nil, fmt.Errorf("lookup partition keys: %w", err)
+	}
+	defer rows.Close()
+	out := make(map[string]store.ParentKey, len(txids))
+	for rows.Next() {
+		var txid, status, key string
+		if err := rows.Scan(&txid, &status, &key); err != nil {
+			return nil, fmt.Errorf("lookup partition keys: %w", err)
+		}
+		out[txid] = store.ParentKey{Status: models.Status(status), PartitionKey: key}
+	}
+	return out, rows.Err()
 }

@@ -126,3 +126,12 @@ func (s retryRecoveryStore) StoredRetryReason(_ context.Context, txid string) (s
 	}
 	return st.RetryReason, nil
 }
+
+// The propagation partition key persists with the row so a child submitted
+// later can key like its in-flight parent.
+func TestPartitionKey_Conformance(t *testing.T) {
+	storetest.RunPartitionKeySuite(t, func(t *testing.T) storetest.PartitionKeyBackend {
+		t.Helper()
+		return newTestStore(t)
+	})
+}

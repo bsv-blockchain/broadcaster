@@ -21,10 +21,12 @@ import (
 // order-independent: a client retrying the same family with the batch
 // shuffled maps to the same partition as the original messages.
 //
-// Only same-submission edges join a family. A parent submitted in an
-// earlier HTTP request may land on a different partition than its child;
-// that residual race is absorbed by the propagator's missing-parent
-// safety net rather than by keying (see PropagationConfig.Partitions).
+// Only same-submission edges join a family here. A parent submitted in an
+// earlier HTTP request is handled by partitionKeyForSubmit /
+// inheritStoredPartitionKeys (partition_inherit.go), which reuse the key an
+// in-flight parent's row persisted; what that cannot cover (child before
+// parent, parent already on the network) is absorbed by the propagator's
+// missing-parent safety net (see PropagationConfig.Partitions).
 //
 // inputs[i] holds the source txids of tx i's inputs (collectInputTXIDs).
 // Empty strings and self-references are ignored, mirroring the dispatcher's

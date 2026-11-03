@@ -9,6 +9,7 @@ import (
 	"errors"
 	"html/template"
 	"io"
+	"maps"
 	"net/http"
 	"strings"
 	"time"
@@ -893,10 +894,12 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 		return
 	}
 
-	// Publish to transaction topic for validation. Keying by txid pins the tx
-	// to one Kafka partition, so any re-submission (retry, user double-post)
-	// lands on the same consumer — a future idempotency check can then see the
-	// duplicate instead of having it fan out across replicas.
+	// Publish to transaction topic for validation. The partition key is the
+	// txid, or — when the submission spends an output of a transaction still
+	// in flight through this broadcaster — that parent's key, so the child
+	// lands on the dispatcher holding its parent (partitionKeyForSubmit). A
+	// re-submission (retry, user double-post) keeps its row's key and lands
+	// on the same consumer.
 	//
 	// Raw tx bytes travel as []byte in the JSON payload (encoded as base64 by
 	// encoding/json) so the validator and propagator never hex-decode the body
@@ -949,6 +952,8 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 	// Dedup CAS via GetOrInsertStatus. Two submitters racing on the
 	// same txid both attempt the insert; the loser sees inserted=false
 	// and returns 202 idempotently without re-publishing.
+	inputTXIDs := collectInputTXIDs(parsedTx)
+	partitionKey, ownSeen := s.partitionKeyForSubmit(c.Request.Context(), txid, inputTXIDs)
 	submitResult := "new"
 	if s.store != nil {
 		row := &models.TransactionStatus{
@@ -959,6 +964,8 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 			// reaper can rebroadcast txs that are stuck in non-terminal
 			// states without re-fetching from Kafka or the API caller.
 			RawTx: rawTx,
+			// Persist the key so a child submitted later can follow it.
+			PartitionKey: partitionKey,
 		}
 		existing, inserted, dedupErr := s.store.GetOrInsertStatus(c.Request.Context(), row)
 		switch {
@@ -975,6 +982,10 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 			} else {
 				submitResult = "retry_received"
 			}
+			// Republish under the key the row was stored with: a concurrent
+			// identical submission may have won the CAS with a different key.
+			// A row seen by the pre-CAS lookup already supplied its key.
+			partitionKey = s.storedPartitionKey(c.Request.Context(), txid, partitionKey, ownSeen)
 		case !inserted && existing != nil:
 			// Idempotent re-submit: row already exists at a non-REJECTED
 			// status. Register the txid with the in-process TxTracker so
@@ -1010,9 +1021,9 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 	msg := map[string]interface{}{
 		"txid":        txid,
 		"raw_tx":      rawTx,
-		"input_txids": collectInputTXIDs(parsedTx),
+		"input_txids": inputTXIDs,
 	}
-	if err := s.producer.Send(c.Request.Context(), kafka.TopicPropagation, txid, msg); err != nil {
+	if err := s.producer.Send(c.Request.Context(), kafka.TopicPropagation, partitionKey, msg); err != nil {
 		if errors.Is(err, kafka.ErrBrokerBackpressure) {
 			// Backpressure → shed load to the client. A RECEIVED row may
 			// already exist; shouldRepublishExisting makes the 503 retry
@@ -1310,11 +1321,24 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 		}
 	}
 
+	// Partition keys, computed over the FULL parsed batch (see
+	// familyKeysBySubmittedTxid) and before the CAS so every row persists the
+	// key its message will carry. A family keeps a member's stored key (a
+	// retry rejoins its earlier messages), else joins the partition of an
+	// in-flight parent outside this batch (inheritStoredPartitionKeys).
+	keyByTxid, inputsByTxid := familyKeysBySubmittedTxid(parsed)
+	famByTxid := maps.Clone(keyByTxid) // family identity; inheritance may merge routing keys
+	s.inheritStoredPartitionKeys(c.Request.Context(), keyByTxid, inputsByTxid)
+
 	// Phase 3: dedup CAS per tx. Duplicates are skipped from the
 	// publish but counted in the response so the caller can reconcile.
 	// A dedup error logs but doesn't drop the tx — matches single-tx
 	// best-effort behavior.
 	toPublish := make([]parsedItem, 0, len(parsed))
+	// republished collects CAS losers re-entering toPublish, with the status
+	// that selected them; their stored keys win over this request's choice
+	// (adoptStoredFamilyKeys).
+	republished := make(map[string]models.Status)
 	duplicates := 0
 	newSubmits, retryRejected := 0, 0
 	if s.store != nil {
@@ -1326,7 +1350,8 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 				Timestamp: time.Now(),
 				// Carry the raw bytes on the row so the propagation
 				// reaper can rebroadcast stuck txs without re-fetching.
-				RawTx: p.raw,
+				RawTx:        p.raw,
+				PartitionKey: keyByTxid[p.txid],
 			}
 			existing, inserted, dedupErr := s.store.GetOrInsertStatus(ctx, row)
 			switch {
@@ -1342,6 +1367,7 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 					retryRejected++
 				}
 				toPublish = append(toPublish, p)
+				republished[p.txid] = existing.Status
 			case !inserted && existing != nil:
 				duplicates++
 				// Idempotent re-submit at a non-REJECTED status: register
@@ -1390,7 +1416,7 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 	// multi-partition topic a whole family lands on one partition and
 	// per-partition order still delivers parents before children.
 	if len(toPublish) > 0 {
-		keyByTxid, inputsByTxid := familyKeysBySubmittedTxid(parsed)
+		s.adoptStoredFamilyKeys(ctx, keyByTxid, famByTxid, republished)
 		msgs := propagationMessages(toPublish, keyByTxid, inputsByTxid)
 		if err := s.producer.SendBatch(ctx, kafka.TopicPropagation, msgs); err != nil {
 			if errors.Is(err, kafka.ErrBrokerBackpressure) {

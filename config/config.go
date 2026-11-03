@@ -570,12 +570,31 @@ type PropagationConfig struct {
 	// server keys every propagation message by its dependency family —
 	// all txs of one submission connected through in-batch spends share a
 	// partition key — so per-partition Kafka order still delivers parents
-	// to a dispatcher before their children. Cross-submission chains that
-	// land on different partitions are absorbed by the missing-parent
-	// safety net (TX_MISSING_PARENT is a retryable condition, never a
-	// terminal verdict on its own). Default 1.
-	Partitions        int `mapstructure:"partitions"`
-	MerkleConcurrency int `mapstructure:"merkle_concurrency"`
+	// to a dispatcher before their children. A cross-submission child that
+	// still lands on a different partition (submitted before its parent, or
+	// its parent already accepted) is absorbed by the missing-parent safety
+	// net (TX_MISSING_PARENT is a retryable condition, never a terminal
+	// verdict on its own). Default 1.
+	//
+	// Since the hosted-service report (issue 2) a single-tx POST /tx also
+	// keys like an in-flight parent it spends: the api-server looks the
+	// parents up in the store (LookupPartitionKeys) and reuses the key a
+	// parent still held by a dispatcher (RECEIVED/SENT_TO_NETWORK) was
+	// published with, so a chain submitted one request at a time still lands
+	// on one partition. A resubmission
+	// (single or batch) reuses the key its row was stored with. Bounded by
+	// ParentKeyLookupMaxInputs.
+	Partitions int `mapstructure:"partitions"`
+	// ParentKeyLookupMaxInputs bounds how many of a single POST /tx
+	// submission's inputs the api-server consults in the store to key the
+	// child like an in-flight parent (and how many external parents per tx a
+	// POST /txs family consults). A transaction with more inputs only consults
+	// the first N. 0 disables every partition-key read, the pre-fix
+	// behavior: a single-tx submission keys by its own txid and a batch by
+	// its families, and a resubmission no longer reuses its stored key.
+	// Default 8.
+	ParentKeyLookupMaxInputs int `mapstructure:"parent_key_lookup_max_inputs"`
+	MerkleConcurrency        int `mapstructure:"merkle_concurrency"`
 	// RetryMaxAttempts bounds how many times the propagator will push a
 	// transaction back through the in-memory requeue loop when a broadcast
 	// produced no per-tx network verdict (no healthy peer, body-less 5xx,
@@ -1543,6 +1562,7 @@ func setDefaults() {
 	viper.SetDefault("telemetry.sample_ratio", 1.0)
 	viper.SetDefault("telemetry.export_timeout_ms", 10000)
 	viper.SetDefault("propagation.partitions", 1)
+	viper.SetDefault("propagation.parent_key_lookup_max_inputs", 8)
 	viper.SetDefault("propagation.merkle_concurrency", 10)
 	viper.SetDefault("propagation.retry_max_attempts", 5)
 	viper.SetDefault("propagation.retry_backoff_ms", 2000)

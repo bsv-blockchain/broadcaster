@@ -966,3 +966,30 @@ func (s *Store) cursorBatch() int32 {
 	}
 	return int32(s.batchSize) //nolint:gosec // bounded just above
 }
+
+// LookupPartitionKeys implements store.Store with one projected query.
+func (s *Store) LookupPartitionKeys(ctx context.Context, txids []string) (map[string]store.ParentKey, error) {
+	if len(txids) == 0 {
+		return nil, nil
+	}
+	octx, cancel := s.opCtx(ctx)
+	defer cancel()
+	cur, err := s.tx.Find(octx, doc(kv(fID, doc(kv(opIn, txids)))),
+		options.Find().SetProjection(doc(kv(fStatus, 1), kv(fPartitionKey, 1))))
+	if err != nil {
+		return nil, fmt.Errorf("lookup partition keys: %w", err)
+	}
+	defer func() { _ = cur.Close(octx) }()
+	out := make(map[string]store.ParentKey, len(txids))
+	for cur.Next(octx) {
+		var d txDoc
+		if err := cur.Decode(&d); err != nil {
+			return nil, fmt.Errorf("lookup partition keys: decode: %w", err)
+		}
+		out[d.TxID] = store.ParentKey{Status: models.Status(d.Status), PartitionKey: d.PartitionKey}
+	}
+	if err := cur.Err(); err != nil {
+		return nil, fmt.Errorf("lookup partition keys: %w", err)
+	}
+	return out, nil
+}

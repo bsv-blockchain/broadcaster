@@ -42,6 +42,7 @@ const (
 	fRetryCount         = "retry_count"
 	fNextRetryAt        = "next_retry_at"
 	fRetryReason        = "retry_reason"
+	fPartitionKey       = "partition_key"
 	fTimestamp          = "timestamp"
 	fCreatedAt          = "created_at"
 	fMerkleRegisteredAt = "merkle_registered_at"
@@ -164,6 +165,7 @@ type txDoc struct {
 	CreatedAt          time.Time           `bson:"created_at"`
 	MerkleRegisteredAt time.Time           `bson:"merkle_registered_at,omitempty"`
 	OrphanedAnchors    []orphanedAnchorDoc `bson:"orphaned_anchors,omitempty"`
+	PartitionKey       string              `bson:"partition_key,omitempty"`
 	Version            int64               `bson:"version"`
 }
 
@@ -200,6 +202,7 @@ func txDocFromStatus(st *models.TransactionStatus) txDoc {
 		CreatedAt:          st.CreatedAt,
 		MerkleRegisteredAt: st.MerkleRegisteredAt,
 		OrphanedAnchors:    anchorsToDocs(st.OrphanedProofs),
+		PartitionKey:       st.PartitionKey,
 	}
 }
 
@@ -219,6 +222,7 @@ func (d txDoc) toStatus() *models.TransactionStatus {
 		CreatedAt:          d.CreatedAt,
 		MerkleRegisteredAt: d.MerkleRegisteredAt,
 		OrphanedProofs:     anchorsFromDocs(d.OrphanedAnchors),
+		PartitionKey:       d.PartitionKey,
 	}
 	if len(d.MerklePath) > 0 {
 		st.MerklePath = models.HexBytes(d.MerklePath)

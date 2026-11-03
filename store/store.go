@@ -316,6 +316,15 @@ type Store interface {
 	// GetStatus retrieves the status for a transaction
 	GetStatus(ctx context.Context, txid string) (*models.TransactionStatus, error)
 
+	// LookupPartitionKeys returns, for every txid in txids that has a row, the
+	// row's current status and the propagation partition key its message was
+	// published with (ParentKey.PartitionKey is "" for rows written before the
+	// key was persisted). A projected read that never touches raw_tx, cheap
+	// enough for the intake path: the api-server consults a submission's
+	// parents so a child keys like an in-flight parent and lands on the
+	// dispatcher that holds it. Unknown txids are absent from the result.
+	LookupPartitionKeys(ctx context.Context, txids []string) (map[string]ParentKey, error)
+
 	// EnrichMerklePath populates status.MerklePath in place for a MINED/IMMUTABLE
 	// status that already carries a BlockHash, extracting the transaction's
 	// minimal merkle path from the block's compound BUMP. It is a no-op when the
@@ -787,4 +796,11 @@ type Store interface {
 
 	// Close closes the database connection
 	Close() error
+}
+
+// ParentKey is one LookupPartitionKeys result: a row's current status and the
+// propagation partition key its message carried.
+type ParentKey struct {
+	Status       models.Status
+	PartitionKey string
 }

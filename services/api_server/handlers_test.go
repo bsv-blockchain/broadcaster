@@ -2554,3 +2554,9 @@ func validStumpBytes(size int, seed byte) []byte {
 	}
 	return buf
 }
+
+// LookupPartitionKeys satisfies the intake keying lookup; the generic mock
+// knows no parents, so every submission keys by its own txid.
+func (m *mockStore) LookupPartitionKeys(_ context.Context, _ []string) (map[string]store.ParentKey, error) {
+	return nil, nil
+}

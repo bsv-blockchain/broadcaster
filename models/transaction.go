@@ -87,6 +87,13 @@ type TransactionStatus struct {
 	// added). The startup replay loop reads this to skip rows registered
 	// within MerkleReplaySkipRecentMinutes — see issue #145.
 	MerkleRegisteredAt time.Time `json:"merkleRegisteredAt,omitzero"`
+	// PartitionKey is the bsv-broadcaster.propagation partition key the row's
+	// propagation message was published with. Persisted so a later single-tx
+	// submission spending this row's outputs can key itself the same way while
+	// the row is still in flight, which puts the child on the dispatcher that
+	// holds its parent (api_server.partitionKeyForSubmit). Routing state, not
+	// status: never serialized, read only through store.LookupPartitionKeys.
+	PartitionKey string `json:"-"`
 }
 
 // Status represents the various states a transaction can be in

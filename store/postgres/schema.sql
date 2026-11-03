@@ -40,6 +40,11 @@ CREATE TABLE IF NOT EXISTS transactions (
 -- introduced. Existing rows keep NULL until the next successful /watch call
 -- repopulates the marker — see issue #145.
 ALTER TABLE transactions ADD COLUMN IF NOT EXISTS merkle_registered_at TIMESTAMPTZ;
+-- Propagation partition key the row's message was published with, so a child
+-- submitted on its own can key like its in-flight parent and reach the
+-- dispatcher that holds it (dependency-aware dispatch across submissions).
+-- NULL for rows written before the column existed.
+ALTER TABLE transactions ADD COLUMN IF NOT EXISTS partition_key TEXT;
 -- Orphaned-anchor history (issue #279): every block this tx was once MINED
 -- against before a reorg superseded the anchor, as a JSONB array of
 -- {blockHash, blockHeight, orphanedAt} in models.OrphanedAnchor shape,
