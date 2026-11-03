@@ -1,12 +1,10 @@
 package webhook
 
 import (
-	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -16,8 +14,9 @@ import (
 	"github.com/bsv-blockchain/broadcaster/models"
 )
 
-// TestDeliverStripsCallbackTokenHint: the event-only hint is an SSE
-// subscriber's token and must never be posted to a webhook receiver.
+// TestDeliverStripsCallbackTokenHint: the event-only hint (carried by intake's
+// REJECTED) is an SSE subscriber's token and must never be posted to a
+// webhook receiver.
 func TestDeliverStripsCallbackTokenHint(t *testing.T) {
 	var body string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -36,7 +35,7 @@ func TestDeliverStripsCallbackTokenHint(t *testing.T) {
 		zap.NewNop(), recordingPub{}, st, nil,
 	)
 	svc.handleUpdate(t.Context(), &models.TransactionStatus{
-		TxID: txA, Status: models.StatusReceived, Timestamp: time.Now(), CallbackTokenHint: "sse-secret-token",
+		TxID: txA, Status: models.StatusRejected, Timestamp: time.Now(), CallbackTokenHint: "sse-secret-token",
 	})
 
 	if body == "" {
@@ -45,58 +44,39 @@ func TestDeliverStripsCallbackTokenHint(t *testing.T) {
 	if strings.Contains(body, "sse-secret-token") || strings.Contains(body, "callbackTokenHint") {
 		t.Errorf("webhook body leaks the SSE token hint: %s", body)
 	}
-	if !strings.Contains(body, `"txStatus":"RECEIVED"`) {
+	if !strings.Contains(body, `"txStatus":"REJECTED"`) {
 		t.Errorf("webhook body lost the status: %s", body)
 	}
 }
 
-// A RECEIVED event can trail the transaction's verdict on the events topic
-// (the inserting request paused between its CAS and its publish while a
-// concurrent duplicate's attempt was rejected). Posted then, it would leave a
-// FullStatusUpdates receiver at an in-flight state after its verdict, and a
-// repeated rejection is a non-transition that publishes nothing to correct it.
-func TestHandleUpdate_StaleReceivedIsWithheld(t *testing.T) {
-	cases := []struct {
-		name      string
-		row       *models.TransactionStatus
-		statusErr error
-		wantPost  bool
-	}{
-		{name: "row still RECEIVED", row: &models.TransactionStatus{TxID: txA, Status: models.StatusReceived}, wantPost: true},
-		{name: "no row", wantPost: true},
-		{name: "row REJECTED", row: &models.TransactionStatus{TxID: txA, Status: models.StatusRejected}},
-		{name: "row ACCEPTED_BY_NETWORK", row: &models.TransactionStatus{TxID: txA, Status: models.StatusAcceptedByNetwork}},
-		{name: "lookup error", statusErr: errors.New("store down")},
+// TestHandleUpdate_ReceivedIsNeverPosted: RECEIVED is intake's SSE-facing
+// event. Even a FullStatusUpdates receiver must not get it — posting it would
+// race ACCEPTED_BY_NETWORK for the first delivery claim — and the event must
+// not cost a submission lookup. The ACCEPTED_BY_NETWORK after it still posts.
+func TestHandleUpdate_ReceivedIsNeverPosted(t *testing.T) {
+	var statuses []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		statuses = append(statuses, string(raw))
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	st := &fakeStore{subs: map[string][]*models.Submission{
+		txA: {{SubmissionID: "sub-1", TxID: txA, CallbackURL: srv.URL, FullStatusUpdates: true}},
+	}}
+	svc := New(
+		config.WebhookConfig{HTTPTimeoutMs: 1000, MaxRetries: 3, InitialBackoffMs: 1},
+		config.CallbackConfig{AllowPrivateIPs: true},
+		zap.NewNop(), recordingPub{}, st, nil,
+	)
+	svc.handleUpdate(t.Context(), &models.TransactionStatus{TxID: txA, Status: models.StatusReceived, Timestamp: time.Now()})
+	svc.handleUpdate(t.Context(), &models.TransactionStatus{TxIDs: []string{txA}, Status: models.StatusReceived, Timestamp: time.Now()})
+	if len(statuses) != 0 {
+		t.Fatalf("RECEIVED posted: %v", statuses)
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			var posts atomic.Int32
-			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-				posts.Add(1)
-				w.WriteHeader(http.StatusOK)
-			}))
-			defer srv.Close()
-
-			st := &fakeStore{
-				subs: map[string][]*models.Submission{
-					txA: {{SubmissionID: "sub-1", TxID: txA, CallbackURL: srv.URL, FullStatusUpdates: true}},
-				},
-				rows:      map[string]*models.TransactionStatus{},
-				statusErr: tc.statusErr,
-			}
-			if tc.row != nil {
-				st.rows[txA] = tc.row
-			}
-			svc := New(
-				config.WebhookConfig{HTTPTimeoutMs: 1000, MaxRetries: 3, InitialBackoffMs: 1},
-				config.CallbackConfig{AllowPrivateIPs: true},
-				zap.NewNop(), recordingPub{}, st, nil,
-			)
-			svc.handleUpdate(t.Context(), &models.TransactionStatus{TxID: txA, Status: models.StatusReceived, Timestamp: time.Now()})
-
-			if got := posts.Load() == 1; got != tc.wantPost {
-				t.Fatalf("RECEIVED posted = %v (%d posts), want %v", got, posts.Load(), tc.wantPost)
-			}
-		})
+	svc.handleUpdate(t.Context(), &models.TransactionStatus{TxID: txA, Status: models.StatusAcceptedByNetwork, Timestamp: time.Now()})
+	if len(statuses) != 1 || !strings.Contains(statuses[0], `"txStatus":"ACCEPTED_BY_NETWORK"`) {
+		t.Fatalf("posts = %v, want one ACCEPTED_BY_NETWORK", statuses)
 	}
 }

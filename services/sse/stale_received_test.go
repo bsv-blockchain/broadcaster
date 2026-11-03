@@ -1,8 +1,9 @@
 package sse
 
 import (
-	"context"
-	"errors"
+	"bufio"
+	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -11,187 +12,207 @@ import (
 
 // Intake publishes RECEIVED from the api-server while the propagator publishes
 // the verdict, so on the events topic RECEIVED can trail the verdict: the
-// inserter pauses between its CAS and its publish while a concurrent duplicate's
-// propagation attempt is rejected, or the two events sit on different
-// partitions under consumer lag. These tests feed fan-out the event order such
-// a race produces, with the store in the state the propagator leaves it in
-// (verdict row written before the verdict is published), and assert on what
-// the stream actually carries.
+// inserting request pauses between its CAS and its publish while a concurrent
+// duplicate's attempt is rejected, or the two events sit on different
+// partitions under consumer lag. These tests publish the orders such races
+// produce through the real KafkaPublisher and read GET /events off the wire.
 
 const (
-	staleTok = "stale-tok"
-	staleTx  = "stale-tx"
+	staleTok      = "stale-tok"
+	staleSentinel = "stale-sentinel"
 )
 
-// drainFrames returns every frame queued on c without blocking.
-func drainFrames(c *Client) []*models.TransactionStatus {
-	var out []*models.TransactionStatus
-	for {
-		select {
-		case f := <-c.Ch:
-			out = append(out, f)
-		default:
-			return out
-		}
-	}
+// staleStream is an open GET /events body. reader persists across reads:
+// readNextSSEFrame reuses an existing *bufio.Reader, so bytes it buffered past
+// one frame are not lost to the next call.
+type staleStream struct {
+	reader *bufio.Reader
 }
 
-// assertFrames checks the stream carries exactly want, as txid:status pairs.
-func assertFrames(t *testing.T, name string, c *Client, want ...string) {
+// openStaleStream subscribes staleTok to txids (plus the sentinel) and opens
+// its stream, closed when the test ends.
+func openStaleStream(t *testing.T, h *e2eHarness, txids ...string) staleStream {
 	t.Helper()
-	got := drainFrames(c)
-	gotPairs := make([]string, len(got))
-	for i, f := range got {
-		gotPairs[i] = f.TxID + ":" + string(f.Status)
+	subs := make([]*models.Submission, 0, len(txids)+1)
+	for _, txid := range append(txids, staleSentinel) {
+		subs = append(subs, &models.Submission{TxID: txid, CallbackToken: staleTok})
 	}
-	if len(gotPairs) != len(want) {
-		t.Fatalf("%s stream = %v, want %v", name, gotPairs, want)
+	h.store.mu.Lock()
+	h.store.subsByToken[staleTok] = subs
+	h.store.mu.Unlock()
+	req, _ := http.NewRequestWithContext(t.Context(), http.MethodGet, h.httpSrv.URL+"/events?callbackToken="+staleTok, nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET /events: %v", err)
 	}
-	for i := range want {
-		if gotPairs[i] != want[i] {
-			t.Fatalf("%s stream = %v, want %v", name, gotPairs, want)
+	t.Cleanup(func() { _ = resp.Body.Close() })
+	return staleStream{reader: bufio.NewReader(resp.Body)}
+}
+
+// publish emits status onto the events stream; persist first writes it as
+// the txid's row, as the propagator does for a verdict.
+func publish(t *testing.T, h *e2eHarness, status *models.TransactionStatus, persist bool) {
+	t.Helper()
+	if persist {
+		h.store.setStatus(status.TxID, status)
+	}
+	var err error
+	if len(status.TxIDs) > 0 {
+		err = h.publisher.PublishBulk(t.Context(), status)
+	} else {
+		err = h.publisher.Publish(t.Context(), status)
+	}
+	if err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+}
+
+func ev(txid string, status models.Status) *models.TransactionStatus {
+	return &models.TransactionStatus{TxID: txid, Status: status, Timestamp: time.Now().UTC(), CallbackTokenHint: staleTok}
+}
+
+// readUntilSentinel publishes a sentinel frame (single-partition memory broker,
+// so it is consumed after everything before it) and returns the stream's
+// frames before it as txid:status pairs.
+func readUntilSentinel(t *testing.T, h *e2eHarness, body staleStream) []string {
+	t.Helper()
+	publish(t, h, ev(staleSentinel, models.StatusAcceptedByNetwork), true)
+	var got []string
+	for {
+		frame, err := readNextSSEFrame(body.reader, 3*time.Second)
+		if err != nil {
+			t.Fatalf("read frame after %v: %v", got, err)
 		}
+		pair := framePair(frame)
+		if strings.HasPrefix(pair, staleSentinel+":") {
+			return got
+		}
+		got = append(got, pair)
 	}
 }
 
-func received(txid, hint string) *models.TransactionStatus {
-	return &models.TransactionStatus{TxID: txid, Status: models.StatusReceived, Timestamp: time.Now(), CallbackTokenHint: hint}
+// framePair renders a status frame as txid:status.
+func framePair(frame string) string {
+	field := func(key string) string {
+		i := strings.Index(frame, `"`+key+`":"`)
+		if i < 0 {
+			return ""
+		}
+		rest := frame[i+len(key)+4:]
+		return rest[:strings.IndexByte(rest, '"')]
+	}
+	return field("txid") + ":" + field("txStatus")
 }
 
-func rejected(txid string) *models.TransactionStatus {
-	return &models.TransactionStatus{TxID: txid, Status: models.StatusRejected, Timestamp: time.Now(), ExtraInfo: "bad-txns"}
+func assertStream(t *testing.T, got []string, want ...string) {
+	t.Helper()
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("stream = %v, want %v", got, want)
+	}
 }
 
-// TestFanOut_DelayedInserterReceivedAfterVerdictIsDropped is the reviewer's
+// TestSSE_StaleReceived_DelayedInserterIsSkipped is the reviewer's
 // reproduction: request A inserts the row and pauses; duplicate B queues
 // propagation, the propagator stores and publishes REJECTED; A resumes and
-// publishes RECEIVED. A rebroadcast rejected again is a non-transition and
-// publishes nothing, so a RECEIVED delivered here would be the stream's last
-// word. Neither the token-scoped nor the firehose client may see it.
-func TestFanOut_DelayedInserterReceivedAfterVerdictIsDropped(t *testing.T) {
-	mgr, st, cancel := newFanOutFixture(t, []string{staleTok}, []string{staleTx})
-	defer cancel()
-	scoped := mgr.NewClient(staleTok)
-	firehose := mgr.NewClient("")
-	for _, c := range []*Client{scoped, firehose} {
-		mgr.Register(c)
-		defer mgr.Unregister(c.ID)
-	}
+// publishes RECEIVED. A rebroadcast rejected again publishes nothing, so a
+// RECEIVED written here would be the stream's last word.
+func TestSSE_StaleReceived_DelayedInserterIsSkipped(t *testing.T) {
+	h := newE2EHarness(t)
+	t.Cleanup(h.Close)
+	waitForSubscriberReady()
+	body := openStaleStream(t, h, "tx-a")
+	time.Sleep(100 * time.Millisecond)
 
-	verdict := rejected(staleTx)
-	st.setStatus(staleTx, verdict) // propagator: row first, then publish
-	mgr.fanOut(context.Background(), verdict)
-	mgr.fanOut(context.Background(), received(staleTx, staleTok)) // A resumes
+	publish(t, h, ev("tx-a", models.StatusRejected), true)
+	publish(t, h, ev("tx-a", models.StatusReceived), false)
 
-	assertFrames(t, "scoped", scoped, staleTx+":REJECTED")
-	assertFrames(t, "firehose", firehose, staleTx+":REJECTED")
+	assertStream(t, readUntilSentinel(t, h, body), "tx-a:REJECTED")
 }
 
-// TestFanOut_ReceivedBeforeVerdictIsDelivered: the ordinary order, and the
-// losing-duplicate case — RECEIVED fans out while the row is still RECEIVED,
-// so no verdict has been published yet and the verdict that follows lands
-// after it on the stream.
-func TestFanOut_ReceivedBeforeVerdictIsDelivered(t *testing.T) {
-	mgr, st, cancel := newFanOutFixture(t, []string{staleTok}, []string{staleTx})
-	defer cancel()
-	c := mgr.NewClient(staleTok)
-	mgr.Register(c)
-	defer mgr.Unregister(c.ID)
+// TestSSE_StaleReceived_LaggingPodStillDeliversReceived: under consumer lag the
+// propagator has already STORED the verdict by the time this pod reaches the
+// RECEIVED that precedes it on the topic. That RECEIVED is not stale — this
+// stream has not been written the verdict yet — so it must still be the first
+// frame. A guard that reads the store would drop it here and bring back the
+// "first frame is ACCEPTED_BY_NETWORK" report this PR fixes.
+func TestSSE_StaleReceived_LaggingPodStillDeliversReceived(t *testing.T) {
+	h := newE2EHarness(t)
+	t.Cleanup(h.Close)
+	waitForSubscriberReady()
+	body := openStaleStream(t, h, "tx-a")
+	time.Sleep(100 * time.Millisecond)
 
-	st.setStatus(staleTx, &models.TransactionStatus{TxID: staleTx, Status: models.StatusReceived})
-	mgr.fanOut(context.Background(), received(staleTx, staleTok))
-	verdict := rejected(staleTx)
-	st.setStatus(staleTx, verdict)
-	mgr.fanOut(context.Background(), verdict)
+	h.store.setStatus("tx-a", ev("tx-a", models.StatusAcceptedByNetwork))
+	publish(t, h, ev("tx-a", models.StatusReceived), false)
+	publish(t, h, ev("tx-a", models.StatusAcceptedByNetwork), false)
 
-	assertFrames(t, "scoped", c, staleTx+":RECEIVED", staleTx+":REJECTED")
+	assertStream(t, readUntilSentinel(t, h, body), "tx-a:RECEIVED", "tx-a:ACCEPTED_BY_NETWORK")
 }
 
-// TestFanOutBulk_DropsOnlyStaleReceived: a /txs batch whose RECEIVED trails
-// one member's verdict. Only that member's frame is withheld; members whose
-// row is still RECEIVED, or has no row, keep theirs.
-func TestFanOutBulk_DropsOnlyStaleReceived(t *testing.T) {
-	txids := []string{"b-rejected", "b-received", "b-norow"}
-	mgr, st, cancel := newFanOutFixture(t, []string{staleTok}, txids)
-	defer cancel()
-	c := mgr.NewClient(staleTok)
-	mgr.Register(c)
-	defer mgr.Unregister(c.ID)
+// TestSSE_StaleReceived_BulkSkipsOnlyProgressedTxids: a /txs batch's bulk
+// RECEIVED trailing one member's verdict skips only that member.
+func TestSSE_StaleReceived_BulkSkipsOnlyProgressedTxids(t *testing.T) {
+	h := newE2EHarness(t)
+	t.Cleanup(h.Close)
+	waitForSubscriberReady()
+	body := openStaleStream(t, h, "b1", "b2")
+	time.Sleep(100 * time.Millisecond)
 
-	st.setStatus("b-received", &models.TransactionStatus{TxID: "b-received", Status: models.StatusReceived})
-	verdict := rejected("b-rejected")
-	st.setStatus("b-rejected", verdict)
-	mgr.fanOut(context.Background(), verdict)
-	mgr.fanOutBulk(context.Background(), &models.TransactionStatus{
-		TxIDs: txids, Status: models.StatusReceived, Timestamp: time.Now(), CallbackTokenHint: staleTok,
-	})
+	publish(t, h, ev("b1", models.StatusRejected), true)
+	publish(t, h, &models.TransactionStatus{TxIDs: []string{"b1", "b2"}, Status: models.StatusReceived, Timestamp: time.Now().UTC(), CallbackTokenHint: staleTok}, false)
 
-	assertFrames(t, "scoped", c, "b-rejected:REJECTED", "b-received:RECEIVED", "b-norow:RECEIVED")
+	assertStream(t, readUntilSentinel(t, h, body), "b1:REJECTED", "b2:RECEIVED")
 }
 
-// TestFanOut_StaleReceivedAfterAnyLaterStatusIsDropped: the guard is "row has
-// moved past RECEIVED", not "row is REJECTED" — a RECEIVED trailing an
-// ACCEPTED_BY_NETWORK would regress the stream just the same.
-func TestFanOut_StaleReceivedAfterAnyLaterStatusIsDropped(t *testing.T) {
-	for _, later := range []models.Status{models.StatusAcceptedByNetwork, models.StatusPendingRetry, models.StatusSeenOnNetwork, models.StatusMined} {
-		t.Run(string(later), func(t *testing.T) {
-			mgr, st, cancel := newFanOutFixture(t, []string{staleTok}, []string{staleTx})
-			defer cancel()
-			c := mgr.NewClient(staleTok)
-			mgr.Register(c)
-			defer mgr.Unregister(c.ID)
+// TestSSE_StaleReceived_AfterCatchupIsSkipped: a stream opened after the
+// verdict gets it from connect-time catchup; a RECEIVED arriving live after
+// that must not regress it.
+func TestSSE_StaleReceived_AfterCatchupIsSkipped(t *testing.T) {
+	h := newE2EHarness(t)
+	t.Cleanup(h.Close)
+	waitForSubscriberReady()
+	h.store.setStatus("tx-a", ev("tx-a", models.StatusAcceptedByNetwork))
+	body := openStaleStream(t, h, "tx-a")
 
-			st.setStatus(staleTx, &models.TransactionStatus{TxID: staleTx, Status: later})
-			mgr.fanOut(context.Background(), received(staleTx, staleTok))
-			assertFrames(t, "scoped", c)
-		})
+	frame, err := readNextSSEFrame(body.reader, 3*time.Second)
+	if err != nil {
+		t.Fatalf("read catchup frame: %v", err)
 	}
+	if got := framePair(frame); got != "tx-a:ACCEPTED_BY_NETWORK" {
+		t.Fatalf("catchup frame = %s, want tx-a:ACCEPTED_BY_NETWORK", got)
+	}
+	publish(t, h, ev("tx-a", models.StatusReceived), false)
+
+	assertStream(t, readUntilSentinel(t, h, body))
 }
 
-// TestFanOut_ReceivedStoreErrorIsDropped: with the row's state unknown the
-// frame is withheld — the verdict or a reconnect's catchup supersedes a lost
-// RECEIVED, while a stale one after a terminal verdict is never corrected.
-func TestFanOut_ReceivedStoreErrorIsDropped(t *testing.T) {
-	mgr, st, cancel := newFanOutFixture(t, []string{staleTok}, []string{staleTx})
-	defer cancel()
-	c := mgr.NewClient(staleTok)
-	mgr.Register(c)
-	defer mgr.Unregister(c.ID)
-
-	st.mu.Lock()
-	st.statusErr = errors.New("store down")
-	st.mu.Unlock()
-	mgr.fanOut(context.Background(), received(staleTx, staleTok))
-	assertFrames(t, "scoped", c)
-}
-
-// TestFanOut_StaleReceivedCheckCost: the row is read once per RECEIVED event
-// however many clients want it, never for a txid no client wants, and never
-// for any other status.
-func TestFanOut_StaleReceivedCheckCost(t *testing.T) {
-	mgr, st, cancel := newFanOutFixture(t, []string{staleTok, "tok-2"}, []string{staleTx})
-	defer cancel()
-	for range 3 {
-		c := mgr.NewClient(staleTok)
-		mgr.Register(c)
-		defer mgr.Unregister(c.ID)
+// TestClientAdmit covers the rules the stream tests rely on, including the
+// ones they cannot reach cheaply: block statuses are not recorded, and the
+// set is bounded.
+func TestClientAdmit(t *testing.T) {
+	st := func(txid string, s models.Status) *models.TransactionStatus {
+		return &models.TransactionStatus{TxID: txid, Status: s}
 	}
-	calls := func() int {
-		st.mu.RLock()
-		defer st.mu.RUnlock()
-		return st.statusCalls
+	c := &Client{}
+	if !c.admit(st("a", models.StatusReceived)) {
+		t.Fatal("first RECEIVED refused")
+	}
+	if !c.admit(st("a", models.StatusSeenOnNetwork)) || c.admit(st("a", models.StatusReceived)) {
+		t.Fatal("RECEIVED after SEEN_ON_NETWORK admitted")
+	}
+	if !c.admit(st("m", models.StatusMined)) || !c.admit(st("m", models.StatusReceived)) {
+		t.Fatal("MINED must not be recorded")
+	}
+	if !(*Client)(nil).admit(st("a", models.StatusReceived)) {
+		t.Fatal("nil client must admit")
 	}
 
-	mgr.fanOut(context.Background(), received("tx-unwatched", ""))
-	if got := calls(); got != 0 {
-		t.Fatalf("unwatched RECEIVED read the row %d times, want 0", got)
-	}
-	mgr.fanOut(context.Background(), received(staleTx, staleTok))
-	if got := calls(); got != 1 {
-		t.Fatalf("RECEIVED with 3 recipients read the row %d times, want 1", got)
-	}
-	mgr.fanOut(context.Background(), rejected(staleTx))
-	if got := calls(); got != 1 {
-		t.Fatalf("REJECTED read the row (%d calls), want no read", got)
+	r := newTxidRing(2)
+	r.add("x")
+	r.add("y")
+	r.add("x") // already present: no eviction
+	r.add("z") // evicts x, the oldest
+	if r.has("x") || !r.has("y") || !r.has("z") || len(r.set) != 2 {
+		t.Fatalf("ring = %v, want {y,z}", r.set)
 	}
 }

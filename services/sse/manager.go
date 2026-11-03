@@ -18,7 +18,6 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/bsv-blockchain/broadcaster/events"
-	"github.com/bsv-blockchain/broadcaster/logfields"
 	"github.com/bsv-blockchain/broadcaster/metrics"
 	"github.com/bsv-blockchain/broadcaster/models"
 	"github.com/bsv-blockchain/broadcaster/store"
@@ -78,6 +77,81 @@ type Client struct {
 	// hints are disabled). Per-client rather than shared because a single
 	// shared delay relocates a reconnect herd instead of dispersing it.
 	drainRetryMS atomic.Int64
+
+	// progressed holds txids this stream has already been written a status
+	// past RECEIVED for, so a RECEIVED that reaches the writer afterwards is
+	// skipped (see admit). Owned by the writer goroutine; no locking.
+	progressed *txidRing
+}
+
+// admit reports whether status may be written to this client's stream, and
+// records it. RECEIVED is the only status that can reach the stream out of
+// lifecycle order: intake publishes it from the api-server while the
+// propagator publishes the verdict, so on the events topic it can trail that
+// verdict — the inserting request paused between its CAS and its publish
+// while a concurrent duplicate's attempt was rejected, or the two events sit
+// on different partitions under consumer lag. Written after the verdict, it
+// would regress the stream to an in-flight state, and a repeated rejection is
+// a non-transition that publishes nothing to correct it. So a RECEIVED is
+// skipped once this stream has carried any later status for the txid, live or
+// from catchup. The check is per stream, not against the store: a verdict
+// already stored but not yet written here must not suppress the RECEIVED
+// ahead of it. Runs on the writer goroutine only.
+func (c *Client) admit(status *models.TransactionStatus) bool {
+	if c == nil || status.TxID == "" {
+		return true
+	}
+	switch status.Status {
+	case models.StatusReceived:
+		if c.progressed != nil && c.progressed.has(status.TxID) {
+			metrics.APISSEDroppedTotal.WithLabelValues("stale_received").Inc()
+			return false
+		}
+	case models.StatusMined, models.StatusImmutable:
+		// A RECEIVED trailing a block event by a whole block interval does
+		// not happen; leaving block bursts out keeps a big block from
+		// evicting the txids whose verdicts just went out.
+	default:
+		if c.progressed == nil {
+			c.progressed = newTxidRing(progressedCapacity)
+		}
+		c.progressed.add(status.TxID)
+	}
+	return true
+}
+
+// progressedCapacity bounds Client.progressed. A trailing RECEIVED arrives
+// within the intake pause or partition skew of its verdict, so only the most
+// recent txids matter; at ~100 B per entry this caps a firehose client's set
+// near 1.6 MB, and a token-scoped client's set stays at its own txids.
+const progressedCapacity = 16384
+
+// txidRing is a fixed-capacity set that evicts its oldest entry when full.
+type txidRing struct {
+	set  map[string]struct{}
+	ring []string
+	next int
+}
+
+func newTxidRing(capacity int) *txidRing {
+	return &txidRing{set: make(map[string]struct{}), ring: make([]string, capacity)}
+}
+
+func (r *txidRing) has(txid string) bool {
+	_, ok := r.set[txid]
+	return ok
+}
+
+func (r *txidRing) add(txid string) {
+	if r.has(txid) {
+		return
+	}
+	if old := r.ring[r.next]; old != "" {
+		delete(r.set, old)
+	}
+	r.ring[r.next] = txid
+	r.set[txid] = struct{}{}
+	r.next = (r.next + 1) % len(r.ring)
 }
 
 // Manager owns the per-pod registry of SSE clients listening on
@@ -313,12 +387,6 @@ func (m *Manager) deliver(ctx context.Context, clients []*Client, status *models
 		if c.Token != "" && !tokens.has(c.Token) {
 			continue
 		}
-		// First recipient: a RECEIVED the stored row has already moved past is
-		// dropped for every client, before anyone is sent it.
-		if !enriched && status.Status == models.StatusReceived && m.receivedIsStale(ctx, status.TxID) {
-			metrics.APISSEDroppedTotal.WithLabelValues("stale_received").Inc()
-			return
-		}
 		// This client will receive the frame, so attach the merkle proof — once
 		// per event (the status pointer is shared across the sends below) and
 		// lazily after the token match, so we only pay for txids a connected
@@ -338,48 +406,6 @@ func (m *Manager) deliver(ctx context.Context, clients []*Client, status *models
 			metrics.APISSEDroppedTotal.WithLabelValues("slow_client").Inc()
 			m.recordDrop(c, status)
 		}
-	}
-}
-
-// receivedIsStale reports whether a RECEIVED event must be dropped because
-// the transaction's stored row has already moved past RECEIVED. Intake
-// publishes RECEIVED from a different process than the one that produces the
-// verdict, so on the events topic it can land after that verdict: an inserter
-// that paused between its CAS and its publish, a concurrent duplicate whose
-// propagation attempt was rejected in that pause, or a RECEIVED and a verdict
-// on different partitions under consumer lag. Ordering it at the producer
-// would need one atomic step across replicas; the store gives a sufficient
-// order instead, because the propagator writes a verdict's row before it
-// publishes the verdict. So on this single fan-out goroutine:
-//   - the row still RECEIVED means no verdict has been published yet, so none
-//     can already be on any stream ahead of this frame — deliver it;
-//   - the row past RECEIVED means a verdict exists (delivered, in flight, or
-//     served by connect-time catchup) — drop the frame, which would only
-//     regress the stream to an in-flight state with nothing to correct it
-//     when a repeated rejection is suppressed as a non-transition.
-//
-// No store or no row (reaped, or never stored) leaves nothing to contradict
-// the event, so it is delivered. A store error drops it: RECEIVED is the
-// least informative frame in the lifecycle and the next verdict or a
-// reconnect's catchup supersedes it, while a stale one after a terminal
-// verdict is wrong for good. Called at most once per event, and only once a
-// client wants the txid, so a token-scoped pod pays nothing for txids nobody
-// is watching.
-func (m *Manager) receivedIsStale(ctx context.Context, txid string) bool {
-	if m.store == nil {
-		return false
-	}
-	row, err := m.store.GetStatus(ctx, txid)
-	switch {
-	case errors.Is(err, store.ErrNotFound):
-		return false
-	case err != nil:
-		m.logger.Warn("dropping RECEIVED frame: status lookup failed", logfields.TxID(txid), zap.Error(err))
-		return true
-	case row == nil:
-		return false
-	default:
-		return row.Status != models.StatusReceived
 	}
 }
 
@@ -600,7 +626,7 @@ func (s *Service) handleEvents(c *gin.Context) {
 			writeShutdown(writer, client)
 			return
 		case status := <-client.Ch:
-			if status != nil {
+			if status != nil && client.admit(status) {
 				if err := writeStatusBuffered(writer, status); err != nil {
 					outcome = "write_error"
 					return
@@ -840,6 +866,9 @@ func (s *Service) sendCatchup(ctx context.Context, w *sseWriter, token string, s
 				}
 			}
 		}
+		if !client.admit(status) {
+			return nil
+		}
 		if err := writeStatus(w, status); err != nil {
 			res.writeFailed = true
 			return err
@@ -1012,7 +1041,7 @@ func drainLive(w *sseWriter, client *Client) (int, error) {
 	for {
 		select {
 		case status := <-client.Ch:
-			if status == nil {
+			if status == nil || !client.admit(status) {
 				continue
 			}
 			if err := writeStatusBuffered(w, status); err != nil {

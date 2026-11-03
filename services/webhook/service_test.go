@@ -33,11 +33,6 @@ type fakeStore struct {
 	mu   sync.Mutex
 	subs map[string][]*models.Submission
 
-	// rows is the transaction-status table GetStatus reads (nil row when
-	// absent, like the real backends); statusErr fails every GetStatus.
-	rows      map[string]*models.TransactionStatus
-	statusErr error
-
 	deliveries []deliveryRecord
 	attempts   []attemptRecord
 }
@@ -68,15 +63,6 @@ func (s *fakeStore) GetSubmissionsByTxID(_ context.Context, txid string) ([]*mod
 		out[i] = &cp
 	}
 	return out, nil
-}
-
-func (s *fakeStore) GetStatus(_ context.Context, txid string) (*models.TransactionStatus, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.statusErr != nil {
-		return nil, s.statusErr
-	}
-	return s.rows[txid], nil
 }
 
 func (s *fakeStore) UpdateDeliveryStatus(_ context.Context, id string, last models.Status, retry int, nextRetry *time.Time) error {
@@ -175,6 +161,11 @@ func (s *fakeStore) BatchUpdateStatus(context.Context, []*models.TransactionStat
 }
 
 func (s *fakeStore) BatchUpdateStatusReturning(context.Context, []*models.TransactionStatus) ([]store.StatusUpdate, error) {
+	return nil, nil
+}
+
+//nolint:nilnil // unused stub; safe to return the zero pair.
+func (s *fakeStore) GetStatus(context.Context, string) (*models.TransactionStatus, error) {
 	return nil, nil
 }
 

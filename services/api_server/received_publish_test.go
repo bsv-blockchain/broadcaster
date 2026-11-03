@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
@@ -289,11 +291,48 @@ func TestHandleSubmitTransactions_AllRejectedResubmitsPublishNoReceived(t *testi
 // TestPublishReceived_NoopWithoutPublisherOrTxIDs: nil publisher and empty
 // lists are no-ops, never panics.
 func TestPublishReceived_NoopWithoutPublisherOrTxIDs(t *testing.T) {
-	(&Server{logger: zap.NewNop()}).publishReceived(context.Background(), []string{"aa"}, submitOptions{})
+	(&Server{logger: zap.NewNop()}).publishReceived(context.Background(), []string{"aa"}, time.Now(), submitOptions{})
 	pub := &recordingCallbackPub{}
-	(&Server{logger: zap.NewNop(), publisher: pub}).publishReceived(context.Background(), nil, submitOptions{})
+	(&Server{logger: zap.NewNop(), publisher: pub}).publishReceived(context.Background(), nil, time.Now(), submitOptions{})
 	if len(pub.publishes) != 0 || len(pub.bulkPublishes) != 0 {
 		t.Errorf("empty txid list published events")
+	}
+}
+
+// TestPublishReceived_ChunksLargeBatches: a bulk RECEIVED is split so no
+// event outgrows the Kafka producer's message limit, every txid goes out
+// exactly once, and each event carries the rows' insert time and the hint.
+func TestPublishReceived_ChunksLargeBatches(t *testing.T) {
+	txids := make([]string, 2*maxTxIDsPerReceivedEvent+1)
+	for i := range txids {
+		txids[i] = fmt.Sprintf("%064x", i)
+	}
+	at := time.Unix(1_700_000_000, 123)
+	pub := &recordingCallbackPub{}
+	(&Server{logger: zap.NewNop(), publisher: pub}).publishReceived(context.Background(), txids, at, submitOptions{CallbackToken: "tok"})
+
+	pub.mu.Lock()
+	defer pub.mu.Unlock()
+	if len(pub.bulkPublishes) != 3 {
+		t.Fatalf("bulk events = %d, want 3", len(pub.bulkPublishes))
+	}
+	seen := 0
+	for _, ev := range pub.bulkPublishes {
+		if len(ev.TxIDs) > maxTxIDsPerReceivedEvent {
+			t.Errorf("event carries %d txids, cap %d", len(ev.TxIDs), maxTxIDsPerReceivedEvent)
+		}
+		if !ev.Timestamp.Equal(at) || ev.CallbackTokenHint != "tok" {
+			t.Errorf("event timestamp %v hint %q, want %v and tok", ev.Timestamp, ev.CallbackTokenHint, at)
+		}
+		for _, id := range ev.TxIDs {
+			if id != txids[seen] {
+				t.Fatalf("txid %d = %s, want %s", seen, id, txids[seen])
+			}
+			seen++
+		}
+	}
+	if seen != len(txids) {
+		t.Fatalf("published %d txids, want %d", seen, len(txids))
 	}
 }
 

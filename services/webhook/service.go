@@ -13,7 +13,6 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -282,6 +281,16 @@ func (s *Service) Stop() error {
 // channel. The expensive bit — N store.GetSubmissionsByTxID calls — runs
 // inside the worker, never blocking the channel reader.
 func (s *Service) handleUpdate(ctx context.Context, status *models.TransactionStatus) {
+	// RECEIVED is intake's SSE-facing event and is never posted to a webhook
+	// (callbacks have never carried it). Skipped before the submission
+	// lookup, so the per-tx intake event costs every replica nothing. It
+	// would also be unsafe: it reaches the delivery pool moments before
+	// ACCEPTED_BY_NETWORK, and if both claim from the same empty
+	// LastDeliveredStatus and RECEIVED wins the CAS, ACCEPTED_BY_NETWORK
+	// loses it and is never posted. Intake's REJECTED is unaffected.
+	if status.Status == models.StatusReceived {
+		return
+	}
 	if len(status.TxIDs) == 0 {
 		s.dispatchOne(ctx, status)
 		return
@@ -315,11 +324,6 @@ func (s *Service) dispatchOne(ctx context.Context, status *models.TransactionSta
 		if !shouldDeliver(sub, status) {
 			continue
 		}
-		// First deliverable subscriber: a RECEIVED the stored row has already
-		// moved past is withheld from every receiver (see receivedIsStale).
-		if !enriched && status.Status == models.StatusReceived && s.receivedIsStale(ctx, status.TxID) {
-			return
-		}
 		// Attach the merkle proof to MINED/IMMUTABLE deliveries. Done lazily on
 		// the first deliverable subscriber (not for SSE-only txids) and only
 		// once — the status pointer is shared across every deliver() below, so
@@ -332,30 +336,6 @@ func (s *Service) dispatchOne(ctx context.Context, status *models.TransactionSta
 			enriched = true
 		}
 		s.deliver(ctx, sub, status)
-	}
-}
-
-// receivedIsStale reports whether a RECEIVED event arrived after the
-// transaction's stored row moved past RECEIVED. Intake publishes RECEIVED from
-// a different process than the propagator that publishes the verdict, so the
-// event can trail it (an inserter that paused between its CAS and its
-// publish, or a cross-partition lag); the propagator writes the verdict's row
-// before publishing it, so the row is the order that holds. Posting the stale
-// RECEIVED would leave a FullStatusUpdates receiver at an in-flight state
-// after its verdict. No row leaves nothing to contradict the event; a lookup
-// error withholds it, since the verdict supersedes RECEIVED anyway.
-func (s *Service) receivedIsStale(ctx context.Context, txid string) bool {
-	row, err := s.store.GetStatus(ctx, txid)
-	switch {
-	case errors.Is(err, store.ErrNotFound):
-		return false
-	case err != nil:
-		s.logger.Warn("withholding RECEIVED callback: status lookup failed", logfields.TxID(txid), zap.Error(err))
-		return true
-	case row == nil:
-		return false
-	default:
-		return row.Status != models.StatusReceived
 	}
 }
 

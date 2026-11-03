@@ -959,11 +959,12 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 	// does it publish RECEIVED (see below). Without a store there is no CAS
 	// to coordinate with, so every submission counts as the first.
 	inserted := s.store == nil
+	receivedAt := time.Now()
 	if s.store != nil {
 		row := &models.TransactionStatus{
 			TxID:      txid,
 			Status:    models.StatusReceived,
-			Timestamp: time.Now(),
+			Timestamp: receivedAt,
 			// Carry the raw bytes on the status row so the propagation
 			// reaper can rebroadcast txs that are stuck in non-terminal
 			// states without re-fetching from Kafka or the API caller.
@@ -1031,12 +1032,12 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 	// orders RECEIVED against a verdict produced by ANOTHER request's
 	// propagation (this request can pause between its CAS and this publish),
 	// and nothing here can across replicas. What keeps the stream true is the
-	// consumer: SSE fan-out and webhook dispatch drop a RECEIVED whose stored
-	// row has already moved past RECEIVED (sse.Manager.receivedIsStale). These
-	// rules just keep the topic from carrying RECEIVED events that would
-	// nearly always be dropped.
+	// SSE writer: it skips a RECEIVED once its stream has carried a later
+	// status for the txid (sse.Client.admit). Webhooks never post RECEIVED.
+	// These rules just keep the topic from carrying RECEIVED events that would
+	// nearly always be skipped.
 	if inserted {
-		s.publishReceived(c.Request.Context(), []string{txid}, opts)
+		s.publishReceived(c.Request.Context(), []string{txid}, receivedAt, opts)
 	}
 
 	msg := map[string]interface{}{
@@ -1080,32 +1081,51 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 // because the submission row is written by the asynchronous recorder and may
 // not exist yet when the SSE pod resolves the txid's subscribers. Callers pass
 // only txids whose row this request's CAS inserted. The event can still trail
-// a verdict another request's attempt produced; consumers drop it then (see
-// handleSubmitTransaction). Best-effort: the row is already durable, and
+// a verdict another request's attempt produced; the SSE writer skips it then
+// (see handleSubmitTransaction). Best-effort: the row is already durable, and
 // connect-time catchup covers a lost event. A failed Kafka send after this
 // leaves the row at RECEIVED, which the client's retry re-queues without a
 // second RECEIVED, so the frame stays true.
-func (s *Server) publishReceived(ctx context.Context, txids []string, opts submitOptions) {
+//
+// receivedAt is the inserted rows' timestamp (the earliest, for a batch), so
+// the frame's SSE id sits in the store's timestamp domain that a reconnect's
+// Last-Event-ID catchup resumes from, rather than a later publish-time clock
+// reading. A batch goes out in chunks of maxTxIDsPerReceivedEvent.
+func (s *Server) publishReceived(ctx context.Context, txids []string, receivedAt time.Time, opts submitOptions) {
 	if s.publisher == nil || len(txids) == 0 {
 		return
 	}
-	st := &models.TransactionStatus{
-		Status:            models.StatusReceived,
-		Timestamp:         time.Now(),
-		CallbackTokenHint: opts.CallbackToken,
-	}
-	var err error
 	if len(txids) == 1 {
-		st.TxID = txids[0]
-		err = s.publisher.Publish(ctx, st)
-	} else {
-		st.TxIDs = txids
-		err = s.publisher.PublishBulk(ctx, st)
+		st := &models.TransactionStatus{
+			TxID:              txids[0],
+			Status:            models.StatusReceived,
+			Timestamp:         receivedAt,
+			CallbackTokenHint: opts.CallbackToken,
+		}
+		if err := s.publisher.Publish(ctx, st); err != nil {
+			s.logger.Warn("RECEIVED publish failed", zap.Int("count", 1), zap.Error(err))
+		}
+		return
 	}
-	if err != nil {
-		s.logger.Warn("RECEIVED publish failed", zap.Int("count", len(txids)), zap.Error(err))
+	for start := 0; start < len(txids); start += maxTxIDsPerReceivedEvent {
+		chunk := txids[start:min(start+maxTxIDsPerReceivedEvent, len(txids))]
+		st := &models.TransactionStatus{
+			TxIDs:             chunk,
+			Status:            models.StatusReceived,
+			Timestamp:         receivedAt,
+			CallbackTokenHint: opts.CallbackToken,
+		}
+		if err := s.publisher.PublishBulk(ctx, st); err != nil {
+			s.logger.Warn("RECEIVED publish failed", zap.Int("count", len(chunk)), zap.Error(err))
+		}
 	}
 }
+
+// maxTxIDsPerReceivedEvent caps the txids in one bulk RECEIVED event so a
+// large POST /txs stays under the Kafka producer's 1 MiB default
+// MaxMessageBytes (~67 bytes of JSON per txid). Mirrors bump_builder's
+// maxTxIDsPerBulkEvent.
+const maxTxIDsPerReceivedEvent = 5000
 
 // arcStatusCodeOf extracts the numeric ARC status code (460-476 taxonomy,
 // errors/errors.go) from an error chain, or 0 when none is attached.
@@ -1404,13 +1424,14 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 	receivedTxIDs := make([]string, 0, len(parsed))
 	duplicates := 0
 	newSubmits, retryRejected := 0, 0
+	receivedAt := time.Now()
 	if s.store != nil {
 		ctx := c.Request.Context()
 		for _, p := range parsed {
 			row := &models.TransactionStatus{
 				TxID:      p.txid,
 				Status:    models.StatusReceived,
-				Timestamp: time.Now(),
+				Timestamp: receivedAt,
 				// Carry the raw bytes on the row so the propagation
 				// reaper can rebroadcast stuck txs without re-fetching.
 				RawTx:        p.raw,
@@ -1420,9 +1441,14 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 			switch {
 			case dedupErr != nil:
 				s.logger.Error("dedup CAS failed", logfields.TxID(p.txid), zap.Error(dedupErr))
+				fallthrough
+			case !inserted && existing == nil:
+				// A CAS error, or neither inserted nor an existing row: the
+				// row state is unknown, so queue best-effort but leave
+				// RECEIVED to whichever attempt created the row.
 				newSubmits++
 				toPublish = append(toPublish, p)
-			case !inserted && existing != nil && shouldRepublishExisting(existing.Status):
+			case !inserted && shouldRepublishExisting(existing.Status):
 				// REJECTED resubmit and stranded RECEIVED (Kafka send failed
 				// after insert) both re-enter toPublish. Mirrors
 				// handleSubmitTransaction. Seen/accepted rows stay duplicates.
@@ -1431,7 +1457,7 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 				}
 				toPublish = append(toPublish, p)
 				republished[p.txid] = existing.Status
-			case !inserted && existing != nil:
+			case !inserted:
 				duplicates++
 				// Idempotent re-submit at a non-REJECTED status: register
 				// the txid with the in-process TxTracker using the
@@ -1441,12 +1467,6 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 					s.txTracker.Add(p.txid, existing.Status)
 				}
 				s.recordSubmission(ctx, p.txid, opts)
-			case !inserted:
-				// Neither inserted nor an existing row: the row state is
-				// unknown, so queue best-effort (as for a CAS error) but
-				// leave RECEIVED to whichever attempt created the row.
-				newSubmits++
-				toPublish = append(toPublish, p)
 			default:
 				newSubmits++
 				toPublish = append(toPublish, p)
@@ -1491,7 +1511,7 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 	if len(toPublish) > 0 {
 		s.adoptStoredFamilyKeys(ctx, keyByTxid, famByTxid, republished)
 		// Before SendBatch, for the ordering reason in handleSubmitTransaction.
-		s.publishReceived(ctx, receivedTxIDs, opts)
+		s.publishReceived(ctx, receivedTxIDs, receivedAt, opts)
 
 		msgs := propagationMessages(toPublish, keyByTxid, inputsByTxid)
 		if err := s.producer.SendBatch(ctx, kafka.TopicPropagation, msgs); err != nil {

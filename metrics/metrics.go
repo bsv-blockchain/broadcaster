@@ -834,10 +834,10 @@ var APIRequestBytes = promauto.NewHistogramVec(prometheus.HistogramOpts{
 //     SSEConnectedClients before attributing fault to a consumer.
 //   - "client_gone": the client was unregistering concurrently and its context
 //     had already been canceled by the time fan-out reached it.
-//   - "stale_received": a RECEIVED event arrived after the transaction's
-//     stored row had moved past RECEIVED, so it was withheld from every
-//     client rather than regress a stream that already has (or is about to
-//     get) the verdict. Counted once per event, not per client.
+//   - "stale_received": a RECEIVED reached a client's writer after that
+//     stream had already carried a later status for the txid (it trailed
+//     the verdict on the events topic), so it was skipped rather than
+//     regress the stream. Counted per client.
 //
 // A non-zero "client_gone" rate is normal under churn.
 var APISSEDroppedTotal = promauto.NewCounterVec(prometheus.CounterOpts{

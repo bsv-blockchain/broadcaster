@@ -77,11 +77,6 @@ type sseStoreStub struct {
 	subsByToken map[string][]*models.Submission
 	statusByTx  map[string]*models.TransactionStatus
 
-	// statusErr, when set, is returned by GetStatus; statusCalls counts
-	// GetStatus round-trips (the stale-RECEIVED check's store cost).
-	statusErr   error
-	statusCalls int
-
 	// iterErr, when set, is returned by IterateStatusesByToken instead of
 	// streaming — models a backend refusing a replay it cannot bound.
 	iterErr error
@@ -100,12 +95,8 @@ func (s *sseStoreStub) GetSubmissionsByToken(_ context.Context, token string) ([
 }
 
 func (s *sseStoreStub) GetStatus(_ context.Context, txid string) (*models.TransactionStatus, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.statusCalls++
-	if s.statusErr != nil {
-		return nil, s.statusErr
-	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return s.statusByTx[txid], nil
 }
 
