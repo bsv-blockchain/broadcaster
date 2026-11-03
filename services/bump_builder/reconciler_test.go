@@ -121,6 +121,7 @@ func newTestReconciler(st store.Store, pub *capturePublisher, stub *stubChaintra
 		publisher:     pub,
 		chainHeader:   stub,
 		defers:        make(map[string]int),
+		rewatch:       make(map[string]*orphanRewatch),
 		pendingRemine: make(map[string]uint64),
 		now:           time.Now,
 		done:          make(chan struct{}),
@@ -1879,7 +1880,8 @@ func TestReconciler_ShortCircuitReactivationIsGenerationChecked(t *testing.T) {
 }
 
 // reprocessStub is a merkle-service /reprocess endpoint that records the
-// block hashes it was asked to redeliver.
+// block hashes it was asked to redeliver. Other endpoints (the reconciler's
+// orphan re-watch /watch calls) are accepted and not recorded.
 type reprocessStub struct {
 	mu     sync.Mutex
 	hashes []string
@@ -1890,6 +1892,10 @@ func newReprocessStub(t *testing.T) *reprocessStub {
 	t.Helper()
 	s := &reprocessStub{}
 	s.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path != "/reprocess" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
 		var body struct {
 			BlockHash string `json:"blockHash"`
 		}
