@@ -2803,14 +2803,34 @@ func (s *Store) LookupPartitionKeys(ctx context.Context, txids []string) (map[st
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		st, err := s.readStoredStatus(txid)
+		pk, found, err := s.readPartitionKey(txid)
 		if err != nil {
 			return nil, err
 		}
-		if st == nil {
-			continue
+		if found {
+			out[txid] = pk
 		}
-		out[txid] = store.ParentKey{Status: models.Status(st.Status), PartitionKey: st.PartitionKey}
 	}
 	return out, nil
+}
+
+// readPartitionKey decodes only the status and partition key of txid's row,
+// so the intake-path lookup never base64-decodes raw_tx or merkle_path.
+func (s *Store) readPartitionKey(txid string) (store.ParentKey, bool, error) {
+	v, closer, err := s.db.Get(txKey(txid))
+	if errors.Is(err, pebbledb.ErrNotFound) {
+		return store.ParentKey{}, false, nil
+	}
+	if err != nil {
+		return store.ParentKey{}, false, fmt.Errorf("get tx %s: %w", txid, err)
+	}
+	defer func() { _ = closer.Close() }()
+	var row struct {
+		Status       string `json:"status"`
+		PartitionKey string `json:"partition_key,omitempty"`
+	}
+	if err := json.Unmarshal(v, &row); err != nil {
+		return store.ParentKey{}, false, fmt.Errorf("unmarshal tx %s: %w", txid, err)
+	}
+	return store.ParentKey{Status: models.Status(row.Status), PartitionKey: row.PartitionKey}, true, nil
 }

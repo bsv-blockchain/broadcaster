@@ -48,9 +48,11 @@ const partitionKeyLookupChunk = 1000
 //
 // Best-effort: a lookup failure, a parent written before keys were persisted,
 // or more parents than ParentKeyLookupMaxInputs all fall back to the own-txid
-// key and the missing-parent safety net. So does a parent being resubmitted
-// after REJECTED: its row stays REJECTED until the rebroadcast's verdict, so
-// it does not count as in flight.
+// key and the missing-parent safety net. A parent being resubmitted after
+// REJECTED is not followed either: its row stays REJECTED until the
+// rebroadcast's verdict, so it does not count as in flight, and a child that
+// outruns it is left to the missing-parent cascade, which reads that REJECTED
+// row (parentStillPending).
 //
 // ownSeen reports whether the lookup found txid's own row: a CAS loser then
 // already holds the stored key (or the row has none) and need not read it

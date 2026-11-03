@@ -1567,3 +1567,32 @@ func TestDatahubEndpoints_AdvertisedPolicy(t *testing.T) {
 		t.Error("an all-zero policy must survive as advertised, not read back as nil")
 	}
 }
+
+func TestLookupPartitionKeys_ReturnsStatusAndKey(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	for _, row := range []*models.TransactionStatus{
+		{TxID: "keyed", Status: models.StatusReceived, RawTx: []byte{0x01, 0x02, 0x03}, PartitionKey: "kP", Timestamp: time.Now()},
+		{TxID: "unkeyed", Status: models.StatusRejected, RawTx: []byte{0x04}, Timestamp: time.Now()},
+	} {
+		if _, _, err := s.GetOrInsertStatus(ctx, row); err != nil {
+			t.Fatalf("insert %s: %v", row.TxID, err)
+		}
+	}
+	got, err := s.LookupPartitionKeys(ctx, []string{"keyed", "unkeyed", "missing"})
+	if err != nil {
+		t.Fatalf("LookupPartitionKeys: %v", err)
+	}
+	want := map[string]store.ParentKey{
+		"keyed":   {Status: models.StatusReceived, PartitionKey: "kP"},
+		"unkeyed": {Status: models.StatusRejected},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("rows = %v, want %v", got, want)
+	}
+	for id, w := range want {
+		if got[id] != w {
+			t.Errorf("%s = %+v, want %+v", id, got[id], w)
+		}
+	}
+}

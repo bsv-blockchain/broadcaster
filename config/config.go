@@ -589,8 +589,10 @@ type PropagationConfig struct {
 	// submission's inputs the api-server consults in the store to key the
 	// child like an in-flight parent (and how many external parents per tx a
 	// POST /txs family consults). A transaction with more inputs only consults
-	// the first N. 0 disables the lookup: every single-tx submission keys by
-	// its own txid, the pre-fix behavior. Default 8.
+	// the first N. 0 disables every partition-key read, the pre-fix
+	// behavior: a single-tx submission keys by its own txid and a batch by
+	// its families, and a resubmission no longer reuses its stored key.
+	// Default 8.
 	ParentKeyLookupMaxInputs int `mapstructure:"parent_key_lookup_max_inputs"`
 	MerkleConcurrency        int `mapstructure:"merkle_concurrency"`
 	// RetryMaxAttempts bounds how many times the propagator will push a
