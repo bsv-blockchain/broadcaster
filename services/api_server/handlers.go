@@ -1,6 +1,7 @@
 package api_server
 
 import (
+	"cmp"
 	"context"
 	"crypto/rand"
 	"crypto/subtle"
@@ -1424,14 +1425,14 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 	receivedTxIDs := make([]string, 0, len(parsed))
 	duplicates := 0
 	newSubmits, retryRejected := 0, 0
-	receivedAt := time.Now()
+	var receivedAt time.Time // the first inserted row's timestamp
 	if s.store != nil {
 		ctx := c.Request.Context()
 		for _, p := range parsed {
 			row := &models.TransactionStatus{
 				TxID:      p.txid,
 				Status:    models.StatusReceived,
-				Timestamp: receivedAt,
+				Timestamp: time.Now(),
 				// Carry the raw bytes on the row so the propagation
 				// reaper can rebroadcast stuck txs without re-fetching.
 				RawTx:        p.raw,
@@ -1470,12 +1471,18 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 			default:
 				newSubmits++
 				toPublish = append(toPublish, p)
+				// Each row keeps its own timestamp, so a large batch is not one
+				// equal-timestamp run for catchup to drain; the event carries
+				// the earliest, so a Last-Event-ID reconnect mid-burst replays
+				// the rest instead of skipping them.
+				receivedAt = cmp.Or(receivedAt, row.Timestamp)
 				receivedTxIDs = append(receivedTxIDs, p.txid)
 			}
 		}
 	} else {
 		toPublish = parsed
 		newSubmits = len(parsed)
+		receivedAt = time.Now()
 		for _, p := range parsed {
 			receivedTxIDs = append(receivedTxIDs, p.txid)
 		}

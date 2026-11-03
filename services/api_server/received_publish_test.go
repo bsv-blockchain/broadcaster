@@ -475,3 +475,33 @@ func TestHandleSubmit_DedupErrorPublishesNoReceived(t *testing.T) {
 		})
 	}
 }
+
+// TestHandleSubmitTransactions_RowsKeepOwnTimestamps: a batch's rows are not
+// one equal-timestamp run (catchup would have to drain it whole, and a
+// Last-Event-ID reconnect mid-burst would skip the rest), and the
+// RECEIVED carries the earliest INSERTED row's timestamp, so that reconnect
+// replays the batch's remaining rows instead of skipping them.
+func TestHandleSubmitTransactions_RowsKeepOwnTimestamps(t *testing.T) {
+	rawA, rawB, txidA, txidB := twoDistinctTxs(t)
+	rows := map[string]time.Time{}
+	ms := &mockStore{getOrInsertFn: func(in *models.TransactionStatus) (*models.TransactionStatus, bool, error) {
+		rows[in.TxID] = in.Timestamp
+		if in.TxID == txidA {
+			time.Sleep(2 * time.Millisecond) // the next row's clock reading must differ
+			return &models.TransactionStatus{TxID: txidA, Status: models.StatusRejected}, false, nil
+		}
+		return nil, true, nil
+	}}
+	pub, _, router := newReceivedServer(ms)
+	postSubmit(t, router, "/txs", append(append([]byte(nil), rawA...), rawB...))
+
+	if !rows[txidB].After(rows[txidA]) {
+		t.Errorf("row timestamps A=%v B=%v; each row must keep its own", rows[txidA], rows[txidB])
+	}
+	if len(pub.publishes) != 1 || pub.publishes[0].TxID != txidB {
+		t.Fatalf("expected one RECEIVED for the inserted %s, got %+v", txidB, pub.publishes)
+	}
+	if got := pub.publishes[0].Timestamp; !got.Equal(rows[txidB]) {
+		t.Errorf("RECEIVED timestamp %v, want the inserted row's %v", got, rows[txidB])
+	}
+}

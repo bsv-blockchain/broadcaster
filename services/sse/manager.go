@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/hashicorp/golang-lru/v2/simplelru"
 	"go.uber.org/zap"
 
 	"github.com/bsv-blockchain/broadcaster/events"
@@ -130,39 +131,31 @@ func (c *Client) admit(status *models.TransactionStatus) bool {
 // progressedCapacity bounds each of Client.progressed and Client.mined. A
 // trailing RECEIVED arrives within the intake pause or partition skew of its
 // verdict, so only the most recent txids matter; at ~100 B per entry this caps
-// a firehose client near 3.2 MB, and a token-scoped client's sets stay at its
-// own txids.
+// a firehose client in the low megabytes, and a token-scoped client's sets
+// stay at its own txids.
 const progressedCapacity = 16384
 
-// txidRing is a fixed-capacity set that evicts its oldest entry when full.
+// txidRing is a bounded set that evicts its least recently recorded txid when
+// full. It grows with what is recorded, so a token-scoped stream pays only for
+// its own txids, not for the capacity.
 type txidRing struct {
-	set  map[string]struct{}
-	ring []string
-	next int
+	lru *simplelru.LRU[string, struct{}]
 }
 
 func newTxidRing(capacity int) *txidRing {
-	return &txidRing{set: make(map[string]struct{}), ring: make([]string, capacity)}
+	l, err := simplelru.NewLRU[string, struct{}](capacity, nil)
+	if err != nil {
+		panic(err) // capacity is a positive constant
+	}
+	return &txidRing{lru: l}
 }
 
 func (r *txidRing) has(txid string) bool {
-	if r == nil {
-		return false
-	}
-	_, ok := r.set[txid]
-	return ok
+	return r != nil && r.lru.Contains(txid)
 }
 
 func (r *txidRing) add(txid string) {
-	if r.has(txid) {
-		return
-	}
-	if old := r.ring[r.next]; old != "" {
-		delete(r.set, old)
-	}
-	r.ring[r.next] = txid
-	r.set[txid] = struct{}{}
-	r.next = (r.next + 1) % len(r.ring)
+	r.lru.Add(txid, struct{}{})
 }
 
 // Manager owns the per-pod registry of SSE clients listening on
@@ -335,7 +328,11 @@ func (m *Manager) fanOut(ctx context.Context, status *models.TransactionStatus) 
 	hint := status.CallbackTokenHint
 	status.CallbackTokenHint = ""
 	var tokens tokenSet
-	if tokenScoped(clients) {
+	switch {
+	case !tokenScoped(clients):
+	case hintedReceived(status, hint):
+		tokens = tokenSet{hint}
+	default:
 		tokens = m.tokens.lookup(ctx, status.TxID).withHint(hint)
 	}
 	m.deliver(ctx, clients, status, tokens)
@@ -363,16 +360,32 @@ func (m *Manager) fanOutBulk(ctx context.Context, status *models.TransactionStat
 	hint := status.CallbackTokenHint
 	status.CallbackTokenHint = ""
 	var resolved map[string]tokenSet
-	if tokenScoped(clients) {
+	hinted := hintedReceived(status, hint)
+	if tokenScoped(clients) && !hinted {
 		resolved = m.tokens.resolveBatch(ctx, status.TxIDs)
 	}
+	hintOnly := tokenSet{hint}
 	for _, txid := range status.TxIDs {
 		perTx := *status
 		perTx.TxID = txid
 		perTx.TxIDs = nil
-		m.deliver(ctx, clients, &perTx, resolved[txid].withHint(hint))
+		tokens := hintOnly
+		if !hinted {
+			tokens = resolved[txid].withHint(hint)
+		}
+		m.deliver(ctx, clients, &perTx, tokens)
 	}
 	m.observeFanout("bulk", start)
+}
+
+// hintedReceived reports whether an event's subscriber set is its hint alone,
+// so the token index need not be asked. Only the request that inserted the
+// row publishes RECEIVED, and its submission is the one the hint names; a
+// duplicate racing it gets no RECEIVED by design, and the row being new, no
+// earlier submission can name the txid. The lookup would also almost always
+// miss, the submission row being written asynchronously.
+func hintedReceived(status *models.TransactionStatus, hint string) bool {
+	return hint != "" && status.Status == models.StatusReceived
 }
 
 // deliver pushes one status to every client subscribed to it. tokens is the

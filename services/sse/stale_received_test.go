@@ -271,9 +271,9 @@ func TestClientAdmit(t *testing.T) {
 	r := newTxidRing(2)
 	r.add("x")
 	r.add("y")
-	r.add("x") // already present: no eviction
-	r.add("z") // evicts x, the oldest
-	if r.has("x") || !r.has("y") || !r.has("z") || len(r.set) != 2 {
-		t.Fatalf("ring = %v, want {y,z}", r.set)
+	r.add("x") // already present: refreshes x, no eviction
+	r.add("z") // evicts y, the least recently recorded
+	if !r.has("x") || r.has("y") || !r.has("z") || r.lru.Len() != 2 {
+		t.Fatalf("ring = %v, want {x,z}", r.lru.Keys())
 	}
 }
