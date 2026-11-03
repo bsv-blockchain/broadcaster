@@ -117,7 +117,12 @@ func TestStart_ReceivedTakesNoQueueSlot(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	startErr := make(chan error, 1)
 	go func() { startErr <- svc.Start(ctx) }()
-	defer func() { cancel(); <-startErr }()
+	defer func() {
+		cancel()
+		if err := <-startErr; err != nil {
+			t.Errorf("Start: %v", err)
+		}
+	}()
 
 	pub.ch <- &models.TransactionStatus{TxID: "txStall", Status: models.StatusMined, Timestamp: time.Now()}
 	select {
