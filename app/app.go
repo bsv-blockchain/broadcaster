@@ -16,7 +16,7 @@ import (
 	"net/http"
 	"os"
 	"path"
-	"strings"
+	"regexp"
 	"sync"
 	"time"
 
@@ -797,11 +797,18 @@ func (a chaintracksHeaderReader) GetHeaderByHeight(ctx context.Context, height u
 }
 
 // isRemoteHeaderNotFound recognizes the go-chaintracks client's 404, which it
-// only exposes as ErrServerRequestFailed wrapped with "status <code>".
+// only exposes as ErrServerRequestFailed wrapped with "status <code>" (no
+// typed status, as of v1.4.5). Matched as a whole token anywhere in the
+// message, so a reworded suffix ("status 404 Not Found", a trailing URL or
+// body) still reads as a 404 and "status 4040" does not. A miss here is
+// safe — the lookup stays a failure and the block stays queued — and a false
+// hit cannot park anything at or below the store's active tip, where the
+// reconciler disbelieves absence (Reconciler.judgedActiveHashAt).
 func isRemoteHeaderNotFound(err error) bool {
-	return errors.Is(err, chaintrackslib.ErrServerRequestFailed) &&
-		strings.HasSuffix(err.Error(), fmt.Sprintf("status %d", http.StatusNotFound))
+	return errors.Is(err, chaintrackslib.ErrServerRequestFailed) && remoteNotFoundRE.MatchString(err.Error())
 }
+
+var remoteNotFoundRE = regexp.MustCompile(fmt.Sprintf(`\bstatus %d\b`, http.StatusNotFound))
 
 // endpointSourceValidationTTL is how long a discovered URL that passed
 // validation skips re-validation (including its DNS round-trip) on

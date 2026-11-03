@@ -405,6 +405,7 @@ bump_builder:
   #   blocks_per_tick: 4       # orphaned blocks reconciled per tick
   #   neighborhood_depth: 6    # heights above an orphan searched for re-binned txs
   #   max_defer_attempts: 10   # ticks to wait for a missing canonical BUMP
+  #   rewatch_concurrency: 0   # parallel /watch calls re-registering an orphan's txs (0 = propagation.merkle_concurrency)
   #   startup_full_scan: true  # one-off sweep for stale anchors (bounded, see below)
   #
   #   # Startup full-scan horizon (issue #282). The sweep is BOUNDED so it does

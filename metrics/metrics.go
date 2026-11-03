@@ -624,7 +624,8 @@ var BumpBuilderAnchorGuardDeniedTotal = promauto.NewCounterVec(prometheus.Counte
 // block's BUMP), parked (canonical BUMP unavailable at the defer cap — txs
 // left MINED, NOT reverted, awaiting a later canonical BUMP; issue #282),
 // stale (the reconciled_at compare-and-set found the row reactivated or
-// orphaned again mid-pass — nothing stamped; issue #339), error.
+// orphaned again mid-pass — nothing stamped; issue #339), held (waiting for
+// the merkle-service re-watch of the orphan's txs, under its cap), error.
 var ReconcilerBlocksTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "bsv_broadcaster_reconciler_blocks_total",
 	Help: "Orphaned blocks processed by the anchor reconciler, by outcome.",

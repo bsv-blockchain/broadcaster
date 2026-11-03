@@ -205,8 +205,8 @@ func TestReconciler_OrphanTxsReminedAfterPostMineTTL_ReanchorToNewBlock(t *testi
 // TestReconciler_OrphanRewatchOncePerGenerationRetriesOnFailure: the
 // re-watch is a one-off per orphan generation — the defer ticks that follow
 // must not re-POST every anchored txid every 30 s — but a failed one is
-// retried on the next tick instead of being lost, and it never holds the
-// reconcile pass up.
+// retried on the next tick instead of being lost. While it is outstanding
+// the pass is held, and a hold does not spend the defer budget.
 func TestReconciler_OrphanRewatchOncePerGenerationRetriesOnFailure(t *testing.T) {
 	ctx := context.Background()
 	st := newPebbleForTest(t)
@@ -223,12 +223,12 @@ func TestReconciler_OrphanRewatchOncePerGenerationRetriesOnFailure(t *testing.T)
 	withMerkleTTLStub(r, merkle)
 
 	merkle.setFail(true)
-	r.tick(ctx) // re-watch fails; the pass still defers as usual
+	r.tick(ctx) // re-watch fails; the pass is held
 	if n := merkle.watchCount(recShared1); n != 0 {
 		t.Fatalf("failing merkle-service must not record a watch, got %d", n)
 	}
-	if r.defers[recOrphan] != 1 {
-		t.Fatalf("a failed re-watch must not hold up the pass, defers=%d", r.defers[recOrphan])
+	if r.defers[recOrphan] != 0 {
+		t.Fatalf("a hold must not spend the defer budget, defers=%d", r.defers[recOrphan])
 	}
 
 	merkle.setFail(false)
@@ -243,26 +243,25 @@ func TestReconciler_OrphanRewatchOncePerGenerationRetriesOnFailure(t *testing.T)
 }
 
 // TestReconciler_NoParkUntilOrphanRewatched: merkle-service unreachable
-// through the defer window must not let the cap park the block straight
-// away — a park with the watches lapsed strands its txs exactly as at
-// 973522, because nothing re-registers them once the block is off the
-// queue. The block is held while the re-watch retries, then parks as usual
-// once it lands.
+// must not let the block park straight away — a park with the watches lapsed
+// strands its txs exactly as at 973522, because nothing re-registers them
+// once the block is off the queue. The block is held while the re-watch
+// retries, then defers and parks as usual once it lands.
 func TestReconciler_NoParkUntilOrphanRewatched(t *testing.T) {
 	ctx := context.Background()
 	st, merkle, r := newRewatchFixture(t, 2, recShared1)
 
 	merkle.setFail(true)
-	r.tick(ctx) // defer 1/2
-	r.tick(ctx) // defer 2/2
-	r.tick(ctx) // cap reached, re-watch still failing → held (1/2)
-	r.tick(ctx) // held (2/2)
+	r.tick(ctx) // held 1/2
+	r.tick(ctx) // held 2/2
 	if rows, _ := st.ListOrphanedBlocksToReconcile(ctx, 10); len(rows) != 1 {
 		t.Fatalf("an orphan whose txs were never re-watched must stay queued, got %d rows", len(rows))
 	}
 
 	merkle.setFail(false)
-	r.tick(ctx) // re-watch lands → park
+	r.tick(ctx) // re-watch lands → defer 1/2
+	r.tick(ctx) // defer 2/2
+	r.tick(ctx) // cap → park
 	if rows, _ := st.ListOrphanedBlocksToReconcile(ctx, 10); len(rows) != 0 {
 		t.Fatalf("once re-watched the orphan must park and leave the queue, got %d rows", len(rows))
 	}
@@ -284,7 +283,7 @@ func TestReconciler_RewatchHoldIsBounded(t *testing.T) {
 	st, merkle, r := newRewatchFixture(t, 2, recShared1)
 
 	merkle.setFail(true)
-	for range 5 { // 2 defers + 2 holds, then retired
+	for range 5 { // 2 holds, then 2 defers, then retired
 		r.tick(ctx)
 	}
 	if rows, _ := st.ListOrphanedBlocksToReconcile(ctx, 10); len(rows) != 0 {
@@ -305,9 +304,6 @@ func TestReconciler_NoCanonicalReprocessUntilRewatched(t *testing.T) {
 	r.tick(ctx)
 	if got := merkle.reprocessed(); len(got) != 0 {
 		t.Fatalf("no canonical /reprocess while the orphan's txs are unwatched, got %v", got)
-	}
-	if r.defers[recOrphan] != 1 {
-		t.Fatalf("the skipped poke must still count as a defer attempt, defers=%d", r.defers[recOrphan])
 	}
 
 	merkle.setFail(false)
@@ -363,4 +359,193 @@ func mustOrphanedAt(t *testing.T, r *Reconciler) *time.Time {
 		t.Fatalf("orphan row: %+v err=%v", bp, err)
 	}
 	return bp.OrphanedAt
+}
+
+// TestReconciler_RewatchLandingLateStillReprocessesCanonical: the re-watch
+// lands only after as many failing ticks as the defer cap. Holds must not
+// have spent the defer budget, or the pass parks straight away without ever
+// asking merkle-service to rebuild the canonical block — and merkle-service
+// has already processed that block, so no STUMP for the re-watched txs ever
+// arrives and the ones in it stay MINED@orphan for good.
+func TestReconciler_RewatchLandingLateStillReprocessesCanonical(t *testing.T) {
+	ctx := context.Background()
+	st, merkle, r := newRewatchFixture(t, 2, recShared1)
+
+	merkle.setFail(true)
+	r.tick(ctx)
+	r.tick(ctx)
+	merkle.setFail(false)
+	for range 4 {
+		r.tick(ctx)
+	}
+	if got := merkle.reprocessed(); len(got) == 0 || got[0] != recCanonical {
+		t.Fatalf("the canonical block must be reprocessed once the re-watch lands, got %v", got)
+	}
+	if rows, _ := st.ListOrphanedBlocksToReconcile(ctx, 10); len(rows) != 0 {
+		t.Fatalf("the orphan must still retire after its defers, got %d rows", len(rows))
+	}
+}
+
+// TestReconciler_PermanentTxRewatchFailureDoesNotStarveReprocess: one txid
+// merkle-service refuses every time must not keep the canonical /reprocess
+// from ever being sent for the txs that did register. Past the hold cap the
+// pass goes on: it defers with the /reprocess, and keeps retrying the one
+// txid on the way.
+func TestReconciler_PermanentTxRewatchFailureDoesNotStarveReprocess(t *testing.T) {
+	ctx := context.Background()
+	st, merkle, r := newRewatchFixture(t, 2, recShared1, recAOnly)
+
+	merkle.setFailTx(recAOnly, true)
+	r.tick(ctx) // held 1/2
+	r.tick(ctx) // held 2/2
+	if got := merkle.reprocessed(); len(got) != 0 {
+		t.Fatalf("no /reprocess while held, got %v", got)
+	}
+	r.tick(ctx) // hold cap → defer 1/2 with /reprocess
+	if got := merkle.reprocessed(); len(got) != 1 || got[0] != recCanonical {
+		t.Fatalf("past the hold cap the canonical block must be reprocessed, got %v", got)
+	}
+	r.tick(ctx) // defer 2/2
+	r.tick(ctx) // cap → park
+	if rows, _ := st.ListOrphanedBlocksToReconcile(ctx, 10); len(rows) != 0 {
+		t.Fatalf("the orphan must retire, got %d rows", len(rows))
+	}
+	if n := merkle.watchCount(recShared1); n != 1 {
+		t.Fatalf("the registered tx is not re-POSTed, got %d", n)
+	}
+}
+
+// TestReconciler_RewatchHoldOutcome: a held pass reports "held", not "error"
+// — it is a planned wait, and must not feed reconciler-error alerting.
+func TestReconciler_RewatchHoldOutcome(t *testing.T) {
+	ctx := context.Background()
+	st, merkle, r := newRewatchFixture(t, 2, recShared1)
+	merkle.setFail(true)
+	rows, err := st.ListOrphanedBlocksToReconcile(ctx, 10)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("queue: %d rows err=%v", len(rows), err)
+	}
+	if got := r.reconcileBlock(ctx, rows[0]); got != outcomeHeld {
+		t.Fatalf("outcome = %q, want %q", got, outcomeHeld)
+	}
+}
+
+// TestReconciler_PrunesStateOfRowsThatLeftTheQueue: per-orphan bookkeeping
+// of a block that left the queue without passing through forgetOrphan (the
+// block-status tracker reactivated it) is dropped once a listing shows the
+// whole queue — a re-watch entry can hold a large orphan's whole txid list.
+// A pending re-mine's defer counter is that path's own and stays.
+func TestReconciler_PrunesStateOfRowsThatLeftTheQueue(t *testing.T) {
+	ctx := context.Background()
+	_, _, r := newRewatchFixture(t, 2, recShared1)
+	r.rewatch["gone"] = &orphanRewatch{pending: []string{"a", "b"}}
+	r.defers["gone"] = 3
+	r.defers["pending-remine"] = 1
+	r.pendingRemine["pending-remine"] = 7
+
+	r.tick(ctx)
+
+	if _, ok := r.rewatch["gone"]; ok {
+		t.Fatal("re-watch state of a departed row must be pruned")
+	}
+	if _, ok := r.defers["gone"]; ok {
+		t.Fatal("defer count of a departed row must be pruned")
+	}
+	if r.defers["pending-remine"] != 1 {
+		t.Fatal("a pending re-mine's defer counter must be kept")
+	}
+	if _, ok := r.rewatch[recOrphan]; !ok {
+		t.Fatal("a still-queued orphan's re-watch state must be kept")
+	}
+}
+
+// TestReconciler_HeaderSourceBehindStoreKeepsQueued: absence from the
+// header source is believed only above the store's active tip. At or below
+// it the store holds an active block there, so "no header" means the source
+// is behind or misconfigured — a chaintracks pod resyncing from genesis, a
+// remote URL missing /chaintracks that 404s every height — and acting on it
+// would park the orphan (no canonical hash at O) or end the neighborhood
+// walk early ahead of a revert.
+func TestReconciler_HeaderSourceBehindStoreKeepsQueued(t *testing.T) {
+	t.Run("no header at the orphan's height", func(t *testing.T) {
+		ctx := context.Background()
+		st := newPebbleForTest(t)
+		chain := &stubChaintracks{notFoundErr: true} // nothing at any height
+		seedMined(t, st, recOrphan, 10, recShared1)
+		_ = st.UpsertBlockHeaderSeen(ctx, recOrphan, 10, time.Now())
+		_ = st.UpsertBlockHeaderSeen(ctx, recCanonical, 10, time.Now()) // store tip 10: the canonical block
+		_, _ = st.MarkBlocksOrphaned(ctx, []string{recOrphan}, time.Now())
+		r := newTestReconciler(st, &capturePublisher{}, chain, func(c *config.ReconcilerConfig) {
+			c.MaxDeferAttempts = 1
+			c.NeighborhoodDepth = 0 // only the lookup at O is in play
+		})
+
+		for range 4 {
+			r.tick(ctx)
+		}
+		if rows, _ := st.ListOrphanedBlocksToReconcile(ctx, 10); len(rows) != 1 {
+			t.Fatalf("a header source with nothing at or below the store's tip must not park the orphan, got %d rows", len(rows))
+		}
+		if got := statusOf(t, st, recShared1); got.Status != models.StatusMined || got.BlockHash != recOrphan {
+			t.Fatalf("tx must be untouched, got %s@%s", got.Status, got.BlockHash)
+		}
+	})
+
+	t.Run("no header at a neighbor the store holds", func(t *testing.T) {
+		ctx := context.Background()
+		st := newPebbleForTest(t)
+		chain := &stubChaintracks{notFoundErr: true}
+		chain.setHeightHeader(10, headerWithHash(t, recCanonical, 10))
+		seedMined(t, st, recOrphan, 10, recShared1)
+		_ = st.UpsertBlockHeaderSeen(ctx, recOrphan, 10, time.Now())
+		_ = st.UpsertBlockHeaderSeen(ctx, recCanonical, 10, time.Now())
+		_ = st.InsertBUMP(ctx, recCanonical, 10, makeCompoundForTest(t, 10, recShared2))
+		_ = st.UpsertBlockHeaderSeen(ctx, recNeighbor, 11, time.Now()) // store tip 11, source tip 10
+		_, _ = st.MarkBlocksOrphaned(ctx, []string{recOrphan}, time.Now())
+		r := newTestReconciler(st, &capturePublisher{}, chain, nil)
+
+		rows, _ := st.ListOrphanedBlocksToReconcile(ctx, 10)
+		if len(rows) != 1 {
+			t.Fatalf("queue: %d rows", len(rows))
+		}
+		if got := r.reconcileBlock(ctx, rows[0]); got != outcomeError {
+			t.Fatalf("outcome = %q, want %q — the walk must not end at a height the store holds", got, outcomeError)
+		}
+		if got := statusOf(t, st, recShared1); got.Status != models.StatusMined || got.BlockHash != recOrphan {
+			t.Fatalf("tx must not be reverted, got %s@%s", got.Status, got.BlockHash)
+		}
+	})
+
+	t.Run("absence above the store's tip ends the walk", func(t *testing.T) {
+		ctx := context.Background()
+		st := newPebbleForTest(t)
+		chain := &stubChaintracks{notFoundErr: true}
+		chain.setHeightHeader(10, headerWithHash(t, recCanonical, 10))
+		seedMined(t, st, recOrphan, 10, recShared1)
+		_ = st.UpsertBlockHeaderSeen(ctx, recOrphan, 10, time.Now())
+		_ = st.UpsertBlockHeaderSeen(ctx, recCanonical, 10, time.Now())
+		_ = st.InsertBUMP(ctx, recCanonical, 10, makeCompoundForTest(t, 10, recShared2))
+		_, _ = st.MarkBlocksOrphaned(ctx, []string{recOrphan}, time.Now())
+		r := newTestReconciler(st, &capturePublisher{}, chain, nil)
+
+		rows, _ := st.ListOrphanedBlocksToReconcile(ctx, 10)
+		if got := r.reconcileBlock(ctx, rows[0]); got == outcomeError {
+			t.Fatalf("absence above the store's tip is the end of the chain, not a failure; got %q", got)
+		}
+	})
+}
+
+// TestReconciler_RewatchConcurrency: the reconciler's own setting wins; unset,
+// it falls back to the propagation service's merkle_concurrency, which in
+// microservice mode is only set on the propagation deployment.
+func TestReconciler_RewatchConcurrency(t *testing.T) {
+	r := newTestReconciler(newPebbleForTest(t), &capturePublisher{}, &stubChaintracks{}, nil)
+	r.cfg.Propagation.MerkleConcurrency = 50
+	if got := r.rewatchConcurrency(); got != 50 {
+		t.Fatalf("fallback = %d, want 50", got)
+	}
+	r.cfg.BumpBuilder.Reconciler.RewatchConcurrency = 8
+	if got := r.rewatchConcurrency(); got != 8 {
+		t.Fatalf("reconciler setting = %d, want 8", got)
+	}
 }

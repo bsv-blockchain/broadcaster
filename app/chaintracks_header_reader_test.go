@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -40,5 +41,28 @@ func TestChaintracksHeaderReader_RemoteNotFoundIsAbsence(t *testing.T) {
 	_, err = reader.GetHeaderByHeight(context.Background(), 973525)
 	if err == nil || errors.Is(err, chaintrackslib.ErrHeaderNotFound) {
 		t.Fatalf("a remote 500 is a failed lookup, not absence, got %v", err)
+	}
+}
+
+// TestIsRemoteHeaderNotFound pins the 404 match against the client's error
+// wording: it must survive a reworded suffix and must not match other codes.
+func TestIsRemoteHeaderNotFound(t *testing.T) {
+	wrap := func(msg string) error { return fmt.Errorf("%w: %s", chaintrackslib.ErrServerRequestFailed, msg) }
+	cases := []struct {
+		err  error
+		want bool
+	}{
+		{wrap("status 404"), true},
+		{wrap("status 404 Not Found"), true},
+		{fmt.Errorf("get header: %w", wrap("status 404 (http://ct/v2/header/height/5)")), true},
+		{wrap("status 4040"), false},
+		{wrap("status 500"), false},
+		{errors.New("status 404"), false}, // not the client's request failure
+		{nil, false},
+	}
+	for _, tc := range cases {
+		if got := isRemoteHeaderNotFound(tc.err); got != tc.want {
+			t.Errorf("isRemoteHeaderNotFound(%v) = %v, want %v", tc.err, got, tc.want)
+		}
 	}
 }

@@ -879,6 +879,12 @@ type ReconcilerConfig struct {
 	// SEEN_ON_NETWORK → MINED is lattice-legal and a late canonical
 	// redelivery re-mines via the short-circuit path. Default 10.
 	MaxDeferAttempts int `mapstructure:"max_defer_attempts"`
+	// RewatchConcurrency is how many merkle-service /watch calls run at once
+	// when the reconciler re-registers the txs anchored to an orphan. 0 falls
+	// back to propagation.merkle_concurrency (the same merkle-service), then
+	// to the client default — set it here in microservice mode, where the
+	// propagation settings are only on the propagation deployment.
+	RewatchConcurrency int `mapstructure:"rewatch_concurrency"`
 	// StartupFullScan runs one pass over the block_processing table after
 	// startup, orphan-marking any 'active' row whose height's canonical
 	// header differs — the deep backstop that also heals incidents that
@@ -1628,6 +1634,7 @@ func setDefaults() {
 	viper.SetDefault("bump_builder.reconciler.batch_size", 5000)
 	viper.SetDefault("bump_builder.reconciler.blocks_per_tick", 4)
 	viper.SetDefault("bump_builder.reconciler.neighborhood_depth", 6)
+	viper.SetDefault("bump_builder.reconciler.rewatch_concurrency", 0)
 	viper.SetDefault("bump_builder.reconciler.max_defer_attempts", 10)
 	viper.SetDefault("bump_builder.reconciler.startup_full_scan", true)
 	viper.SetDefault("bump_builder.reconciler.full_scan_depth", 144)
