@@ -80,6 +80,23 @@ type Deps struct {
 // order they need to be created. The returned cleanup func closes them in
 // reverse order. teranodeClient.Start is wired to ctx, so its background
 // probes terminate when ctx is canceled.
+// partitionPreflight fails startup when a topic the deployment was sized
+// for is missing or too narrow.
+//
+// TopicPropagation is always checked against propagation.partitions.
+// The fan-out topics from kafka.HorizontalScaleTopics are checked against
+// kafka.min_partitions only when that floor is greater than 1. Zero and
+// one are the standalone and single-replica settings and skip that check.
+func partitionPreflight(broker kafka.Broker, cfg *config.Config, logger *zap.Logger) error {
+	if pErr := kafka.CheckMinPartitions(broker, kafka.TopicPropagation, cfg.Propagation.Partitions, logger); pErr != nil {
+		return pErr
+	}
+	if cfg.Kafka.MinPartitions > 1 {
+		return kafka.CheckPartitions(broker, kafka.HorizontalScaleTopics(), cfg.Kafka.MinPartitions, logger)
+	}
+	return nil
+}
+
 func Bootstrap(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*Deps, func(), error) {
 	logger.Info(
 		"starting bsv-broadcaster",
@@ -119,27 +136,19 @@ func Bootstrap(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*De
 	// partition count: every partition carries real traffic and gets its own
 	// dispatcher. This knob is a fail-closed assertion, not a placement
 	// control; lowering it does not narrow the producer's hash space.
-	if pErr := kafka.CheckMinPartitions(broker, kafka.TopicPropagation, cfg.Propagation.Partitions, logger); pErr != nil {
+	// TopicPropagation is always checked, including at one partition.
+	// kafka.min_partitions, when greater than 1, is the same kind of
+	// fail-closed floor for the fan-out topics (block_processed and
+	// tx_status). A missing topic is an error: the metadata probe does
+	// not create it, and auto-creation on first publish would use the
+	// broker default, which can be narrower than the pod count. Values
+	// of 0 or 1 skip that floor so standalone and single-replica
+	// deployments, including the in-memory broker, are unchanged.
+	// TopicPropagation is not in that list; it has its own knob.
+	// TopicTransaction and the DLQs stay at one partition by design.
+	if pErr := partitionPreflight(broker, cfg, logger); pErr != nil {
 		_ = producer.Close()
 		return nil, nil, fmt.Errorf("kafka partition check: %w", pErr)
-	}
-	// MinPartitions is a soft hint for horizontally-scaled topics. There
-	// are currently no other hot-path topics that need it (TopicTransaction
-	// was retired with tx_validator) but the knob is retained so a future
-	// fan-out topic can opt into the check without re-introducing config.
-	//
-	// Deliberately still passed a nil topic list, which makes CheckPartitions
-	// a no-op. Handing it the real fan-out topics turns a check that has been
-	// dead since TopicTransaction was retired into a live boot-blocking one:
-	// any deployment carrying a leftover kafka.min_partitions greater than
-	// its actual bsv-broadcaster.tx_status / bsv-broadcaster.block_processed width would
-	// crash-loop on upgrade, for a reason unrelated to multi-partition
-	// propagation. Enabling it is its own change, with its own release note.
-	if cfg.Kafka.MinPartitions > 1 {
-		if pErr := kafka.CheckPartitions(broker, nil, cfg.Kafka.MinPartitions, logger); pErr != nil {
-			_ = producer.Close()
-			return nil, nil, fmt.Errorf("kafka partition check: %w", pErr)
-		}
 	}
 
 	st, leaser, err := storefactory.New(ctx, cfg, logger)
