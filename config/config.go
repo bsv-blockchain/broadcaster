@@ -333,7 +333,7 @@ type Store struct {
 type Aero struct {
 	Hosts           []string `mapstructure:"hosts"`
 	Namespace       string   `mapstructure:"namespace"`
-	BatchSize       int      `mapstructure:"batch_size"`
+	BatchSize       int      `mapstructure:"batch_size"` // must be > 0; 0 hangs batch loops (issue #90)
 	PoolSize        int      `mapstructure:"pool_size"`
 	QueryTimeoutMs  int      `mapstructure:"query_timeout_ms"`
 	OpTimeoutMs     int      `mapstructure:"op_timeout_ms"`
@@ -1307,6 +1307,12 @@ const (
 	DefaultTeranodeMaxBatchBytes = 16 * 1024 * 1024
 )
 
+// DefaultAerospikeBatchSize is the fallback for store.aerospike.batch_size.
+// Batch loops advance by this step; a non-positive value never moves and
+// hangs mined-status, BUMP, and STUMP cleanup (issue #90). viper and
+// aerospike.New share this constant so the two cannot drift.
+const DefaultAerospikeBatchSize = 500
+
 // Default policy values for the GET /policy endpoint. They mirror teranode's
 // canonical BSV policy defaults (validator.defaultPolicySettings) so BSV Broadcaster
 // advertises the same limits the upstream node enforces when the operator
@@ -1513,7 +1519,7 @@ func setDefaults() {
 	viper.SetDefault("store.backend", "aerospike")
 	viper.SetDefault("store.aerospike.hosts", []string{"localhost:3000"})
 	viper.SetDefault("store.aerospike.namespace", "bsv_broadcaster")
-	viper.SetDefault("store.aerospike.batch_size", 500)
+	viper.SetDefault("store.aerospike.batch_size", DefaultAerospikeBatchSize)
 	viper.SetDefault("store.aerospike.pool_size", 256)
 	viper.SetDefault("store.aerospike.query_timeout_ms", 8000)
 	viper.SetDefault("store.aerospike.op_timeout_ms", 3000)
@@ -1811,6 +1817,11 @@ func validate(cfg *Config) error {
 	case "", "aerospike":
 		if len(cfg.Store.Aerospike.Hosts) == 0 {
 			return fmt.Errorf("store.aerospike.hosts is required when store.backend=aerospike")
+		}
+		// 0 is not "use the default" — viper already applied 500 when the key
+		// was unset. An explicit 0 makes `i += batchSize` spin forever.
+		if cfg.Store.Aerospike.BatchSize <= 0 {
+			return fmt.Errorf("store.aerospike.batch_size must be > 0, got %d", cfg.Store.Aerospike.BatchSize)
 		}
 	case "pebble":
 		if cfg.Store.Pebble.Path == "" {

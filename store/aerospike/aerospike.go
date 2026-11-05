@@ -13,6 +13,7 @@ import (
 
 	aero "github.com/aerospike/aerospike-client-go/v7"
 	"github.com/aerospike/aerospike-client-go/v7/types"
+	"go.uber.org/zap"
 
 	"github.com/bsv-blockchain/broadcaster/config"
 	"github.com/bsv-blockchain/broadcaster/metrics"
@@ -48,6 +49,24 @@ const (
 	setDatahubEndpoints = "arcade_datahub_endpoints"
 	setPeerPolicies     = "arcade_peer_policies"
 )
+
+// effectiveBatchSize returns n when it is a positive loop step, otherwise
+// config.DefaultAerospikeBatchSize. Config validation rejects <= 0; this
+// clamp covers callers that build config.Aero without going through Load.
+// A nil logger discards the warning emitted when the value is clamped.
+func effectiveBatchSize(n int, logger *zap.Logger) int {
+	if n > 0 {
+		return n
+	}
+	if logger == nil {
+		logger = zap.NewNop()
+	}
+	logger.Warn("clamping non-positive store.aerospike.batch_size so batch loops advance",
+		zap.Int("configured", n),
+		zap.Int("batch_size", config.DefaultAerospikeBatchSize),
+	)
+	return config.DefaultAerospikeBatchSize
+}
 
 // BUMP chunking — large compound BUMPs (scaling networks with millions of
 // txs/block produce tens of MiB of merkle path data) cannot fit in a single
@@ -100,7 +119,9 @@ type Store struct {
 }
 
 // New creates an Aerospike-backed Store connected to the configured cluster.
-func New(ctx context.Context, cfg config.Aero) (*Store, error) {
+// A nil logger discards the warning emitted when BatchSize is non-positive
+// and is clamped to config.DefaultAerospikeBatchSize.
+func New(ctx context.Context, cfg config.Aero, logger *zap.Logger) (*Store, error) {
 	hosts := make([]*aero.Host, 0, len(cfg.Hosts))
 	for _, h := range cfg.Hosts {
 		hostname, portStr, err := net.SplitHostPort(h)
@@ -161,7 +182,7 @@ func New(ctx context.Context, cfg config.Aero) (*Store, error) {
 	s := &Store{
 		client:        client,
 		namespace:     cfg.Namespace,
-		batchSize:     cfg.BatchSize,
+		batchSize:     effectiveBatchSize(cfg.BatchSize, logger),
 		queryTimeout:  time.Duration(cfg.QueryTimeoutMs) * time.Millisecond,
 		opTimeout:     time.Duration(cfg.OpTimeoutMs) * time.Millisecond,
 		socketTimeout: time.Duration(cfg.SocketTimeoutMs) * time.Millisecond,
