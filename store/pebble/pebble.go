@@ -2834,3 +2834,45 @@ func (s *Store) readPartitionKey(txid string) (store.ParentKey, bool, error) {
 	}
 	return store.ParentKey{Status: models.Status(row.Status), PartitionKey: row.PartitionKey}, true, nil
 }
+
+// LookupRawTxs implements store.Store. Pebble reads the row whole either
+// way, so this is one point read per txid.
+func (s *Store) LookupRawTxs(ctx context.Context, txids []string) (map[string]store.RawTxRow, error) {
+	out := make(map[string]store.RawTxRow, len(txids))
+	for _, txid := range txids {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		row, err := s.readStoredStatus(txid)
+		if err != nil {
+			return nil, err
+		}
+		if row != nil {
+			out[txid] = store.RawTxRow{Status: models.Status(row.Status), RawTx: row.RawTx}
+		}
+	}
+	return out, nil
+}
+
+// SetRawTx implements store.Store. raw_tx is not indexed, so only the row
+// itself is rewritten.
+func (s *Store) SetRawTx(_ context.Context, txid string, rawTx []byte) error {
+	mu := s.shardFor(txid)
+	mu.Lock()
+	defer mu.Unlock()
+
+	existing, err := s.readStoredStatus(txid)
+	if err != nil {
+		return err
+	}
+	if existing == nil {
+		return fmt.Errorf("set raw tx %s: %w", txid, store.ErrNotFound)
+	}
+	updated := *existing
+	updated.RawTx = rawTx
+	payload, err := json.Marshal(updated)
+	if err != nil {
+		return err
+	}
+	return s.db.Set(txKey(txid), payload, s.writeOpts)
+}

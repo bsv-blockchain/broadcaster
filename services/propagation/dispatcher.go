@@ -2,11 +2,9 @@ package propagation
 
 import (
 	"context"
-	"encoding/json"
 	"time"
 
 	"go.opentelemetry.io/otel/trace"
-	"go.uber.org/zap"
 
 	"github.com/bsv-blockchain/broadcaster/kafka"
 	"github.com/bsv-blockchain/broadcaster/metrics"
@@ -171,9 +169,9 @@ func (p *Propagator) runDispatcher(ctx context.Context, claim kafka.Claim, cfg d
 	// See markQueue for why this is a queue, not a map (#295).
 	marks := &markQueue{}
 
-	var claimMsgCh <-chan *kafka.Message
+	var claimMsgCh <-chan hydratedMsg
 	if claim != nil {
-		claimMsgCh = claim.Messages()
+		claimMsgCh = p.hydrateClaim(ctx, claim.Messages())
 	}
 
 	// In production the ticker drives periodic flushes (50ms). In test
@@ -228,7 +226,7 @@ func (p *Propagator) runDispatcher(ctx context.Context, claim kafka.Claim, cfg d
 		// claim.Messages() and admitCh participate, so the same cap
 		// applies in either mode.
 		var admitChIfRoom <-chan admitRequest
-		var claimChIfRoom <-chan *kafka.Message
+		var claimChIfRoom <-chan hydratedMsg
 		if cfg.maxPending <= 0 || len(pendingMsgs) < cfg.maxPending {
 			admitChIfRoom = io.admitCh
 			claimChIfRoom = claimMsgCh
@@ -244,30 +242,23 @@ func (p *Propagator) runDispatcher(ctx context.Context, claim kafka.Claim, cfg d
 			marks.advance(claim, tracker)
 			return nil
 
-		case msg, ok := <-claimChIfRoom:
+		case h, ok := <-claimChIfRoom:
 			if !ok {
 				// Claim channel closed → claim ended; exit cleanly so
 				// Sarama can move on. Same final drain as ctx.Done.
 				marks.advance(claim, tracker)
 				return nil
 			}
-			var propMsg propagationMsg
-			if err := json.Unmarshal(msg.Value, &propMsg); err != nil {
-				p.logger.Warn(
-					"decoding propagation message",
-					zap.Int64("offset", msg.Offset),
-					zap.Error(err),
-				)
-				// Mark malformed messages so the consumer doesn't
-				// redeliver them forever. Drop on the floor.
-				claim.MarkMessage(msg)
+			msg := h.kmsg
+			if h.drop != "" {
+				// Malformed, or no raw tx to load (see hydrate). Queue the
+				// offset with no tracker entry so it is marked once the
+				// watermark reaches it, not ahead of in-flight offsets
+				// below it.
+				marks.push(msg)
 				continue
 			}
-			if len(propMsg.RawTx) == 0 {
-				p.logger.Warn("propagation message has empty raw_tx", zap.Int64("offset", msg.Offset))
-				claim.MarkMessage(msg)
-				continue
-			}
+			propMsg := h.msg
 			// Stash the producer's trace context (invalid/zero-value, at no
 			// extra cost, when msg.Headers is nil — telemetry disabled or
 			// the producer never injected one). processBatch links the

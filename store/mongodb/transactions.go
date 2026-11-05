@@ -993,3 +993,44 @@ func (s *Store) LookupPartitionKeys(ctx context.Context, txids []string) (map[st
 	}
 	return out, nil
 }
+
+// LookupRawTxs implements store.Store with one projected query.
+func (s *Store) LookupRawTxs(ctx context.Context, txids []string) (map[string]store.RawTxRow, error) {
+	if len(txids) == 0 {
+		return nil, nil
+	}
+	octx, cancel := s.opCtx(ctx)
+	defer cancel()
+	cur, err := s.tx.Find(octx, doc(kv(fID, doc(kv(opIn, txids)))),
+		options.Find().SetProjection(doc(kv(fStatus, 1), kv(fRawTx, 1))))
+	if err != nil {
+		return nil, fmt.Errorf("lookup raw txs: %w", err)
+	}
+	defer func() { _ = cur.Close(octx) }()
+	out := make(map[string]store.RawTxRow, len(txids))
+	for cur.Next(octx) {
+		var d txDoc
+		if err := cur.Decode(&d); err != nil {
+			return nil, fmt.Errorf("lookup raw txs: decode: %w", err)
+		}
+		out[d.TxID] = store.RawTxRow{Status: models.Status(d.Status), RawTx: d.RawTx}
+	}
+	if err := cur.Err(); err != nil {
+		return nil, fmt.Errorf("lookup raw txs: %w", err)
+	}
+	return out, nil
+}
+
+// SetRawTx implements store.Store.
+func (s *Store) SetRawTx(ctx context.Context, txid string, rawTx []byte) error {
+	octx, cancel := s.opCtx(ctx)
+	defer cancel()
+	res, err := s.tx.UpdateOne(octx, idFilter(txid), doc(kv(opSet, doc(kv(fRawTx, rawTx))), incVersion()))
+	if err != nil {
+		return fmt.Errorf("set raw tx %s: %w", txid, err)
+	}
+	if res.MatchedCount == 0 {
+		return fmt.Errorf("set raw tx %s: %w", txid, store.ErrNotFound)
+	}
+	return nil
+}
