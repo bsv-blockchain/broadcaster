@@ -57,3 +57,24 @@ func TestStatusFromUpdateBinsIgnoresUnrelatedBins(t *testing.T) {
 		t.Fatalf("unrelated bins were decoded: %+v", got)
 	}
 }
+
+// The stale-row reaper reads rows through IterateStatusesSince, which decodes
+// with recordToStatus, and skips any row without a raw tx — so dropping the
+// bin here leaves a stuck RECEIVED row unrecoverable on Aerospike.
+func TestRecordToStatusDecodesRawTx(t *testing.T) {
+	raw := []byte{0x01, 0x00, 0x00, 0x00, 0xde, 0xad}
+	rec := &aero.Record{Bins: aero.BinMap{
+		"status":    "RECEIVED",
+		"timestamp": 1_700_000_000_000,
+		"raw_tx":    raw,
+	}}
+	got := recordToStatus(rec, "txid")
+	if got.Status != models.StatusReceived || string(got.RawTx) != string(raw) {
+		t.Fatalf("decoded status = {%s %x}, want {RECEIVED %x}", got.Status, got.RawTx, raw)
+	}
+
+	cleared := recordToStatus(&aero.Record{Bins: aero.BinMap{"status": "REJECTED"}}, "txid")
+	if len(cleared.RawTx) != 0 {
+		t.Fatalf("absent raw_tx bin decoded as %x", cleared.RawTx)
+	}
+}

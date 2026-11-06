@@ -3502,6 +3502,14 @@ func recordToStatus(rec *aero.Record, txid string) *models.TransactionStatus {
 			status.MerklePath = b
 		}
 	}
+	// raw_tx is what the propagation reaper rebroadcasts from; it skips any
+	// row IterateStatusesSince returns without it, so a stale RECEIVED row
+	// would never recover on this backend.
+	if v, ok := rec.Bins["raw_tx"]; ok {
+		if b, ok := v.([]byte); ok && len(b) > 0 {
+			status.RawTx = b
+		}
+	}
 	if v, ok := rec.Bins["competing_txs"]; ok {
 		switch ct := v.(type) {
 		case []byte:

@@ -18,11 +18,13 @@ type RawTxBackend interface {
 	ClearRetryState(ctx context.Context, txid string, finalStatus models.Status, extraInfo string) error
 	LookupRawTxs(ctx context.Context, txids []string) (map[string]store.RawTxRow, error)
 	SetRawTx(ctx context.Context, txid string, rawTx []byte) error
+	IterateStatusesSince(ctx context.Context, since time.Time, fn func(*models.TransactionStatus) error) error
 }
 
 // RunRawTxSuite asserts the contract txid-only propagation messages rely on
 // (#329): the raw tx intake inserts comes back from LookupRawTxs with the
-// row's current status; ClearRetryState drops it; SetRawTx puts it back
+// row's current status and from IterateStatusesSince, the scan the stale-row
+// reaper rebroadcasts from; ClearRetryState drops it; SetRawTx puts it back
 // without touching the status and never creates a row; unknown txids are
 // absent.
 func RunRawTxSuite(t *testing.T, newBackend func(t *testing.T) RawTxBackend) {
@@ -46,6 +48,25 @@ func RunRawTxSuite(t *testing.T, newBackend func(t *testing.T) RawTxBackend) {
 	}
 	if _, ok := got[unknown]; ok {
 		t.Errorf("unknown txid returned: %+v", got[unknown])
+	}
+
+	// The reaper skips rows the scan returns without a body, so a stale
+	// RECEIVED row only recovers if IterateStatusesSince decodes raw_tx.
+	errFound := errors.New("found")
+	var scanned *models.TransactionStatus
+	if ierr := b.IterateStatusesSince(ctx, time.Now().Add(-time.Hour), func(st *models.TransactionStatus) error {
+		if st.TxID != txid {
+			return nil
+		}
+		scanned = st
+		return errFound
+	}); ierr != nil && !errors.Is(ierr, errFound) {
+		t.Fatalf("iterate statuses: %v", ierr)
+	}
+	if scanned == nil {
+		t.Errorf("IterateStatusesSince did not return %s", txid)
+	} else if !bytes.Equal(scanned.RawTx, raw) {
+		t.Errorf("IterateStatusesSince raw_tx = %x, want %x", scanned.RawTx, raw)
 	}
 
 	if cerr := b.ClearRetryState(ctx, txid, models.StatusRejected, "test"); cerr != nil {
