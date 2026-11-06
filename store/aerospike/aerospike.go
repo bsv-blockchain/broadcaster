@@ -580,7 +580,7 @@ loop:
 // IterateStatusesSince streams scan results to fn one record at a time. The
 // Aerospike client already produces records over a channel — we just hand
 // them off without buffering, so peak memory is O(1) plus whatever fn keeps.
-func (s *Store) IterateStatusesSince(ctx context.Context, _ time.Time, fn func(*models.TransactionStatus) error) error {
+func (s *Store) IterateStatusesSince(ctx context.Context, since time.Time, fn func(*models.TransactionStatus) error) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -604,8 +604,13 @@ func (s *Store) IterateStatusesSince(ctx context.Context, _ time.Time, fn func(*
 			if rec.Err != nil {
 				return rec.Err
 			}
+			// The scan is the whole set, so honor since here: callers
+			// filter on the window the store contract promises.
+			if ms := getInt64(rec.Record, "timestamp"); ms > 0 && time.UnixMilli(ms).Before(since) {
+				continue
+			}
 			txid := getString(rec.Record, "txid")
-			if err := fn(scanRecordToStatus(rec.Record, txid)); err != nil {
+			if err := fn(recordToStatus(rec.Record, txid)); err != nil {
 				return err
 			}
 		}
@@ -617,8 +622,8 @@ func (s *Store) IterateStatusesSince(ctx context.Context, _ time.Time, fn func(*
 // use) projecting only the three bins hydration reads.
 //
 // This is the largest of the three backend wins: IterateStatusesSince above is
-// a full-namespace scan that ignores `since` entirely and transfers whole
-// records, so hydration used to pull every row in the set — raw_tx included —
+// a full-namespace scan that filters `since` only client-side and transfers
+// whole records, so hydration used to pull every row in the set — raw_tx included —
 // across the wire on every api-server boot (issue #276).
 //
 // The MINED height cutoff is applied client-side via scan.Keep: Aerospike's
@@ -1150,6 +1155,9 @@ func minedWrite(rec *aero.Record, txid, blockHash string, blockHeight uint64, no
 		return nil, nil, false
 	}
 	prev = recordToStatus(rec, txid)
+	// prevs accumulate across a whole block in SetMinedByTxIDs; no caller
+	// reads their body, so drop it (Postgres' prev CTE never selects it).
+	prev.RawTx = nil
 	ops = []*aero.Operation{
 		aero.PutOp(aero.NewBin("status", string(models.StatusMined))),
 		aero.PutOp(aero.NewBin("block_hash", blockHash)),
@@ -3470,19 +3478,6 @@ loop:
 
 // --- Helpers ---
 
-// scanRecordToStatus is recordToStatus plus raw_tx, for IterateStatusesSince:
-// the propagation reaper rebroadcasts from those bytes and skips any row
-// without them, so a stale RECEIVED row would never recover on this backend.
-// The other reads leave raw_tx out, as Postgres' prev CTE does: SetMinedByTxIDs
-// would otherwise hold every mined body of a block in its prevs.
-func scanRecordToStatus(rec *aero.Record, txid string) *models.TransactionStatus {
-	status := recordToStatus(rec, txid)
-	if b, ok := rec.Bins["raw_tx"].([]byte); ok && len(b) > 0 {
-		status.RawTx = b
-	}
-	return status
-}
-
 func recordToStatus(rec *aero.Record, txid string) *models.TransactionStatus {
 	status := &models.TransactionStatus{TxID: txid}
 	if v, ok := rec.Bins["status"]; ok {
@@ -3514,6 +3509,12 @@ func recordToStatus(rec *aero.Record, txid string) *models.TransactionStatus {
 		if b, ok := v.([]byte); ok {
 			status.MerklePath = b
 		}
+	}
+	// raw_tx, as the other backends' reads return it: the propagation reaper
+	// rebroadcasts from it off IterateStatusesSince, and rejectedAncestor
+	// climbs to a grandparent through GetStatus's copy.
+	if b, ok := rec.Bins["raw_tx"].([]byte); ok && len(b) > 0 {
+		status.RawTx = b
 	}
 	if v, ok := rec.Bins["competing_txs"]; ok {
 		switch ct := v.(type) {

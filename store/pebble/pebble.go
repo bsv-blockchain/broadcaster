@@ -2843,15 +2843,34 @@ func (s *Store) LookupRawTxs(ctx context.Context, txids []string) (map[string]st
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		row, err := s.readStoredStatus(txid)
+		row, err := s.readStoredRawTx(txid)
 		if err != nil {
 			return nil, err
 		}
 		if row != nil {
-			out[txid] = store.RawTxRow{Status: models.Status(row.Status), RawTx: row.RawTx}
+			out[txid] = *row
 		}
 	}
 	return out, nil
+}
+
+// readStoredRawTx is readStoredStatus for LookupRawTxs: a row that does not
+// unmarshal reads as absent rather than failing the batch (see
+// store.Store.LookupRawTxs). A read error is still returned.
+func (s *Store) readStoredRawTx(txid string) (*store.RawTxRow, error) {
+	v, closer, err := s.db.Get(txKey(txid))
+	if errors.Is(err, pebbledb.ErrNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get tx %s: %w", txid, err)
+	}
+	defer func() { _ = closer.Close() }()
+	var st storedStatus
+	if json.Unmarshal(v, &st) != nil {
+		return nil, nil
+	}
+	return &store.RawTxRow{Status: models.Status(st.Status), RawTx: st.RawTx}, nil
 }
 
 // SetRawTx implements store.Store. raw_tx is not indexed, so only the row

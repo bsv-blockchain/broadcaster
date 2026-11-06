@@ -165,6 +165,60 @@ func TestSubmit_RepublishWithRawTx_SkipsRestore(t *testing.T) {
 	}
 }
 
+// TestSubmit_RejectedResubmit_RestoresEvenWithStoredRawTx: only
+// ClearRetryState empties raw_tx, so a network-REJECTED row still holds the
+// rejected bytes. A resubmit (say, with corrected EF metadata under the same
+// txid) must republish the new ones.
+func TestSubmit_RejectedResubmit_RestoresEvenWithStoredRawTx(t *testing.T) {
+	rawA, rawB, txidA, txidB := twoDistinctTxs(t)
+	for _, tc := range []struct {
+		path string
+		body []byte
+		want map[string][]byte
+	}{
+		{"/tx", rawA, map[string][]byte{txidA: rawA}},
+		{"/txs", append(append([]byte(nil), rawA...), rawB...), map[string][]byte{txidA: rawA, txidB: rawB}},
+	} {
+		t.Run(tc.path, func(t *testing.T) {
+			ms := &mockStore{
+				getOrInsertFn: func(in *models.TransactionStatus) (*models.TransactionStatus, bool, error) {
+					return &models.TransactionStatus{TxID: in.TxID, Status: models.StatusRejected, RawTx: []byte{0xba, 0xd0}}, false, nil
+				},
+			}
+			_, _, router := newReceivedServer(ms)
+			if w := submit(t, router, tc.path, tc.body); w.Code != http.StatusAccepted && w.Code != http.StatusOK {
+				t.Fatalf("status = %d: %s", w.Code, w.Body.String())
+			}
+			for txid, raw := range tc.want {
+				if !bytes.Equal(ms.setRawTxCalls[txid], raw) {
+					t.Errorf("SetRawTx(%s) = %x, want the resubmitted bytes", txid, ms.setRawTxCalls[txid])
+				}
+			}
+		})
+	}
+}
+
+// TestSubmitTx_TrailingBytes_StoresOnlyTheTx: the stored bytes are later
+// concatenated into a Teranode /txs stream, so anything after the parsed tx
+// must not reach the row.
+func TestSubmitTx_TrailingBytes_StoresOnlyTheTx(t *testing.T) {
+	rawA, _, _, _ := twoDistinctTxs(t)
+	var stored []byte
+	ms := &mockStore{
+		getOrInsertFn: func(in *models.TransactionStatus) (*models.TransactionStatus, bool, error) {
+			stored = append([]byte(nil), in.RawTx...)
+			return in, true, nil
+		},
+	}
+	_, _, router := newReceivedServer(ms)
+	if w := submit(t, router, "/tx", append(append([]byte(nil), rawA...), '\n')); w.Code != http.StatusAccepted && w.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", w.Code, w.Body.String())
+	}
+	if !bytes.Equal(stored, rawA) {
+		t.Errorf("stored %d bytes, want the %d-byte tx without the trailing newline", len(stored), len(rawA))
+	}
+}
+
 // TestSubmit_RestoreRawTxFailure_Sheds503: without the bytes back on the row
 // the republished message could not be hydrated, so the request fails
 // retryably and nothing is published.

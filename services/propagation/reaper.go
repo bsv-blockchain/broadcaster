@@ -235,10 +235,10 @@ func (p *Propagator) reapOnce(ctx context.Context) {
 	// scheduling existed) so they can be booked into the queue after the walk.
 	var adopt []propagationMsg
 	err := p.store.IterateStatusesSince(ctx, since, func(st *models.TransactionStatus) error {
-		// Not every backend honors since (Aerospike scans the whole set),
-		// so bound the window here too. Otherwise a long-dead row is
-		// rebroadcast every tick: its status never advances, so its
-		// timestamp never moves out of the stale deadlines.
+		// Bound the window here too, as replay does: a backend that
+		// over-returns (Aerospike's scan once ignored since) would have a
+		// long-dead row rebroadcast every tick, since its status never
+		// advances and its timestamp never leaves the stale deadlines.
 		if !st.Timestamp.IsZero() && st.Timestamp.Before(since) {
 			return nil
 		}

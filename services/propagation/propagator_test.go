@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -156,13 +155,11 @@ type mockStore struct {
 	// rows shaped like the real backends'. See setStatusRow.
 	rawByTxID map[string][]byte
 	// lookupRawErr / lookupRawCalls drive and count LookupRawTxs.
-	// lookupRawPoison fails any call whose txids include it.
 	// ignoreSince makes IterateStatusesSince return rows outside the
 	// window, as Aerospike's full-set scan does.
-	ignoreSince     bool
-	lookupRawErr    error
-	lookupRawCalls  int
-	lookupRawPoison string
+	ignoreSince    bool
+	lookupRawErr   error
+	lookupRawCalls int
 	// retrySeq records the order rows entered the durable retry queue, so
 	// GetReadyRetries can break next_retry_at ties the way an index scan does.
 	retrySeq     map[string]int
@@ -213,9 +210,6 @@ func (m *mockStore) LookupRawTxs(_ context.Context, txids []string) (map[string]
 	m.lookupRawCalls++
 	if m.lookupRawErr != nil {
 		return nil, m.lookupRawErr
-	}
-	if m.lookupRawPoison != "" && slices.Contains(txids, m.lookupRawPoison) {
-		return nil, errors.New("poison row")
 	}
 	out := make(map[string]store.RawTxRow, len(txids))
 	for _, txid := range txids {

@@ -69,6 +69,21 @@ func RunRawTxSuite(t *testing.T, newBackend func(t *testing.T) RawTxBackend) {
 		t.Errorf("IterateStatusesSince raw_tx = %x, want %x", scanned.RawTx, raw)
 	}
 
+	// A row older than since stays out of the scan on every backend: the
+	// reaper would otherwise rebroadcast long-dead rows every tick.
+	old := fmt.Sprintf("%048x%016x", base, 0xc3)
+	if _, _, oerr := b.GetOrInsertStatus(ctx, &models.TransactionStatus{TxID: old, Status: models.StatusReceived, RawTx: raw, Timestamp: time.Now().Add(-48 * time.Hour)}); oerr != nil {
+		t.Fatalf("insert old row: %v", oerr)
+	}
+	if ierr := b.IterateStatusesSince(ctx, time.Now().Add(-time.Hour), func(st *models.TransactionStatus) error {
+		if st.TxID == old {
+			t.Errorf("IterateStatusesSince returned a row older than since: %s at %s", old, st.Timestamp)
+		}
+		return nil
+	}); ierr != nil {
+		t.Fatalf("iterate statuses: %v", ierr)
+	}
+
 	if cerr := b.ClearRetryState(ctx, txid, models.StatusRejected, "test"); cerr != nil {
 		t.Fatalf("clear retry state: %v", cerr)
 	}

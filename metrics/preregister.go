@@ -113,7 +113,7 @@ func PreRegisterPropagationRetryOutcomes() {
 	for _, outcome := range []string{"requeued", "reaper_retry", "rejected_ancestor"} {
 		PropagationMissingParentTotal.WithLabelValues(outcome)
 	}
-	for _, reason := range []string{"row_missing", "terminal", "raw_tx_missing", "lookup_failed", "malformed"} {
+	for _, reason := range []string{"row_missing", "terminal", "raw_tx_missing", "malformed"} {
 		PropagationHydrateDroppedTotal.WithLabelValues(reason)
 	}
 	for _, outcome := range []string{"scheduled", "exhausted"} {

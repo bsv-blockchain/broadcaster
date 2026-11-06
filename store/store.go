@@ -329,7 +329,10 @@ type Store interface {
 	// current status and its stored raw_tx (nil once ClearRetryState has
 	// dropped it). The propagation consumer hydrates txid-only Kafka messages
 	// with it (#329): the message carries no tx bytes, so its size never
-	// tracks the tx-size policy. Unknown txids are absent from the result.
+	// tracks the tx-size policy. Unknown txids are absent from the result,
+	// and so is a row that cannot be decoded: one corrupt row must not fail
+	// the batch, or the consumer would retry the same claim batch forever.
+	// err is reserved for the store itself failing.
 	LookupRawTxs(ctx context.Context, txids []string) (map[string]RawTxRow, error)
 
 	// SetRawTx overwrites the stored raw_tx of an existing row without

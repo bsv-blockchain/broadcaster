@@ -59,26 +59,38 @@ func TestStatusFromUpdateBinsIgnoresUnrelatedBins(t *testing.T) {
 }
 
 // The stale-row reaper reads rows through IterateStatusesSince, which decodes
-// with scanRecordToStatus, and skips any row without a raw tx — so dropping
-// the bin there leaves a stuck RECEIVED row unrecoverable on Aerospike. The
-// other reads keep the body out of memory.
-func TestScanRecordToStatusDecodesRawTx(t *testing.T) {
+// with recordToStatus, and skips any row without a raw tx — so dropping the
+// bin here leaves a stuck RECEIVED row unrecoverable on Aerospike.
+func TestRecordToStatusDecodesRawTx(t *testing.T) {
 	raw := []byte{0x01, 0x00, 0x00, 0x00, 0xde, 0xad}
 	rec := &aero.Record{Bins: aero.BinMap{
 		"status":    "RECEIVED",
 		"timestamp": 1_700_000_000_000,
 		"raw_tx":    raw,
 	}}
-	got := scanRecordToStatus(rec, "txid")
+	got := recordToStatus(rec, "txid")
 	if got.Status != models.StatusReceived || string(got.RawTx) != string(raw) {
 		t.Fatalf("decoded status = {%s %x}, want {RECEIVED %x}", got.Status, got.RawTx, raw)
 	}
-	if plain := recordToStatus(rec, "txid"); len(plain.RawTx) != 0 {
-		t.Fatalf("recordToStatus decoded raw_tx %x; only the scan path should", plain.RawTx)
-	}
 
-	cleared := scanRecordToStatus(&aero.Record{Bins: aero.BinMap{"status": "REJECTED"}}, "txid")
+	cleared := recordToStatus(&aero.Record{Bins: aero.BinMap{"status": "REJECTED"}}, "txid")
 	if len(cleared.RawTx) != 0 {
 		t.Fatalf("absent raw_tx bin decoded as %x", cleared.RawTx)
+	}
+}
+
+// minedWrite's prev feeds SetMinedByTxIDs' per-block prevs; it must not
+// carry the tx body.
+func TestMinedWritePrevOmitsRawTx(t *testing.T) {
+	rec := &aero.Record{Bins: aero.BinMap{
+		"status": "SEEN_ON_NETWORK",
+		"raw_tx": []byte{0x01, 0x02},
+	}}
+	_, prev, ok := minedWrite(rec, "txid", "hash", 10, time.Now())
+	if !ok || prev == nil {
+		t.Fatalf("minedWrite ok=%v prev=%v", ok, prev)
+	}
+	if len(prev.RawTx) != 0 {
+		t.Fatalf("prev carries raw_tx %x", prev.RawTx)
 	}
 }
