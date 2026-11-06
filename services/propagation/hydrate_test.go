@@ -50,6 +50,24 @@ func TestHydrate_TxidOnly_LoadsRawTxAndParents(t *testing.T) {
 	}
 }
 
+// TestHydrate_TrailingBytes_StillDerivesParents: /tx stores the request
+// body and parses it as a stream, so bytes after the tx are accepted at
+// intake; the parents must still come out of them.
+func TestHydrate_TrailingBytes_StillDerivesParents(t *testing.T) {
+	ms := newMockStore()
+	txid, raw := spendingTx(t, parentTxID, 0, 1)
+	ms.setStatusRow(txid, models.StatusReceived, append(raw, '\n'))
+	p := newPropagator("", "http://unused", ms)
+
+	msgs := []propagationMsg{{TXID: txid}}
+	if _, err := p.hydrate(t.Context(), msgs, nil); err != nil {
+		t.Fatalf("hydrate: %v", err)
+	}
+	if !slices.Equal(msgs[0].InputTXIDs, []string{parentTxID}) {
+		t.Errorf("InputTXIDs = %v, want [%s]", msgs[0].InputTXIDs, parentTxID)
+	}
+}
+
 // TestHydrate_DropReasons pins each way a message is unpropagatable, and
 // that each is counted under its own label.
 func TestHydrate_DropReasons(t *testing.T) {
@@ -124,6 +142,54 @@ func TestHydrate_StoreError_DropsNothing(t *testing.T) {
 	drops, err := p.hydrate(t.Context(), []propagationMsg{{TXID: "x"}}, nil)
 	if err == nil {
 		t.Fatalf("hydrate err = nil, drops = %v", drops)
+	}
+}
+
+// TestHydrateWithRetry_PoisonRow_DropsOnlyThatMessage: a row the store
+// fails on every time must not stall the batch behind it forever. After the
+// batch read keeps failing each message is read alone; the poison one drops
+// as lookup_failed and the rest are hydrated.
+func TestHydrateWithRetry_PoisonRow_DropsOnlyThatMessage(t *testing.T) {
+	ms := newMockStore()
+	good, raw := spendingTx(t, parentTxID, 0, 1)
+	ms.setStatusRow(good, models.StatusReceived, raw)
+	ms.setStatusRow("poison", models.StatusReceived, []byte{0x01})
+	ms.lookupRawPoison = "poison"
+	p := newPropagator("", "http://unused", ms)
+
+	before := testutil.ToFloat64(metrics.PropagationHydrateDroppedTotal.WithLabelValues(dropLookupFailed))
+	msgs := []propagationMsg{{TXID: "poison"}, {TXID: good}}
+	drops, ok := p.hydrateWithRetry(t.Context(), msgs, make([]hydratedMsg, len(msgs)))
+	if !ok {
+		t.Fatal("hydrateWithRetry gave up")
+	}
+	if drops[0] != dropLookupFailed || drops[1] != "" {
+		t.Fatalf("drops = %q, want [lookup_failed \"\"]", drops)
+	}
+	if !bytes.Equal(msgs[1].RawTx, raw) {
+		t.Error("the readable message was not hydrated")
+	}
+	if got := testutil.ToFloat64(metrics.PropagationHydrateDroppedTotal.WithLabelValues(dropLookupFailed)) - before; got != 1 {
+		t.Errorf("lookup_failed drops counted = %v, want 1", got)
+	}
+}
+
+// TestHydrateEach_AllFail_IsAnOutage: when no single read succeeds the store
+// is down, so nothing is dropped and the caller keeps retrying.
+func TestHydrateEach_AllFail_IsAnOutage(t *testing.T) {
+	ms := newMockStore()
+	ms.setLookupRawErr(errors.New("store down"))
+	p := newPropagator("", "http://unused", ms)
+
+	msgs := make([]propagationMsg, 2*hydrateOutageProbe)
+	for i := range msgs {
+		msgs[i].TXID = strings.Repeat("0", 63) + string(rune('a'+i%6))
+	}
+	if drops, ok := p.hydrateEach(t.Context(), msgs, make([]bool, len(msgs))); ok {
+		t.Fatalf("hydrateEach ok during an outage, drops = %q", drops)
+	}
+	if n := ms.lookupRawCallCount(); n != hydrateOutageProbe {
+		t.Errorf("single reads during an outage = %d, want %d (probe then stop)", n, hydrateOutageProbe)
 	}
 }
 

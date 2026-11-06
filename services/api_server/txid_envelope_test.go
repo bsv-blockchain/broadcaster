@@ -133,6 +133,38 @@ func TestSubmit_RepublishRestoresRawTx(t *testing.T) {
 	}
 }
 
+// TestSubmit_RepublishWithRawTx_SkipsRestore: a stranded RECEIVED row still
+// carries its raw_tx, so intake republishes without rewriting it.
+func TestSubmit_RepublishWithRawTx_SkipsRestore(t *testing.T) {
+	rawA, rawB, _, _ := twoDistinctTxs(t)
+	for _, tc := range []struct {
+		path string
+		body []byte
+		want int
+	}{
+		{"/tx", rawA, 1},
+		{"/txs", append(append([]byte(nil), rawA...), rawB...), 2},
+	} {
+		t.Run(tc.path, func(t *testing.T) {
+			ms := &mockStore{
+				getOrInsertFn: func(in *models.TransactionStatus) (*models.TransactionStatus, bool, error) {
+					return &models.TransactionStatus{TxID: in.TxID, Status: models.StatusReceived, RawTx: in.RawTx}, false, nil
+				},
+			}
+			_, broker, router := newReceivedServer(ms)
+			if w := submit(t, router, tc.path, tc.body); w.Code != http.StatusAccepted && w.Code != http.StatusOK {
+				t.Fatalf("status = %d: %s", w.Code, w.Body.String())
+			}
+			if len(ms.setRawTxCalls) != 0 {
+				t.Errorf("SetRawTx called for rows that still have raw_tx: %v", ms.setRawTxCalls)
+			}
+			if n := len(publishedEnvelopes(t, broker)); n != tc.want {
+				t.Errorf("republished %d envelopes, want %d", n, tc.want)
+			}
+		})
+	}
+}
+
 // TestSubmit_RestoreRawTxFailure_Sheds503: without the bytes back on the row
 // the republished message could not be hydrated, so the request fails
 // retryably and nothing is published.

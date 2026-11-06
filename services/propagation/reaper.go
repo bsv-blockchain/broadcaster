@@ -235,6 +235,13 @@ func (p *Propagator) reapOnce(ctx context.Context) {
 	// scheduling existed) so they can be booked into the queue after the walk.
 	var adopt []propagationMsg
 	err := p.store.IterateStatusesSince(ctx, since, func(st *models.TransactionStatus) error {
+		// Not every backend honors since (Aerospike scans the whole set),
+		// so bound the window here too. Otherwise a long-dead row is
+		// rebroadcast every tick: its status never advances, so its
+		// timestamp never moves out of the stale deadlines.
+		if !st.Timestamp.IsZero() && st.Timestamp.Before(since) {
+			return nil
+		}
 		// Best-effort per-callback attribution sample (bounded by
 		// stuckAttributionCap). The census COUNTS come from
 		// CensusStatusesSince below, not from this walk.

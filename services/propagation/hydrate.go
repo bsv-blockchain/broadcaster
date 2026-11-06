@@ -26,9 +26,17 @@ const hydrateBatchMax = 500
 // succeeds or the claim ends: skipping it would strand txs at RECEIVED
 // until the reaper's staleReceivedAge, and the claim's commit watermark
 // cannot pass an unhydrated offset anyway.
+//
+// After hydrateIsolateAfter failed batch reads each message is read on its
+// own, so one row the store keeps failing on drops alone instead of
+// stalling the claim. hydrateOutageProbe consecutive single reads failing
+// with none succeeding reads as the store being down: back to retrying the
+// batch, without paying one read per message on every attempt.
 const (
 	hydrateRetryInitial = 100 * time.Millisecond
 	hydrateRetryMax     = 5 * time.Second
+	hydrateIsolateAfter = 3
+	hydrateOutageProbe  = 8
 )
 
 // Drop reasons, also the PropagationHydrateDroppedTotal labels.
@@ -37,6 +45,7 @@ const (
 	dropRowMissing   = "row_missing"
 	dropTerminal     = "terminal"
 	dropRawTxMissing = "raw_tx_missing"
+	dropLookupFailed = "lookup_failed"
 )
 
 // hydratedMsg is one claim message after hydration. drop is non-empty when
@@ -122,7 +131,7 @@ func (p *Propagator) hydrateWithRetry(ctx context.Context, msgs []propagationMsg
 		skip[i] = hs[i].drop != ""
 	}
 	backoff := hydrateRetryInitial
-	for {
+	for attempt := 1; ; attempt++ {
 		drops, err := p.hydrate(ctx, msgs, skip)
 		if err == nil {
 			return drops, true
@@ -131,6 +140,14 @@ func (p *Propagator) hydrateWithRetry(ctx context.Context, msgs []propagationMsg
 			return nil, false
 		}
 		metrics.PropagationHydrateErrorsTotal.Inc()
+		if attempt >= hydrateIsolateAfter {
+			if drops, ok := p.hydrateEach(ctx, msgs, skip); ok {
+				return drops, true
+			}
+			if ctx.Err() != nil {
+				return nil, false
+			}
+		}
 		p.logger.Warn("loading raw txs for propagation messages; retrying",
 			zap.Int("count", len(msgs)), zap.Duration("backoff", backoff), zap.Error(err))
 		select {
@@ -140,6 +157,45 @@ func (p *Propagator) hydrateWithRetry(ctx context.Context, msgs []propagationMsg
 		}
 		backoff = min(backoff*2, hydrateRetryMax)
 	}
+}
+
+// hydrateEach reads each message's row on its own once the batch read keeps
+// failing. A message whose read fails while others succeed is dropped as
+// lookup_failed: its row stays RECEIVED with raw_tx, so the reaper
+// rebroadcasts it after staleReceivedAge. ok is false when no single read
+// succeeded, which looks like the store being down; the caller keeps
+// retrying. A lone message the store always fails on still holds the claim,
+// since it cannot be told apart from an outage.
+func (p *Propagator) hydrateEach(ctx context.Context, msgs []propagationMsg, skip []bool) (drops []string, ok bool) {
+	drops = make([]string, len(msgs))
+	succeeded, failed := 0, 0
+	for i := range msgs {
+		if skip[i] {
+			continue
+		}
+		if ctx.Err() != nil || (succeeded == 0 && failed >= hydrateOutageProbe) {
+			return nil, false
+		}
+		d, err := p.hydrate(ctx, msgs[i:i+1], nil)
+		if err != nil {
+			drops[i] = dropLookupFailed
+			failed++
+			continue
+		}
+		drops[i] = d[0]
+		succeeded++
+	}
+	if succeeded == 0 {
+		return nil, false
+	}
+	for i := range msgs {
+		if drops[i] == dropLookupFailed {
+			metrics.PropagationHydrateDroppedTotal.WithLabelValues(dropLookupFailed).Inc()
+			p.logger.Error("propagation message's store row cannot be read; dropping for the reaper",
+				logfields.TxID(msgs[i].TXID))
+		}
+	}
+	return drops, true
 }
 
 // hydrate fills RawTx and InputTXIDs on every txid-only message in msgs from

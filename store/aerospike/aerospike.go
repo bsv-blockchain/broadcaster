@@ -605,7 +605,7 @@ func (s *Store) IterateStatusesSince(ctx context.Context, _ time.Time, fn func(*
 				return rec.Err
 			}
 			txid := getString(rec.Record, "txid")
-			if err := fn(recordToStatus(rec.Record, txid)); err != nil {
+			if err := fn(scanRecordToStatus(rec.Record, txid)); err != nil {
 				return err
 			}
 		}
@@ -3470,6 +3470,19 @@ loop:
 
 // --- Helpers ---
 
+// scanRecordToStatus is recordToStatus plus raw_tx, for IterateStatusesSince:
+// the propagation reaper rebroadcasts from those bytes and skips any row
+// without them, so a stale RECEIVED row would never recover on this backend.
+// The other reads leave raw_tx out, as Postgres' prev CTE does: SetMinedByTxIDs
+// would otherwise hold every mined body of a block in its prevs.
+func scanRecordToStatus(rec *aero.Record, txid string) *models.TransactionStatus {
+	status := recordToStatus(rec, txid)
+	if b, ok := rec.Bins["raw_tx"].([]byte); ok && len(b) > 0 {
+		status.RawTx = b
+	}
+	return status
+}
+
 func recordToStatus(rec *aero.Record, txid string) *models.TransactionStatus {
 	status := &models.TransactionStatus{TxID: txid}
 	if v, ok := rec.Bins["status"]; ok {
@@ -3500,14 +3513,6 @@ func recordToStatus(rec *aero.Record, txid string) *models.TransactionStatus {
 	if v, ok := rec.Bins["merkle_path"]; ok {
 		if b, ok := v.([]byte); ok {
 			status.MerklePath = b
-		}
-	}
-	// raw_tx is what the propagation reaper rebroadcasts from; it skips any
-	// row IterateStatusesSince returns without it, so a stale RECEIVED row
-	// would never recover on this backend.
-	if v, ok := rec.Bins["raw_tx"]; ok {
-		if b, ok := v.([]byte); ok && len(b) > 0 {
-			status.RawTx = b
 		}
 	}
 	if v, ok := rec.Bins["competing_txs"]; ok {

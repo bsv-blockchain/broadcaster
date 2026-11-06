@@ -999,26 +999,37 @@ func (s *Store) LookupRawTxs(ctx context.Context, txids []string) (map[string]st
 	if len(txids) == 0 {
 		return nil, nil
 	}
-	octx, cancel := s.opCtx(ctx)
+	out := make(map[string]store.RawTxRow, len(txids))
+	// Chunked under the query timeout, not one op-timeout read: a hydrate
+	// batch can carry hundreds of full tx bodies.
+	for _, chunk := range chunks(dedupe(txids), s.batchSize) {
+		if err := s.lookupRawTxChunk(ctx, chunk, out); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+func (s *Store) lookupRawTxChunk(ctx context.Context, txids []string, out map[string]store.RawTxRow) error {
+	qctx, cancel := s.queryCtx(ctx)
 	defer cancel()
-	cur, err := s.tx.Find(octx, doc(kv(fID, doc(kv(opIn, txids)))),
+	cur, err := s.tx.Find(qctx, doc(kv(fID, doc(kv(opIn, txids)))),
 		options.Find().SetProjection(doc(kv(fStatus, 1), kv(fRawTx, 1))))
 	if err != nil {
-		return nil, fmt.Errorf("lookup raw txs: %w", err)
+		return fmt.Errorf("lookup raw txs: %w", err)
 	}
-	defer func() { _ = cur.Close(octx) }()
-	out := make(map[string]store.RawTxRow, len(txids))
-	for cur.Next(octx) {
+	defer func() { _ = cur.Close(qctx) }()
+	for cur.Next(qctx) {
 		var d txDoc
 		if err := cur.Decode(&d); err != nil {
-			return nil, fmt.Errorf("lookup raw txs: decode: %w", err)
+			return fmt.Errorf("lookup raw txs: decode: %w", err)
 		}
 		out[d.TxID] = store.RawTxRow{Status: models.Status(d.Status), RawTx: d.RawTx}
 	}
 	if err := cur.Err(); err != nil {
-		return nil, fmt.Errorf("lookup raw txs: %w", err)
+		return fmt.Errorf("lookup raw txs: %w", err)
 	}
-	return out, nil
+	return nil
 }
 
 // SetRawTx implements store.Store.

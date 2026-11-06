@@ -35,9 +35,9 @@ import (
 )
 
 // collectInputTXIDs returns the parent txids referenced by every input of
-// tx. Empty for coinbase. Used to populate the propagation envelope's
-// input_txids field so the dispatcher can detect parent-child
-// relationships without re-parsing the raw bytes downstream.
+// tx. Empty for coinbase. Intake keys a submission like its in-flight
+// parent's family from these; the propagation envelope no longer carries
+// them (#329), so the consumer re-derives parents from the stored bytes.
 func collectInputTXIDs(tx *sdkTx.Transaction) []string {
 	if tx == nil || len(tx.Inputs) == 0 {
 		return nil
@@ -996,8 +996,9 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 	// does it publish RECEIVED (see below). Without a store there is no CAS
 	// to coordinate with, so every submission counts as the first.
 	inserted := s.store == nil
-	// republish: the CAS found a row this request must publish again.
-	republish := false
+	// restore: the CAS found a row this request must publish again, and it
+	// has no raw_tx to hydrate from (see restoreRawTxs).
+	restore := false
 	receivedAt := time.Now()
 	if s.store != nil {
 		row := &models.TransactionStatus{
@@ -1024,7 +1025,7 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 			respondStoreUnavailable(c)
 			return
 		case !inserted && shouldRepublishExisting(existing.Status):
-			republish = true
+			restore = len(existing.RawTx) == 0
 			// REJECTED resubmit: re-run broadcast. RECEIVED resubmit: the
 			// first attempt wrote the row then failed to Kafka-publish
 			// (503/500). Fall through so this retry actually queues.
@@ -1059,8 +1060,9 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 
 	// A row this request did not create may have lost its raw_tx
 	// (ClearRetryState drops it on the way to REJECTED), and the txid-only
-	// message needs it back before publishing.
-	if republish {
+	// message needs it back before publishing. A stranded RECEIVED row
+	// still has it; rewriting up to 32 MiB for nothing is skipped.
+	if restore {
 		if err := s.restoreRawTxs(c.Request.Context(), map[string][]byte{txid: rawTx}); err != nil {
 			respondStoreUnavailable(c)
 			return
@@ -1479,6 +1481,8 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 	// that selected them; their stored keys win over this request's choice
 	// (adoptStoredFamilyKeys).
 	republished := make(map[string]models.Status)
+	// restore reports, per republished txid, whether its row has no raw_tx.
+	restore := make(map[string]bool)
 	// receivedTxIDs is the subset of toPublish whose row this request's CAS
 	// inserted: only the first attempt publishes RECEIVED, since any other
 	// attempt can run after an earlier attempt's verdict was published (see
@@ -1519,6 +1523,7 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 				}
 				toPublish = append(toPublish, p)
 				republished[p.txid] = existing.Status
+				restore[p.txid] = len(existing.RawTx) == 0
 			case !inserted:
 				duplicates++
 				// Idempotent re-submit at a non-REJECTED status: register
@@ -1549,11 +1554,12 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 			receivedTxIDs = append(receivedTxIDs, p.txid)
 		}
 	}
-	// Restore raw_tx on the republished rows, as handleSubmitTransaction does.
-	if len(republished) > 0 {
-		raws := make(map[string][]byte, len(republished))
+	// Restore raw_tx on the republished rows that lost it, as
+	// handleSubmitTransaction does.
+	if len(restore) > 0 {
+		raws := make(map[string][]byte, len(restore))
 		for _, p := range toPublish {
-			if _, ok := republished[p.txid]; ok {
+			if restore[p.txid] {
 				raws[p.txid] = p.raw
 			}
 		}

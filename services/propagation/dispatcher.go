@@ -373,10 +373,10 @@ func handleAdmit(
 	//
 	// Scope, since #295: inFlight is per-claim, so this suppresses
 	// duplicates only on the SAME partition. It is no longer a process-wide
-	// guard and never was a fleet-wide one. Two intake branches can still
-	// publish a txid that is in flight elsewhere — the store-error branch
-	// (which publishes rather than risk dropping a genuinely new tx) and the
-	// REJECTED-resubmit branch. Family keys are computed over the whole
+	// guard and never was a fleet-wide one. Intake's republish branches —
+	// the REJECTED resubmit and the stranded-RECEIVED retry — can still
+	// publish a txid that is in flight elsewhere (a store error sheds with
+	// 503 and publishes nothing, since #329). Family keys are computed over the whole
 	// submitted batch, so batch composition no longer moves a txid between
 	// partitions, but a resubmission whose family genuinely differs still
 	// can. The consequence is a duplicate broadcast and racing terminal

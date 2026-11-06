@@ -797,12 +797,14 @@ func cascadeReason(status models.Status, ancestor string) string {
 // parentTxIDsOf returns msg's parent txids: InputTXIDs when the intake
 // envelope populated them, else parsed from the raw bytes (reaper
 // rebroadcast rows carry no InputTXIDs). Unparseable bytes yield nil —
-// the caller then just requeues/parks, which is always safe.
+// the caller then just requeues/parks, which is always safe. Parsed as a
+// stream, as intake parses it: the stored bytes are the request body, and an
+// exact-length parse would read trailing bytes after the tx as no parents.
 func parentTxIDsOf(msg propagationMsg) []string {
 	if len(msg.InputTXIDs) > 0 {
 		return msg.InputTXIDs
 	}
-	tx, err := sdkTx.NewTransactionFromBytes(msg.RawTx)
+	tx, _, err := sdkTx.NewTransactionFromStream(msg.RawTx)
 	if err != nil || tx == nil {
 		return nil
 	}
@@ -1714,7 +1716,7 @@ const outpointOwnerAmbiguous = -1
 func buildSubmittedOutpointIndex(batch []propagationMsg) map[string]int {
 	owners := make(map[string]int, len(batch))
 	for i, msg := range batch {
-		tx, err := sdkTx.NewTransactionFromBytes(msg.RawTx)
+		tx, _, err := sdkTx.NewTransactionFromStream(msg.RawTx)
 		if err != nil || tx == nil {
 			continue
 		}
