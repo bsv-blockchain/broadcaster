@@ -158,28 +158,28 @@ func familyKeysBySubmittedTxid(parsed []parsedItem) (keyByTxid map[string]string
 // propagationMessages builds the Kafka envelopes for the txs a submission
 // actually publishes, keyed by dependency family.
 //
-// input_txids drives the dispatcher's dep-aware admission — children of any
-// in-flight parent are held until the parent terminalizes — and the key is
-// what co-locates a family on one partition so that hold is possible at all.
+// The key is what co-locates a family on one partition, so the dispatcher
+// that holds a child until its in-flight parent terminalizes sees both.
 //
-// keyByTxid/inputsByTxid come from familyKeysBySubmittedTxid over the full
-// submitted batch, so every published tx is present; the txid fallback is
+// keyByTxid comes from familyKeysBySubmittedTxid over the full submitted
+// batch, so every published tx is present; the txid fallback is
 // belt-and-braces for a future caller whose publish set is not a subset.
-func propagationMessages(toPublish []parsedItem, keyByTxid map[string]string, inputsByTxid map[string][]string) []kafka.KeyValue {
+func propagationMessages(toPublish []parsedItem, keyByTxid map[string]string) []kafka.KeyValue {
 	msgs := make([]kafka.KeyValue, 0, len(toPublish))
 	for _, p := range toPublish {
 		key, ok := keyByTxid[p.txid]
 		if !ok {
 			key = p.txid
 		}
-		msgs = append(msgs, kafka.KeyValue{
-			Key: key,
-			Value: map[string]interface{}{
-				"txid":        p.txid,
-				"raw_tx":      p.raw,
-				"input_txids": inputsByTxid[p.txid],
-			},
-		})
+		msgs = append(msgs, kafka.KeyValue{Key: key, Value: propagationMessage(p.txid)})
 	}
 	return msgs
+}
+
+// propagationMessage is the TopicPropagation envelope: the txid only (#329).
+// The raw tx is on the store row intake wrote before publishing, and the
+// consumer loads it and derives the parents from it, so the message size is
+// fixed whatever the tx size or input count.
+func propagationMessage(txid string) map[string]string {
+	return map[string]string{"txid": txid}
 }

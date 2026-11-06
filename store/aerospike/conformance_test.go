@@ -137,3 +137,12 @@ func TestPartitionKey_Conformance(t *testing.T) {
 		return integrationStore(t)
 	})
 }
+
+// Propagation messages carry the txid only (#329), so the consumer loads the
+// raw tx from the row and intake restores it before republishing.
+func TestRawTx_Conformance(t *testing.T) {
+	storetest.RunRawTxSuite(t, func(t *testing.T) storetest.RawTxBackend {
+		t.Helper()
+		return integrationStore(t)
+	})
+}
