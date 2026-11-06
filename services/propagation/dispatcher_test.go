@@ -400,6 +400,7 @@ func TestRunDispatcher_ClaimRevokedMidBatch_FailsFastAndLeavesUncommitted(t *tes
 	ms := newMockStore()
 	p := newPropagator(merkleSrv.URL, teranodeSrv.URL, ms)
 
+	quiesceRequeues(t)
 	revokedBefore := testutil.ToFloat64(metrics.PropagationClaimRevokedBatchesTotal)
 	requeuesBefore := testutil.ToFloat64(metrics.PropagationPendingRequeues)
 	claimRevokedBefore := testutil.ToFloat64(metrics.PropagationMerkleRegisterFailures.WithLabelValues("claim_revoked"))
@@ -471,6 +472,7 @@ func TestProcessBatch_ClaimRevokedBeforeStart_NoSideEffects(t *testing.T) {
 	ms := newMockStore()
 	p := newPropagator(merkleSrv.URL, teranodeSrv.URL, ms)
 
+	quiesceRequeues(t)
 	revokedBefore := testutil.ToFloat64(metrics.PropagationClaimRevokedBatchesTotal)
 	requeuesBefore := testutil.ToFloat64(metrics.PropagationPendingRequeues)
 

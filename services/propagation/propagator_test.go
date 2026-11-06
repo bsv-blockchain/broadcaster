@@ -644,7 +644,7 @@ func newPropagator(merkleSrvURL, teranodeSrvURL string, st store.Store) *Propaga
 // handleAndFlush is a helper that adds a message and flushes (simulating consumer behavior)
 func handleAndFlush(t *testing.T, p *Propagator, payload []byte) error {
 	t.Helper()
-	if err := p.handleMessage(context.Background(), consumerMsg(payload)); err != nil {
+	if err := p.handleMessage(t.Context(), consumerMsg(payload)); err != nil {
 		return err
 	}
 	if err := flushSync(t, p); err != nil {
@@ -654,12 +654,32 @@ func handleAndFlush(t *testing.T, p *Propagator, payload []byte) error {
 	return nil
 }
 
+// quiesceRequeues waits out requeue goroutines earlier tests left behind
+// before a test baselines the process-global PropagationPendingRequeues
+// gauge. Each exits when its test's context ends or after requeueDelay; one
+// finishing mid-test otherwise reads as this test's goroutines going
+// negative.
+func quiesceRequeues(t *testing.T) {
+	t.Helper()
+	deadline := time.Now().Add(defaultRequeueDelay + time.Second)
+	for testutil.ToFloat64(metrics.PropagationPendingRequeues) != 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("PropagationPendingRequeues = %v after %s; a requeue goroutine is stuck",
+				testutil.ToFloat64(metrics.PropagationPendingRequeues), defaultRequeueDelay+time.Second)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 // flushSync drains pendingMsgs and synchronously waits for the resulting
 // processBatch goroutine to finish. Mirrors the pre-pipelining semantics
 // that existing tests rely on (assert state right after flushBatch returns).
 func flushSync(t *testing.T, p *Propagator) error {
 	t.Helper()
-	if err := p.flushBatch(context.Background()); err != nil {
+	// t.Context, not Background: a requeue goroutine this flush schedules
+	// waits requeueDelay on it, and must exit with the test instead of
+	// moving the global PropagationPendingRequeues gauge under a later one.
+	if err := p.flushBatch(t.Context()); err != nil {
 		return err
 	}
 	p.WaitForBatches()
