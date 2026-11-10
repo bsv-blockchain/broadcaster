@@ -8,15 +8,15 @@ require (
 	github.com/bsv-blockchain/go-bt/v2 v2.7.4
 	github.com/bsv-blockchain/go-chaincfg v1.7.0
 	github.com/bsv-blockchain/go-chaintracks v1.4.8
-	github.com/bsv-blockchain/go-p2p-message-bus v0.2.0
-	github.com/bsv-blockchain/go-sdk v1.7.3
+	github.com/bsv-blockchain/go-p2p-message-bus v0.3.0
+	github.com/bsv-blockchain/go-sdk v1.7.4
 	github.com/bsv-blockchain/go-teranode-p2p-client v0.3.3
 	github.com/bsv-blockchain/teranode v0.16.1-beta-txmeta-2
 	github.com/cockroachdb/pebble v1.1.5
 	github.com/fergusstrange/embedded-postgres v1.34.0
 	github.com/gin-gonic/gin v1.12.0
 	github.com/hashicorp/golang-lru/v2 v2.0.7
-	github.com/jackc/pgx/v5 v5.11.0
+	github.com/jackc/pgx/v5 v5.12.0
 	github.com/moby/moby/api v1.56.1
 	github.com/moby/moby/client v0.6.2
 	github.com/mrz1836/go-whatsonchain v1.3.0
@@ -28,7 +28,7 @@ require (
 	github.com/testcontainers/testcontainers-go v0.44.0
 	github.com/testcontainers/testcontainers-go/modules/postgres v0.44.0
 	github.com/testcontainers/testcontainers-go/modules/redpanda v0.44.0
-	go.mongodb.org/mongo-driver/v2 v2.9.2
+	go.mongodb.org/mongo-driver/v2 v2.9.3
 	go.opentelemetry.io/contrib/bridges/prometheus v0.72.0
 	go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin v0.72.0
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.72.0
@@ -42,7 +42,7 @@ require (
 	go.opentelemetry.io/otel/sdk/metric v1.47.0
 	go.opentelemetry.io/otel/trace v1.47.0
 	go.uber.org/zap v1.28.0
-	golang.org/x/sync v0.24.0
+	golang.org/x/sync v0.25.0
 	golang.org/x/time v0.16.0
 )
 
@@ -75,7 +75,7 @@ require (
 	github.com/aws/smithy-go v1.28.7 // indirect
 	github.com/benbjohnson/clock v1.3.5 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
-	github.com/bitcoin-sv/bdk/module/gobdk v1.3.1 // indirect
+	github.com/bitcoin-sv/bdk/module/gobdk v1.4.0 // indirect
 	github.com/bsv-blockchain/aerospike-client-go/v8 v8.7.1-bsv6 // indirect
 	github.com/bsv-blockchain/go-batcher/v2 v2.1.1 // indirect
 	github.com/bsv-blockchain/go-lockfree-queue v1.2.0 // indirect
@@ -311,7 +311,7 @@ require (
 	go.uber.org/mock v0.6.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	go.yaml.in/yaml/v2 v2.4.4 // indirect
-	go.yaml.in/yaml/v3 v3.0.5 // indirect
+	go.yaml.in/yaml/v3 v3.0.6 // indirect
 	golang.org/x/arch v0.31.0 // indirect
 	golang.org/x/crypto v0.58.0 // indirect
 	golang.org/x/exp v0.0.0-20261014143641-f0251eb4aa3e // indirect
