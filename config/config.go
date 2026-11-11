@@ -341,6 +341,44 @@ type TierConfig struct {
 	UnitsPerMinute int64 `mapstructure:"units_per_minute"`
 	MaxInFlight    int   `mapstructure:"max_in_flight"`
 	MaxBatch       int   `mapstructure:"max_batch"`
+	// RetentionDays is how long the transaction and submission rows written
+	// for this tier's callers are kept before the store deletes them. Zero
+	// (the default) keeps them forever. Only stores that implement retention
+	// (MongoDB) enforce it; see docs/api-keys.md.
+	RetentionDays int `mapstructure:"retention_days"`
+}
+
+// Retention is RetentionDays as a duration; zero means keep forever.
+func (t TierConfig) Retention() time.Duration {
+	return time.Duration(t.RetentionDays) * 24 * time.Hour
+}
+
+// RetentionFor is the retention for a caller on tier: ratelimit.anonymous
+// for TierAnonymous, the named tier, or free for a tier that is not
+// configured (the same fallback the rate limiter applies). Zero means keep
+// forever.
+func (rl RateLimitConfig) RetentionFor(tier string) time.Duration {
+	if tier == TierAnonymous {
+		return rl.Anonymous.Retention()
+	}
+	if t, ok := rl.Tiers[tier]; ok {
+		return t.Retention()
+	}
+	return rl.Tiers[TierFree].Retention()
+}
+
+// RetentionConfigured reports whether any tier (or anonymous) sets a
+// retention, i.e. whether rows may ever expire.
+func (rl RateLimitConfig) RetentionConfigured() bool {
+	if rl.Anonymous.RetentionDays > 0 {
+		return true
+	}
+	for _, t := range rl.Tiers {
+		if t.RetentionDays > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // Kafka configures the message broker. Backend picks between a real Sarama
@@ -1548,9 +1586,14 @@ func setDefaults() {
 	viper.SetDefault("ratelimit.anonymous.units_per_minute", 50)
 	viper.SetDefault("ratelimit.anonymous.max_in_flight", 5)
 	viper.SetDefault("ratelimit.anonymous.max_batch", 1)
+	// retention_days 0 keeps rows forever: no deployment starts deleting
+	// data on upgrade. Declared so BSV_BROADCASTER_RATELIMIT_*_RETENTION_DAYS
+	// overrides bind.
+	viper.SetDefault("ratelimit.anonymous.retention_days", 0)
 	viper.SetDefault("ratelimit.tiers.free.units_per_minute", 50)
 	viper.SetDefault("ratelimit.tiers.free.max_in_flight", 5)
 	viper.SetDefault("ratelimit.tiers.free.max_batch", 1)
+	viper.SetDefault("ratelimit.tiers.free.retention_days", 0)
 	viper.SetDefault("kafka.backend", "sarama")
 	// callback_* and merkle_service.* defaults exist so viper.AutomaticEnv
 	// knows the keys: without a registered key a BSV_BROADCASTER_MERKLE_SERVICE_URLS
@@ -2136,6 +2179,37 @@ func isLoopbackHost(host string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
+// minRetentionDays is the shortest retention a tier may configure:
+// rows must outlive every in-flight window — propagation retries, parking,
+// confirmation tracking.
+const minRetentionDays = 7
+
+// maxRetentionDays bounds retention_days (100 years) so the duration cannot
+// overflow into a tiny or negative value.
+const maxRetentionDays = 36500
+
+// validateRetention checks every tier's retention_days. It applies whether
+// or not rate limiting is enabled: retention follows the caller's tier
+// (anonymous when auth is off) either way.
+func validateRetention(rl RateLimitConfig) error {
+	check := func(name string, days int) error {
+		if days != 0 && (days < minRetentionDays || days > maxRetentionDays) {
+			return fmt.Errorf("ratelimit tier %q: retention_days must be 0 (keep forever) or between %d and %d, got %d",
+				name, minRetentionDays, maxRetentionDays, days)
+		}
+		return nil
+	}
+	if err := check(TierAnonymous, rl.Anonymous.RetentionDays); err != nil {
+		return err
+	}
+	for _, name := range slices.Sorted(maps.Keys(rl.Tiers)) {
+		if err := check(name, rl.Tiers[name].RetentionDays); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // validateAccessControl checks the API-key, admin and rate-limit settings.
 func validateAccessControl(cfg *Config) error {
 	switch cfg.APIServer.TrustedPlatform {
@@ -2163,6 +2237,9 @@ func validateAccessControl(cfg *Config) error {
 		return err
 	}
 	if err := validateIntrospection(cfg); err != nil {
+		return err
+	}
+	if err := validateRetention(cfg.RateLimit); err != nil {
 		return err
 	}
 	rl := cfg.RateLimit

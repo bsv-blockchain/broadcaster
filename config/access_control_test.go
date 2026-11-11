@@ -200,6 +200,20 @@ func TestValidateAccessControl(t *testing.T) {
 		{"introspection bad provider name", func(c *Config) {
 			c.Auth.Introspection = map[string]IntrospectionProvider{"Wo C": testIntrospectionProvider()}
 		}, "provider name"},
+		{"tier retention two years", func(c *Config) {
+			c.RateLimit.Tiers["enterprise"] = TierConfig{MaxInFlight: 500, MaxBatch: 10000, RetentionDays: 730}
+		}, ""},
+		{"tier retention below minimum", func(c *Config) {
+			c.RateLimit.Tiers["enterprise"] = TierConfig{MaxInFlight: 500, MaxBatch: 10000, RetentionDays: 3}
+		}, "retention_days must be 0 (keep forever) or between 7 and 36500"},
+		{"tier retention that would overflow", func(c *Config) {
+			c.RateLimit.Tiers["enterprise"] = TierConfig{MaxInFlight: 500, MaxBatch: 10000, RetentionDays: 213504}
+		}, "between 7 and 36500"},
+		{"negative anonymous retention", func(c *Config) { c.RateLimit.Anonymous.RetentionDays = -1 }, "retention_days"},
+		{"retention validated with ratelimit off", func(c *Config) {
+			c.RateLimit.Enabled = false
+			c.RateLimit.Tiers[TierFree] = TierConfig{RetentionDays: 1}
+		}, "retention_days"},
 		{"ratelimit without auth", func(c *Config) { c.Auth.Enabled = false }, "requires auth.enabled"},
 		{"auth with zero cache ttl", func(c *Config) { c.RateLimit.KeyCacheTTLMs = 0 }, "key_cache_ttl_ms"},
 		{"stale shorter than ttl", func(c *Config) { c.RateLimit.KeyCacheStaleMaxMs = 1 }, "key_cache_ttl_ms"},
@@ -399,5 +413,58 @@ auth:
 	}
 	if (IntrospectionProvider{}).Timeout() != DefaultIntrospectionTimeoutMs*time.Millisecond {
 		t.Error("zero timeout_ms must default")
+	}
+}
+
+func TestRetentionFor(t *testing.T) {
+	rl := RateLimitConfig{
+		Anonymous: TierConfig{RetentionDays: 30},
+		Tiers: map[string]TierConfig{
+			TierFree:     {RetentionDays: 90},
+			"enterprise": {RetentionDays: 730},
+			"archive":    {},
+		},
+	}
+	day := 24 * time.Hour
+	for tier, want := range map[string]time.Duration{
+		TierAnonymous: 30 * day,
+		TierFree:      90 * day,
+		"enterprise":  730 * day,
+		"archive":     0,
+		"unknown":     90 * day, // falls back to free
+	} {
+		if got := rl.RetentionFor(tier); got != want {
+			t.Errorf("RetentionFor(%q) = %v, want %v", tier, got, want)
+		}
+	}
+	if !rl.RetentionConfigured() {
+		t.Error("RetentionConfigured = false")
+	}
+	if (RateLimitConfig{Tiers: map[string]TierConfig{TierFree: {}}}).RetentionConfigured() {
+		t.Error("RetentionConfigured = true with no retention set")
+	}
+}
+
+// TestRetentionDaysBind proves the shipped defaults keep rows forever and
+// that the env overrides bind (each key needs a SetDefault).
+func TestRetentionDaysBind(t *testing.T) {
+	viper.Reset()
+	t.Cleanup(viper.Reset)
+	cfg, err := Load(&cobra.Command{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.RateLimit.RetentionConfigured() {
+		t.Fatalf("defaults configure retention: anonymous=%d free=%d", cfg.RateLimit.Anonymous.RetentionDays, cfg.RateLimit.Tiers[TierFree].RetentionDays)
+	}
+	viper.Reset()
+	t.Setenv("BSV_BROADCASTER_RATELIMIT_ANONYMOUS_RETENTION_DAYS", "30")
+	t.Setenv("BSV_BROADCASTER_RATELIMIT_TIERS_FREE_RETENTION_DAYS", "90")
+	cfg, err = Load(&cobra.Command{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.RateLimit.Anonymous.RetentionDays != 30 || cfg.RateLimit.Tiers[TierFree].RetentionDays != 90 {
+		t.Errorf("env overrides: anonymous=%d free=%d, want 30/90", cfg.RateLimit.Anonymous.RetentionDays, cfg.RateLimit.Tiers[TierFree].RetentionDays)
 	}
 }

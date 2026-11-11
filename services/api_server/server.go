@@ -45,8 +45,11 @@ const (
 type Server struct {
 	services.ReadyHook
 
-	cfg          *config.Config
-	logger       *zap.Logger
+	cfg    *config.Config
+	logger *zap.Logger
+	// retention enforces per-tier data retention; nil when no tier
+	// configures it or the store cannot (see initRetention).
+	retention    store.RetentionExtender
 	producer     *kafka.Producer
 	publisher    events.Publisher // nil-safe; status updates flow to SSE via Kafka — the api-server itself publishes but does not subscribe
 	store        store.Store
@@ -184,6 +187,7 @@ func (s *Server) Start(ctx context.Context) error {
 	if err := s.initAccessControl(); err != nil { //nolint:contextcheck // false positive: contextcheck's call graph walks into apikey.Middleware's inner gin closures (newMiddleware -> authenticated), which use c.Request.Context() -- the correct per-request context -- not a ctx parameter for the linter to compare against; initAccessControl itself takes no ctx.
 		return err
 	}
+	s.initRetention(ctx)
 	if s.cfg.Admin.Enabled {
 		if err := s.startAdmin(ctx); err != nil {
 			return err

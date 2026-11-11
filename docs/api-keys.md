@@ -105,11 +105,12 @@ admin:
 ratelimit:
   enabled: true
   expected_replicas: 3
+  anonymous: { units_per_minute: 50, max_in_flight: 5, max_batch: 1, retention_days: 30 }
   tiers:
-    free:       { units_per_minute: 50,    max_in_flight: 5,   max_batch: 1 }
-    standard:    { units_per_minute: 3000,  max_in_flight: 20,  max_batch: 100 }
-    high:        { units_per_minute: 30000, max_in_flight: 100, max_batch: 1000 }
-    unlimited: { units_per_minute: 0,     max_in_flight: 500, max_batch: 10000 }
+    free:      { units_per_minute: 50,    max_in_flight: 5,   max_batch: 1,     retention_days: 30 }
+    standard:  { units_per_minute: 3000,  max_in_flight: 20,  max_batch: 100,   retention_days: 90 }
+    high:      { units_per_minute: 30000, max_in_flight: 100, max_batch: 1000,  retention_days: 365 }
+    unlimited: { units_per_minute: 0,     max_in_flight: 500, max_batch: 10000, retention_days: 730 }
 ```
 
 **Trust model — read this before setting either option.** `c.ClientIP()`
@@ -135,6 +136,8 @@ logs.
   `units_per_minute`, and `max_batch × costs.submit_tx + costs.read` must
   too (checked at config load; a tier that could never pay for its own
   batch cap fails startup, not the first request).
+- `retention_days` is how long the transaction and submission rows a
+  tier's callers write are kept; see [Data retention per tier](#data-retention-per-tier).
 - Revocations and tier changes take effect within `key_cache_ttl_ms`
   (default 30s) while the key store is healthy. If the store is down, a
   key already resolved once keeps authenticating on its last known value
@@ -163,6 +166,59 @@ logs.
   `APIKeyStore`), but a tier assigned to a key must still exist under
   `ratelimit.tiers` — populate that section even in an admin-only,
   quota-off deployment if you plan to issue keys on tiers other than `free`.
+
+### Data retention per tier
+
+Each tier, and `ratelimit.anonymous`, can set `retention_days`: how long the
+rows written for its callers (the transaction row and the caller's
+submission/callback row) are kept before the store deletes them. `0`, the
+default, keeps them forever, so no deployment starts deleting data until a
+tier opts in. Otherwise it is between 7 and 36500 days. The 7-day floor
+outlives the default retry, parking and confirmation windows. A row deleted
+while still in flight (say, a transaction stuck unmined past its
+retention) is not an error, but its later status updates are dropped.
+
+- The caller's tier decides: a keyed caller uses its key's tier (a tier
+  missing from config falls back to `free`, as for rate limits), and an
+  unkeyed caller, or any caller when `auth.enabled` is off, uses
+  `ratelimit.anonymous`. Retention applies whether or not
+  `ratelimit.enabled` is set.
+- The expiry is stamped when a row is written: `now + retention_days`. A later
+  tier change does not move it.
+- **Resubmits extend, never shorten.** When another caller submits a
+  transaction that is already stored, its row's expiry moves out to that
+  caller's if that is more than a day later. Resubmitting therefore also
+  keeps a row alive. A keep-forever caller removes the expiry, and a row
+  already kept forever never gains one. Each caller's submission row keeps
+  its own expiry. Normally that is no later than the transaction row's, but
+  the extension is best-effort: if it fails, a submission can outlive its
+  transaction row, and `GET /tx` then answers `404` for that txid.
+- Set `ratelimit.anonymous.retention_days` too: unkeyed callers otherwise
+  keep their rows forever, and their resubmits make any row they touch
+  permanent.
+- Rows written before retention was configured have no expiry and are
+  kept forever.
+
+**Backend support.** Only MongoDB enforces retention, through a TTL index on
+`expires_at` for `transactions` and `submissions` (`tx_expires_ttl`,
+`sub_expires_ttl`, `expireAfterSeconds: 0`, partial on the field existing).
+MongoDB's TTL monitor deletes expired documents in the background (about
+once a minute). On Postgres, Pebble and Aerospike, rows are kept forever and
+the api-server logs a warning at boot when a tier configures retention.
+
+The indexes are built only once retention is configured, by the
+api-server at boot (bounded by `store.mongodb.index_timeout_ms`); upgrading
+without configuring retention builds nothing. A failed or timed-out build
+is logged, not fatal: rows are still stamped and expire once the indexes
+exist. On a large `transactions` collection, create them ahead of the
+deploy (same names, keys and options) so boot finds them in place:
+
+```js
+db.transactions.createIndex({expires_at: 1}, {name: "tx_expires_ttl", expireAfterSeconds: 0,
+  partialFilterExpression: {expires_at: {$exists: true}}})
+db.submissions.createIndex({expires_at: 1}, {name: "sub_expires_ttl", expireAfterSeconds: 0,
+  partialFilterExpression: {expires_at: {$exists: true}}})
+```
 
 ### Sharing one key set across deployments (`auth.store`)
 

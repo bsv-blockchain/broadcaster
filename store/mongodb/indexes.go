@@ -21,9 +21,11 @@ const (
 	idxTxBlockHash     = "tx_block_hash"
 	idxTxTimestamp     = "tx_timestamp"
 	idxTxRetryReady    = "tx_retry_ready"
+	idxTxExpires       = "tx_expires_ttl"
 	idxSubTxIDToken    = "sub_txid_token" //nolint:gosec // an index name, not a credential
 	idxSubTokenTxID    = "sub_token_txid" //nolint:gosec // an index name, not a credential
 	idxSubRetryReady   = "sub_retry_ready"
+	idxSubExpires      = "sub_expires_ttl"
 	idxBPHeightDesc    = "bp_height_desc"
 	idxBPStatusHeight  = "bp_status_height"
 	idxBPStaleSeen     = "bp_stale_seen"
@@ -255,6 +257,18 @@ func (s *Store) provisionIndexes(ctx context.Context, specs []indexSpec, ttlByCo
 
 func idx(name string, keys bson.D) mongo.IndexModel {
 	return mongo.IndexModel{Keys: keys, Options: options.Index().SetName(name)}
+}
+
+// retentionTTL is the data-retention TTL index on expires_at: the TTL
+// monitor deletes a document once its own expires_at has passed
+// (expireAfterSeconds 0). Partial on the field existing, so rows kept
+// forever (no expires_at) are not indexed at all.
+func retentionTTL(name string) mongo.IndexModel {
+	return mongo.IndexModel{
+		Keys: bson.D{{Key: fExpiresAt, Value: 1}},
+		Options: options.Index().SetName(name).SetExpireAfterSeconds(0).
+			SetPartialFilterExpression(bson.D{{Key: fExpiresAt, Value: bson.D{{Key: opExists, Value: true}}}}),
+	}
 }
 
 func idxPartial(name string, keys, filter bson.D) mongo.IndexModel {
