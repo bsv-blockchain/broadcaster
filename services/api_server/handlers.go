@@ -64,19 +64,13 @@ func shouldRepublishExisting(status models.Status) bool {
 
 const jsonKeyError = "error"
 
-// needsRawTxRestore reports whether a republished row must get this
-// request's bytes before the txid-only message goes out. A REJECTED resubmit
-// always does: the stored bytes are the ones that were rejected, and the
-// resubmit may carry corrected EF metadata under the same txid. A stranded
-// RECEIVED row only does if its raw_tx is gone.
-func needsRawTxRestore(existing *models.TransactionStatus) bool {
-	return existing.Status == models.StatusRejected || len(existing.RawTx) == 0
-}
-
-// restoreRawTxs writes each txid's submitted bytes back onto its existing
-// row before the row is republished. The propagation message carries the
-// txid only (#329), so a row whose raw_tx was cleared could not be
-// hydrated. Callers answer a failure with 503; nothing is published yet.
+// restoreRawTxs writes each txid's submitted bytes onto its existing row
+// before the row is republished. The propagation message carries the txid
+// only (#329), so the consumer publishes whatever the row holds: a REJECTED
+// row may have lost raw_tx (ClearRetryState) or hold the rejected bytes, and
+// a stranded RECEIVED row may hold bytes an older intake stored untrimmed.
+// The retry's parsed bytes replace them all, as the pre-#329 message did.
+// Callers answer a failure with 503; nothing is published yet.
 func (s *Server) restoreRawTxs(ctx context.Context, raws map[string][]byte) error {
 	for txid, raw := range raws {
 		if err := s.store.SetRawTx(ctx, txid, raw); err != nil {
@@ -1009,8 +1003,8 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 	// does it publish RECEIVED (see below). Without a store there is no CAS
 	// to coordinate with, so every submission counts as the first.
 	inserted := s.store == nil
-	// restore: the CAS found a row this request must publish again, and it
-	// has no raw_tx to hydrate from (see restoreRawTxs).
+	// restore: the CAS found a row this request must publish again, so it
+	// gets this request's bytes first (see restoreRawTxs).
 	restore := false
 	receivedAt := time.Now()
 	if s.store != nil {
@@ -1038,7 +1032,7 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 			respondStoreUnavailable(c)
 			return
 		case !inserted && shouldRepublishExisting(existing.Status):
-			restore = needsRawTxRestore(existing)
+			restore = true
 			// REJECTED resubmit: re-run broadcast. RECEIVED resubmit: the
 			// first attempt wrote the row then failed to Kafka-publish
 			// (503/500). Fall through so this retry actually queues.
@@ -1071,9 +1065,8 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 		}
 	}
 
-	// A row this request did not create may have lost its raw_tx
-	// (ClearRetryState drops it on the way to REJECTED), and the txid-only
-	// message needs it back before publishing (see needsRawTxRestore).
+	// A row this request did not create is republished with this
+	// request's bytes (see restoreRawTxs).
 	if restore {
 		if err := s.restoreRawTxs(c.Request.Context(), map[string][]byte{txid: rawTx}); err != nil {
 			respondStoreUnavailable(c)
@@ -1493,8 +1486,6 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 	// that selected them; their stored keys win over this request's choice
 	// (adoptStoredFamilyKeys).
 	republished := make(map[string]models.Status)
-	// restore reports, per republished txid, needsRawTxRestore.
-	restore := make(map[string]bool)
 	// receivedTxIDs is the subset of toPublish whose row this request's CAS
 	// inserted: only the first attempt publishes RECEIVED, since any other
 	// attempt can run after an earlier attempt's verdict was published (see
@@ -1535,7 +1526,6 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 				}
 				toPublish = append(toPublish, p)
 				republished[p.txid] = existing.Status
-				restore[p.txid] = needsRawTxRestore(existing)
 			case !inserted:
 				duplicates++
 				// Idempotent re-submit at a non-REJECTED status: register
@@ -1566,11 +1556,11 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 			receivedTxIDs = append(receivedTxIDs, p.txid)
 		}
 	}
-	// Put this request's bytes on the republished rows that need them
-	// (needsRawTxRestore), as handleSubmitTransaction does.
-	raws := make(map[string][]byte)
+	// Put this request's bytes on every republished row (restoreRawTxs), as
+	// handleSubmitTransaction does.
+	raws := make(map[string][]byte, len(republished))
 	for _, p := range toPublish {
-		if restore[p.txid] {
+		if _, ok := republished[p.txid]; ok {
 			raws[p.txid] = p.raw
 		}
 	}

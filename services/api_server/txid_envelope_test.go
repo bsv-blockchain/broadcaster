@@ -133,68 +133,44 @@ func TestSubmit_RepublishRestoresRawTx(t *testing.T) {
 	}
 }
 
-// TestSubmit_RepublishWithRawTx_SkipsRestore: a stranded RECEIVED row still
-// carries its raw_tx, so intake republishes without rewriting it.
-func TestSubmit_RepublishWithRawTx_SkipsRestore(t *testing.T) {
-	rawA, rawB, _, _ := twoDistinctTxs(t)
-	for _, tc := range []struct {
-		path string
-		body []byte
-		want int
-	}{
-		{"/tx", rawA, 1},
-		{"/txs", append(append([]byte(nil), rawA...), rawB...), 2},
-	} {
-		t.Run(tc.path, func(t *testing.T) {
-			ms := &mockStore{
-				getOrInsertFn: func(in *models.TransactionStatus) (*models.TransactionStatus, bool, error) {
-					return &models.TransactionStatus{TxID: in.TxID, Status: models.StatusReceived, RawTx: in.RawTx}, false, nil
-				},
-			}
-			_, broker, router := newReceivedServer(ms)
-			if w := submit(t, router, tc.path, tc.body); w.Code != http.StatusAccepted && w.Code != http.StatusOK {
-				t.Fatalf("status = %d: %s", w.Code, w.Body.String())
-			}
-			if len(ms.setRawTxCalls) != 0 {
-				t.Errorf("SetRawTx called for rows that still have raw_tx: %v", ms.setRawTxCalls)
-			}
-			if n := len(publishedEnvelopes(t, broker)); n != tc.want {
-				t.Errorf("republished %d envelopes, want %d", n, tc.want)
-			}
-		})
-	}
-}
-
-// TestSubmit_RejectedResubmit_RestoresEvenWithStoredRawTx: only
-// ClearRetryState empties raw_tx, so a network-REJECTED row still holds the
-// rejected bytes. A resubmit (say, with corrected EF metadata under the same
-// txid) must republish the new ones.
-func TestSubmit_RejectedResubmit_RestoresEvenWithStoredRawTx(t *testing.T) {
+// TestSubmit_Republish_ReplacesStoredRawTx: the consumer publishes whatever
+// the row holds, so a republished row always gets this request's bytes. A
+// network-REJECTED row still holds the rejected bytes (only ClearRetryState
+// empties raw_tx), and a stranded RECEIVED row may hold bytes an older
+// intake stored with trailing data, which would corrupt the Teranode /txs
+// stream it is concatenated into.
+func TestSubmit_Republish_ReplacesStoredRawTx(t *testing.T) {
 	rawA, rawB, txidA, txidB := twoDistinctTxs(t)
-	for _, tc := range []struct {
-		path string
-		body []byte
-		want map[string][]byte
-	}{
-		{"/tx", rawA, map[string][]byte{txidA: rawA}},
-		{"/txs", append(append([]byte(nil), rawA...), rawB...), map[string][]byte{txidA: rawA, txidB: rawB}},
-	} {
-		t.Run(tc.path, func(t *testing.T) {
-			ms := &mockStore{
-				getOrInsertFn: func(in *models.TransactionStatus) (*models.TransactionStatus, bool, error) {
-					return &models.TransactionStatus{TxID: in.TxID, Status: models.StatusRejected, RawTx: []byte{0xba, 0xd0}}, false, nil
-				},
-			}
-			_, _, router := newReceivedServer(ms)
-			if w := submit(t, router, tc.path, tc.body); w.Code != http.StatusAccepted && w.Code != http.StatusOK {
-				t.Fatalf("status = %d: %s", w.Code, w.Body.String())
-			}
-			for txid, raw := range tc.want {
-				if !bytes.Equal(ms.setRawTxCalls[txid], raw) {
-					t.Errorf("SetRawTx(%s) = %x, want the resubmitted bytes", txid, ms.setRawTxCalls[txid])
+	for _, status := range []models.Status{models.StatusRejected, models.StatusReceived} {
+		for _, tc := range []struct {
+			path string
+			body []byte
+			want map[string][]byte
+		}{
+			{"/tx", rawA, map[string][]byte{txidA: rawA}},
+			{"/txs", append(append([]byte(nil), rawA...), rawB...), map[string][]byte{txidA: rawA, txidB: rawB}},
+		} {
+			t.Run(string(status)+tc.path, func(t *testing.T) {
+				ms := &mockStore{
+					getOrInsertFn: func(in *models.TransactionStatus) (*models.TransactionStatus, bool, error) {
+						stale := append(append([]byte(nil), in.RawTx...), '\n')
+						return &models.TransactionStatus{TxID: in.TxID, Status: status, RawTx: stale}, false, nil
+					},
 				}
-			}
-		})
+				_, broker, router := newReceivedServer(ms)
+				if w := submit(t, router, tc.path, tc.body); w.Code != http.StatusAccepted && w.Code != http.StatusOK {
+					t.Fatalf("status = %d: %s", w.Code, w.Body.String())
+				}
+				for txid, raw := range tc.want {
+					if !bytes.Equal(ms.setRawTxCalls[txid], raw) {
+						t.Errorf("SetRawTx(%s) = %x, want the resubmitted bytes", txid, ms.setRawTxCalls[txid])
+					}
+				}
+				if n := len(publishedEnvelopes(t, broker)); n != len(tc.want) {
+					t.Errorf("republished %d envelopes, want %d", n, len(tc.want))
+				}
+			})
+		}
 	}
 }
 
