@@ -142,7 +142,8 @@ func newMiddleware(r *Resolver, failures *authFailureLimiter) gin.HandlerFunc {
 func authenticated(c *gin.Context, ip string, k *store.APIKey) {
 	WithPrincipal(c, Principal{KeyID: k.ID, Tier: k.Tier, ClientIP: ip})
 	trace.SpanFromContext(c.Request.Context()).SetAttributes(
-		attribute.String("key_id", k.ID), attribute.String("tier", k.Tier))
+		attribute.String("key_id", k.ID), attribute.String("tier", k.Tier),
+	)
 	c.Next()
 }
 

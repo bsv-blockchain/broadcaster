@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bsv-blockchain/go-sdk/script"
+	sdkTx "github.com/bsv-blockchain/go-sdk/transaction"
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 
@@ -17,8 +19,6 @@ import (
 	"github.com/bsv-blockchain/broadcaster/kafka"
 	"github.com/bsv-blockchain/broadcaster/models"
 	"github.com/bsv-blockchain/broadcaster/store"
-	"github.com/bsv-blockchain/go-sdk/script"
-	sdkTx "github.com/bsv-blockchain/go-sdk/transaction"
 )
 
 // TestHandleSubmitTransaction_PublishesReceivedWithTokenHint pins the fix
