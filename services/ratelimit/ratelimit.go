@@ -254,7 +254,7 @@ func (rl *RateLimiter) takeDecision(c *gin.Context, p apikey.Principal, tier Tie
 	if p.Anonymous() {
 		return rl.anon.take(p.Subject(), tier.UnitsPerMinute, units, rl.now()), true
 	}
-	d, err := rl.keyed.take(c.Request.Context(), p.KeyID, tier.UnitsPerMinute, units)
+	d, err := rl.keyed.take(c.Request.Context(), p.QuotaKey(), tier.UnitsPerMinute, units)
 	if err == nil {
 		return d, true
 	}

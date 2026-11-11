@@ -18,7 +18,8 @@ import (
 // Key format: Prefix + 43 base62 chars (32 random bytes) + "_" + 6 base62
 // chars (CRC32 of the body). The prefix makes leaked keys recognizable to
 // secret scanners; the checksum rejects typos and garbage before any store
-// lookup.
+// lookup. External introspection providers (see Introspector) issue keys
+// in the same format under their own configured prefixes.
 const (
 	Prefix      = "bsvb_"
 	secretBytes = 32
@@ -42,10 +43,16 @@ func Generate() (string, error) {
 
 // Validate checks the key's shape and checksum without any store access.
 func Validate(key string) error {
-	if !strings.HasPrefix(key, Prefix) {
+	return ValidateWithPrefix(key, Prefix)
+}
+
+// ValidateWithPrefix is Validate for a key issued under prefix, such as an
+// introspection provider's.
+func ValidateWithPrefix(key, prefix string) error {
+	if !strings.HasPrefix(key, prefix) {
 		return ErrMalformed
 	}
-	rest := key[len(Prefix):]
+	rest := key[len(prefix):]
 	if len(rest) != bodyLen+1+checksumLen || rest[bodyLen] != '_' {
 		return ErrMalformed
 	}
