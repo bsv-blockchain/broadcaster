@@ -24,7 +24,7 @@
         "ghcr.io/devcontainers/features/github-cli:1": {}
     },
     "image": "mcr.microsoft.com/devcontainers/go:2-1-trixie",
-    "name": "bsv-broadcaster dev container",
+    "name": "broadcaster dev container",
     "onCreateCommand": "go install github.com/mrz1836/mage-x/cmd/magex@latest",
     "postCreateCommand": "magex lint && magex vet && magex test",
     "remoteUser": "vscode",

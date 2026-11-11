@@ -1,6 +1,6 @@
 # 🛟 Support Guide
 
-Need help with **BSV Broadcaster**? You're in the right place. Here’s how to get support, report issues, and stay aligned with project guidelines.
+Need help with **broadcaster**? You're in the right place. Here’s how to get support, report issues, and stay aligned with project guidelines.
 
 <br/>
 
