@@ -30,7 +30,7 @@ info:
     stream on the `sse` service. See the individual operations for details.
   version: "1.0.0"
   license:
-    name: Open BSV License
+    name: Apache License 2.0
     url: https://github.com/bsv-blockchain/broadcaster/blob/main/LICENSE
 
 servers:
