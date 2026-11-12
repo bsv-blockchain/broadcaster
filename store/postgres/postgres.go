@@ -2345,3 +2345,38 @@ func (s *Store) LookupPartitionKeys(ctx context.Context, txids []string) (map[st
 	}
 	return out, rows.Err()
 }
+
+// LookupRawTxs implements store.Store with one projected query.
+func (s *Store) LookupRawTxs(ctx context.Context, txids []string) (map[string]store.RawTxRow, error) {
+	if len(txids) == 0 {
+		return nil, nil
+	}
+	rows, err := s.pool.Query(ctx,
+		`SELECT txid, status, raw_tx FROM transactions WHERE txid = ANY($1)`, txids)
+	if err != nil {
+		return nil, fmt.Errorf("lookup raw txs: %w", err)
+	}
+	defer rows.Close()
+	out := make(map[string]store.RawTxRow, len(txids))
+	for rows.Next() {
+		var txid, status string
+		var raw []byte
+		if err := rows.Scan(&txid, &status, &raw); err != nil {
+			return nil, fmt.Errorf("lookup raw txs: %w", err)
+		}
+		out[txid] = store.RawTxRow{Status: models.Status(status), RawTx: raw}
+	}
+	return out, rows.Err()
+}
+
+// SetRawTx implements store.Store.
+func (s *Store) SetRawTx(ctx context.Context, txid string, rawTx []byte) error {
+	tag, err := s.pool.Exec(ctx, `UPDATE transactions SET raw_tx=$2 WHERE txid=$1`, txid, rawTx)
+	if err != nil {
+		return fmt.Errorf("set raw tx %s: %w", txid, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("set raw tx %s: %w", txid, store.ErrNotFound)
+	}
+	return nil
+}

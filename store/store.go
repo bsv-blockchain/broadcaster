@@ -325,6 +325,23 @@ type Store interface {
 	// dispatcher that holds it. Unknown txids are absent from the result.
 	LookupPartitionKeys(ctx context.Context, txids []string) (map[string]ParentKey, error)
 
+	// LookupRawTxs returns, for every txid in txids that has a row, the row's
+	// current status and its stored raw_tx (nil once ClearRetryState has
+	// dropped it). The propagation consumer hydrates txid-only Kafka messages
+	// with it (#329): the message carries no tx bytes, so its size never
+	// tracks the tx-size policy. Unknown txids are absent from the result,
+	// and so is a row that cannot be decoded: one corrupt row must not fail
+	// the batch, or the consumer would retry the same claim batch forever.
+	// err is reserved for the store itself failing.
+	LookupRawTxs(ctx context.Context, txids []string) (map[string]RawTxRow, error)
+
+	// SetRawTx overwrites the stored raw_tx of an existing row without
+	// touching its status. Intake calls it before republishing a row it did
+	// not create (a REJECTED resubmit, a stranded RECEIVED retry), whose
+	// raw_tx may have been cleared, so the consumer can hydrate the
+	// txid-only message. Returns ErrNotFound when the txid has no row.
+	SetRawTx(ctx context.Context, txid string, rawTx []byte) error
+
 	// EnrichMerklePath populates status.MerklePath in place for a MINED/IMMUTABLE
 	// status that already carries a BlockHash, extracting the transaction's
 	// minimal merkle path from the block's compound BUMP. It is a no-op when the
@@ -796,6 +813,13 @@ type Store interface {
 
 	// Close closes the database connection
 	Close() error
+}
+
+// RawTxRow is one LookupRawTxs result: a row's current status and its stored
+// raw transaction bytes.
+type RawTxRow struct {
+	Status models.Status
+	RawTx  []byte
 }
 
 // ParentKey is one LookupPartitionKeys result: a row's current status and the
