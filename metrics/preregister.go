@@ -163,7 +163,7 @@ func PreRegisterAPIKey() {
 // with a usage sink at 0.
 func PreRegisterUsage(providers []string) {
 	for _, p := range providers {
-		for _, result := range []string{"ok", "retry", "unauthorized", "uncertain", "rejected", "disabled"} {
+		for _, result := range []string{"ok", "retry", "unauthorized", "misconfigured", "uncertain", "rejected", "disabled"} {
 			UsageFlushTotal.WithLabelValues(p, result)
 		}
 		for _, reason := range []string{"uncertain", "rejected", "invalid", "overflow", "disabled", "shutdown"} {

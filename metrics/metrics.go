@@ -1424,11 +1424,12 @@ var UsageRequestsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 
 // UsageFlushTotal counts usage report calls by provider and result: ok |
 // retry (kept for a later flush: 503/429, or not sent) | unauthorized |
+// misconfigured (404: no usage endpoint for this token yet; kept) |
 // uncertain (dropped: the receiver may have recorded it) | rejected (400)
 // | disabled (501).
 var UsageFlushTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "bsv_broadcaster_usage_flush_total",
-	Help: "Usage report calls by provider and result (ok|retry|unauthorized|uncertain|rejected|disabled).",
+	Help: "Usage report calls by provider and result (ok|retry|unauthorized|misconfigured|uncertain|rejected|disabled).",
 }, []string{"sink", "result"})
 
 // UsageEntriesSentTotal counts usage entries a provider accepted.

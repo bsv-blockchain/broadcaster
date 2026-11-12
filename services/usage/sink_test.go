@@ -152,6 +152,7 @@ func TestHTTPSinkRetriesWhatWasNotRecorded(t *testing.T) {
 		{"429", response{status: http.StatusTooManyRequests, retryAfter: "7"}, 7 * time.Second},
 		{"401", response{status: http.StatusUnauthorized}, pauseUnauthorized},
 		{"403", response{status: http.StatusForbidden}, pauseUnauthorized},
+		{"404 (usage not enabled yet)", response{status: http.StatusNotFound}, pauseUnauthorized},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newReceiver(t, tc.first, response{status: http.StatusOK})

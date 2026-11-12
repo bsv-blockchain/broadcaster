@@ -11,8 +11,10 @@ import (
 	"github.com/bsv-blockchain/broadcaster/services/usage"
 )
 
-// usageCallTimeout bounds one usage report call.
-const usageCallTimeout = 10 * time.Second
+// usageCallTimeout bounds one usage report call. Kept above a provider's
+// own time to record a batch (10s for the first one), so a slow but
+// successful call isn't dropped as uncertain.
+const usageCallTimeout = 15 * time.Second
 
 // initUsage builds the usage recorder and reporter when usage.enabled.
 // Config validation guarantees at least one provider sets usage_url. Must

@@ -488,6 +488,7 @@ may already have recorded is never resent:
 | `200` | Done. |
 | `503`, `429` | Kept and retried after `Retry-After` (capped at 5 minutes), else 60s. |
 | `401`, `403` | Kept and retried after 5 minutes; logged (fix the token). |
+| `404` | Kept and retried after 5 minutes; logged (fix `usage_url`, or wait for the provider to enable usage for this token). |
 | could not connect (dial, DNS or TLS handshake failure: nothing was sent) | Kept, retried after 30s. |
 | `502`, any other status, a timeout once the request was written | **Dropped**: it may already be counted. |
 | `400` | That batch is dropped and logged; later batches still go. |
@@ -503,7 +504,8 @@ progress is cancelled, and the final report must finish within
 `shutdown_flush_timeout_ms`.
 
 Metrics: `bsv_broadcaster_usage_requests_total{source,endpoint,class}`,
-`bsv_broadcaster_usage_flush_total{sink,result}`,
+`bsv_broadcaster_usage_flush_total{sink,result}` (`ok`, `retry`, `unauthorized`,
+`misconfigured`, `uncertain`, `rejected`, `disabled`),
 `bsv_broadcaster_usage_entries_sent_total{sink}`,
 `bsv_broadcaster_usage_entries_dropped_total{sink,reason}` (`uncertain`,
 `rejected`, `invalid`, `overflow`, `disabled`, `shutdown`),
