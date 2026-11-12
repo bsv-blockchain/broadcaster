@@ -1596,3 +1596,31 @@ func TestLookupPartitionKeys_ReturnsStatusAndKey(t *testing.T) {
 		}
 	}
 }
+
+// TestLookupRawTxs_CorruptRowReadsAbsent: one row that does not unmarshal
+// must not fail the batch, or the propagation consumer would retry the same
+// claim batch forever.
+func TestLookupRawTxs_CorruptRowReadsAbsent(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	good := "aa" + fmt.Sprintf("%062d", 1)
+	bad := "bb" + fmt.Sprintf("%062d", 2)
+	raw := []byte{0x01, 0x02}
+	if _, _, err := s.GetOrInsertStatus(ctx, &models.TransactionStatus{TxID: good, Status: models.StatusReceived, RawTx: raw, Timestamp: time.Now()}); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	if err := s.db.Set(txKey(bad), []byte("{not json"), nil); err != nil {
+		t.Fatalf("write corrupt row: %v", err)
+	}
+
+	got, err := s.LookupRawTxs(ctx, []string{good, bad})
+	if err != nil {
+		t.Fatalf("lookup failed on a corrupt row: %v", err)
+	}
+	if _, ok := got[bad]; ok {
+		t.Errorf("corrupt row returned: %+v", got[bad])
+	}
+	if row := got[good]; row.Status != models.StatusReceived || string(row.RawTx) != string(raw) {
+		t.Errorf("good row = %+v", row)
+	}
+}

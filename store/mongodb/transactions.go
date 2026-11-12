@@ -993,3 +993,60 @@ func (s *Store) LookupPartitionKeys(ctx context.Context, txids []string) (map[st
 	}
 	return out, nil
 }
+
+// LookupRawTxs implements store.Store with projected, chunked queries.
+func (s *Store) LookupRawTxs(ctx context.Context, txids []string) (map[string]store.RawTxRow, error) {
+	if len(txids) == 0 {
+		return nil, nil
+	}
+	out := make(map[string]store.RawTxRow, len(txids))
+	// Chunked under the query timeout, not one op-timeout read: a hydrate
+	// batch can carry hundreds of full tx bodies.
+	for _, chunk := range chunks(dedupe(txids), rawTxLookupChunk) {
+		if err := s.lookupRawTxChunk(ctx, chunk, out); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+// rawTxLookupChunk bounds the bodies one LookupRawTxs query returns. Smaller
+// than batchSize: these rows carry the full tx.
+const rawTxLookupChunk = 100
+
+func (s *Store) lookupRawTxChunk(ctx context.Context, txids []string, out map[string]store.RawTxRow) error {
+	qctx, cancel := s.queryCtx(ctx)
+	defer cancel()
+	cur, err := s.tx.Find(qctx, doc(kv(fID, doc(kv(opIn, txids)))),
+		options.Find().SetProjection(doc(kv(fStatus, 1), kv(fRawTx, 1))))
+	if err != nil {
+		return fmt.Errorf("lookup raw txs: %w", err)
+	}
+	defer closeCursor(qctx, cur)
+	for cur.Next(qctx) {
+		var d txDoc
+		if cur.Decode(&d) != nil {
+			// An undecodable doc reads as absent (see store.Store.LookupRawTxs).
+			continue
+		}
+		out[d.TxID] = store.RawTxRow{Status: models.Status(d.Status), RawTx: d.RawTx}
+	}
+	if err := cur.Err(); err != nil {
+		return fmt.Errorf("lookup raw txs: %w", err)
+	}
+	return nil
+}
+
+// SetRawTx implements store.Store.
+func (s *Store) SetRawTx(ctx context.Context, txid string, rawTx []byte) error {
+	octx, cancel := s.opCtx(ctx)
+	defer cancel()
+	res, err := s.tx.UpdateOne(octx, idFilter(txid), doc(kv(opSet, doc(kv(fRawTx, rawTx))), incVersion()))
+	if err != nil {
+		return fmt.Errorf("set raw tx %s: %w", txid, err)
+	}
+	if res.MatchedCount == 0 {
+		return fmt.Errorf("set raw tx %s: %w", txid, store.ErrNotFound)
+	}
+	return nil
+}

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"testing"
 	"time"
 
@@ -444,10 +445,11 @@ func TestHandleSubmitTransactions_AllConcurrentDuplicatesPublishNoReceived(t *te
 	}
 }
 
-// TestHandleSubmit_DedupErrorPublishesNoReceived: when the CAS errors the
-// handler cannot tell whether it is the first attempt, so it queues the tx
-// best-effort but publishes no RECEIVED, on either endpoint.
-func TestHandleSubmit_DedupErrorPublishesNoReceived(t *testing.T) {
+// TestHandleSubmit_DedupErrorSheds503: when the CAS errors the row may not
+// exist, and the propagation message carries the txid only (#329), so the
+// consumer would have no raw tx to load. Both endpoints answer 503 with
+// Retry-After and publish nothing: no Kafka message, no status event.
+func TestHandleSubmit_DedupErrorSheds503(t *testing.T) {
 	failing := func() *mockStore {
 		return &mockStore{
 			getOrInsertFn: func(*models.TransactionStatus) (*models.TransactionStatus, bool, error) {
@@ -465,12 +467,21 @@ func TestHandleSubmit_DedupErrorPublishesNoReceived(t *testing.T) {
 	} {
 		t.Run(tc.path, func(t *testing.T) {
 			pub, broker, router := newReceivedServer(failing())
-			postSubmit(t, router, tc.path, tc.body)
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, tc.path, bytes.NewReader(tc.body))
+			req.Header.Set("Content-Type", "application/octet-stream")
+			w := httptest.NewRecorder()
+			router.ServeHTTP(w, req)
+			if w.Code != http.StatusServiceUnavailable {
+				t.Fatalf("status = %d, want 503; body=%s", w.Code, w.Body.String())
+			}
+			if w.Header().Get("Retry-After") == "" {
+				t.Error("503 without Retry-After")
+			}
 			if len(pub.publishes) != 0 || len(pub.bulkPublishes) != 0 {
 				t.Errorf("CAS error published events: single=%+v bulk=%+v", pub.publishes, pub.bulkPublishes)
 			}
-			if len(broker.Sends)+broker.BatchCalls != 1 {
-				t.Errorf("CAS error must still queue propagation, got sends=%d batches=%d", len(broker.Sends), broker.BatchCalls)
+			if n := len(broker.Sends) + broker.BatchCalls; n != 0 {
+				t.Errorf("CAS error queued propagation: sends=%d batches=%d", len(broker.Sends), broker.BatchCalls)
 			}
 		})
 	}
@@ -540,5 +551,46 @@ func TestBulkReceivedAt(t *testing.T) {
 	}
 	if got, want := bulkReceivedAt(ts, 2), time.Date(2026, 11, 3, 12, 0, 0, 122_999_999, time.UTC); !got.Equal(want) {
 		t.Errorf("bulk: %v, want %v", got, want)
+	}
+}
+
+// TestHandleSubmitTransactions_PartialCASFailure_PublishesReceivedForInserted:
+// when a /txs CAS fails after earlier rows were inserted, the batch sheds
+// with 503 and nothing reaches Kafka, but the inserted rows still get their
+// RECEIVED. The retry republishes them as CAS losers, which never publish
+// RECEIVED (#391), so this is the only chance.
+func TestHandleSubmitTransactions_PartialCASFailure_PublishesReceivedForInserted(t *testing.T) {
+	rawA, rawB, txidA, _ := twoDistinctTxs(t)
+	ms := &mockStore{
+		getOrInsertFn: func(in *models.TransactionStatus) (*models.TransactionStatus, bool, error) {
+			if in.TxID == txidA {
+				return in, true, nil
+			}
+			return nil, false, errors.New("store unavailable")
+		},
+	}
+	pub, broker, router := newReceivedServer(ms)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/txs", bytes.NewReader(append(append([]byte(nil), rawA...), rawB...)))
+	req.Header.Set("Content-Type", "application/octet-stream")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503; body=%s", w.Code, w.Body.String())
+	}
+	if n := len(broker.Sends) + broker.BatchCalls; n != 0 {
+		t.Errorf("shed batch queued propagation: sends=%d batches=%d", len(broker.Sends), broker.BatchCalls)
+	}
+	events := append(append([]*models.TransactionStatus(nil), pub.publishes...), pub.bulkPublishes...)
+	var got []string
+	for _, e := range events {
+		got = append(got, e.TxID+":"+string(e.Status))
+		for _, id := range e.TxIDs {
+			got = append(got, id+":"+string(e.Status))
+		}
+	}
+	want := txidA + ":" + string(models.StatusReceived)
+	if !slices.Contains(got, want) || len(events) != 1 {
+		t.Errorf("events = %v, want exactly one RECEIVED for the inserted %s", got, txidA)
 	}
 }

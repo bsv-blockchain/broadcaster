@@ -124,6 +124,7 @@ func TestRequeueAfterDelay_RevokedClaim_DropsImmediatelyWithoutParking(t *testin
 		}
 	}()
 
+	quiesceRequeues(t)
 	requeuesBefore := testutil.ToFloat64(metrics.PropagationPendingRequeues)
 
 	ctx, cancel := context.WithCancel(context.Background())
