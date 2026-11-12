@@ -2,11 +2,15 @@ package usage
 
 import (
 	"context"
+	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"sync"
 	"testing"
 	"time"
@@ -247,4 +251,36 @@ func TestRetryAfter(t *testing.T) {
 	require.Equal(t, 30*time.Second, retryAfter("Thu, 12 Nov 2026 12:00:30 GMT", now))
 	require.Equal(t, pauseRetry, retryAfter("", now))
 	require.Equal(t, pauseRetry, retryAfter("soon", now))
+}
+
+// TestHTTPSinkDeliversBeforeBoundingTheQueue pins that max_pending_entries
+// only bounds what is left undelivered: a healthy receiver gets a flush
+// larger than the bound.
+func TestHTTPSinkDeliversBeforeBoundingTheQueue(t *testing.T) {
+	f := newReceiver(t, response{status: http.StatusOK})
+	s, _ := newSink(t, f.srv.URL, time.Second, 100)
+	s.Send(context.Background(), entries(101, "k"))
+	require.Len(t, f.recorded, 101)
+	require.Zero(t, s.Pending())
+}
+
+// TestHTTPSinkIgnoresImplausibleCounts pins that a 200 whose counts don't
+// add up (negative, or more than were sent) is treated as all accepted
+// instead of panicking a counter.
+func TestHTTPSinkIgnoresImplausibleCounts(t *testing.T) {
+	for _, body := range []string{`{"accepted":-1,"dropped":0}`, `{"accepted":0,"dropped":-5}`, `{"accepted":99,"dropped":0}`} {
+		f := newReceiver(t, response{status: http.StatusOK, body: body})
+		s, _ := newSink(t, f.srv.URL, time.Second, 100)
+		require.NotPanics(t, func() { s.Send(context.Background(), entries(2, "k")) }, body)
+		require.Zero(t, s.Pending(), body)
+	}
+}
+
+func TestNotSent(t *testing.T) {
+	require.True(t, notSent(&url.Error{Op: "Post", Err: &net.OpError{Op: "dial", Err: errors.New("connection refused")}}))
+	require.True(t, notSent(&url.Error{Op: "Post", Err: &net.DNSError{Err: "no such host"}}))
+	require.True(t, notSent(&url.Error{Op: "Post", Err: x509.UnknownAuthorityError{}}))
+	require.False(t, notSent(&url.Error{Op: "Post", Err: &net.OpError{Op: "read", Err: errors.New("connection reset")}}), "a reset may follow the write")
+	require.False(t, notSent(&url.Error{Op: "Post", Err: context.DeadlineExceeded}), "a timeout may follow the write")
+	require.False(t, notSent(io.ErrUnexpectedEOF))
 }

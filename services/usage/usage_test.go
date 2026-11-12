@@ -1,6 +1,7 @@
 package usage
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -9,9 +10,11 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
 
 	"github.com/bsv-blockchain/broadcaster/config"
 	"github.com/bsv-blockchain/broadcaster/services/apikey"
+	"github.com/bsv-blockchain/broadcaster/services/ratelimit"
 )
 
 const (
@@ -141,4 +144,57 @@ func TestRecorder(t *testing.T) {
 			}}, entries)
 		})
 	}
+}
+
+// TestRecorderBillsWhatTheLimiterGranted pins that, with a rate limiter on
+// the route, units are what it granted, not the nominal cost: a batch whose
+// per-transaction charge never happened bills only the base it paid.
+func TestRecorderBillsWhatTheLimiterGranted(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	agg := NewAggregator(100)
+	rec := NewRecorder(agg, []string{testSource}, 10)
+	cfg := config.RateLimitConfig{
+		Enabled: true, LeaseFraction: 0.1, ShrinkThreshold: 0.8, ExpectedReplicas: 1,
+		Costs:     config.RateLimitCosts{SubmitTx: 10, Read: 1},
+		Anonymous: config.TierConfig{UnitsPerMinute: 100},
+		Tiers:     map[string]config.TierConfig{config.TierFree: {}, "pro": {}},
+	}
+	rl := ratelimit.New(cfg, grantAll{}, zap.NewNop())
+	p := apikey.Principal{KeyID: "acme:k1", Tier: "pro", Provider: testSource, ProviderKeyID: "k1"}
+	e := gin.New()
+	e.GET("/x", rec.Middleware("v1/txs", 1), func(c *gin.Context) { apikey.WithPrincipal(c, p); c.Next() },
+		rl.Middleware(1), func(c *gin.Context) {
+			SetTxCount(c, 3) // nominal would be 1 + 3×10, but ChargeTxs never ran
+			c.Status(http.StatusAccepted)
+		})
+	e.ServeHTTP(httptest.NewRecorder(), httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/x", nil))
+	entries := agg.Drain()
+	require.Len(t, entries, 1)
+	require.EqualValues(t, 1, entries[0].Units)
+}
+
+type grantAll struct{}
+
+func (grantAll) ReserveQuota(_ context.Context, _ string, _ time.Time, want, _ int64) (int64, int64, error) {
+	return want, want, nil
+}
+
+// TestRecorderCountsPanickingRequests pins that a request whose handler
+// panics is still counted (as 5xx), and the panic still reaches recovery.
+func TestRecorderCountsPanickingRequests(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	agg := NewAggregator(100)
+	rec := NewRecorder(agg, []string{testSource}, 10)
+	e := gin.New()
+	e.Use(gin.CustomRecovery(func(c *gin.Context, _ any) { c.AbortWithStatus(http.StatusInternalServerError) }))
+	e.GET("/x", rec.Middleware(testEndpoint, 10), func(c *gin.Context) {
+		apikey.WithPrincipal(c, apikey.Principal{KeyID: "acme:k1", Provider: testSource, ProviderKeyID: "k1"})
+		panic("boom")
+	})
+	w := httptest.NewRecorder()
+	e.ServeHTTP(w, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/x", nil))
+	require.Equal(t, http.StatusInternalServerError, w.Code, "the panic still reaches recovery")
+	entries := agg.Drain()
+	require.Len(t, entries, 1)
+	require.Equal(t, Class5xx, entries[0].Class)
 }

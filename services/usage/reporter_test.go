@@ -83,3 +83,37 @@ func TestReporterFlushesEarlyWhenFull(t *testing.T) {
 	agg.Add(Bucket{Source: testSource, KeyID: "b", Endpoint: testEndpoint, Class: Class2xx, Day: "d"}, 1) // full
 	require.Eventually(t, func() bool { return len(acme.all()) == 1 }, time.Second, 5*time.Millisecond)
 }
+
+// blockingSink holds Send until its context ends.
+type blockingSink struct {
+	fakeSink
+
+	entered chan struct{}
+}
+
+func (b *blockingSink) Send(ctx context.Context, e []Entry) {
+	select {
+	case b.entered <- struct{}{}:
+	default:
+	}
+	<-ctx.Done()
+	b.fakeSink.Send(ctx, e)
+}
+
+// TestReporterCloseCancelsAFlushInProgress pins that Close abandons a flush
+// already running rather than waiting on it past the shutdown deadline.
+func TestReporterCloseCancelsAFlushInProgress(t *testing.T) {
+	agg := NewAggregator(1)
+	sink := &blockingSink{fakeSink: fakeSink{name: testSource}, entered: make(chan struct{}, 1)}
+	r := NewReporter(agg, []Sink{sink}, time.Hour, zap.NewNop())
+	r.Start(context.Background())
+	agg.Add(Bucket{Source: testSource, KeyID: "a", Endpoint: testEndpoint, Class: Class2xx, Day: "d"}, 1)
+	agg.Add(Bucket{Source: testSource, KeyID: "b", Endpoint: testEndpoint, Class: Class2xx, Day: "d"}, 1) // full: flush starts
+	<-sink.entered
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	start := time.Now()
+	r.Close(ctx) // the final flush blocks on this ctx, so it returns at the deadline at the latest
+	require.Less(t, time.Since(start), 3*time.Second)
+}

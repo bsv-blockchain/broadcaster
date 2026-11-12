@@ -26,7 +26,7 @@ type Reporter struct {
 	logger   *zap.Logger
 
 	flushMu   sync.Mutex // one flush at a time: sinks are single-threaded
-	stop      chan struct{}
+	cancel    context.CancelFunc
 	done      chan struct{}
 	started   bool
 	closeOnce sync.Once
@@ -40,12 +40,15 @@ func NewReporter(agg *Aggregator, sinks []Sink, interval time.Duration, logger *
 	}
 	return &Reporter{
 		agg: agg, sinks: m, interval: interval, logger: logger.Named("usage"),
-		stop: make(chan struct{}), done: make(chan struct{}),
+		cancel: func() {}, done: make(chan struct{}),
 	}
 }
 
-// Start runs the flush loop until Close.
+// Start runs the flush loop until Close (or ctx ends). Flushes run under a
+// context Close cancels, so a flush in progress at shutdown is abandoned
+// rather than outliving the shutdown deadline.
 func (r *Reporter) Start(ctx context.Context) {
+	ctx, r.cancel = context.WithCancel(ctx)
 	r.started = true
 	go func() {
 		defer close(r.done)
@@ -53,8 +56,6 @@ func (r *Reporter) Start(ctx context.Context) {
 		defer timer.Stop()
 		for {
 			select {
-			case <-r.stop:
-				return
 			case <-ctx.Done():
 				return
 			case <-timer.C:
@@ -86,15 +87,23 @@ func (r *Reporter) Flush(ctx context.Context) {
 	}
 }
 
-// Close stops the loop, then flushes once more within ctx (call it after
-// the HTTP server has drained, so the last requests are counted). Whatever
-// is still undelivered is dropped and counted. Safe to call more than once
-// (the api-server's Stop can run twice); only the first call does anything.
+// Close stops the loop, cancelling any flush in progress, then flushes once
+// more within ctx (call it after the HTTP server has drained, so the last
+// requests are counted). Whatever is still undelivered is dropped and
+// counted. Nothing here outlives ctx: if the cancelled flush hasn't
+// returned by then, the final flush is skipped and the counts are lost
+// (and logged). Safe to call more than once (the api-server's Stop can run
+// twice); only the first call does anything.
 func (r *Reporter) Close(ctx context.Context) {
 	r.closeOnce.Do(func() {
-		close(r.stop)
+		r.cancel()
 		if r.started {
-			<-r.done
+			select {
+			case <-r.done:
+			case <-ctx.Done():
+				r.logger.Warn("usage flush in progress did not stop before the shutdown deadline; final usage report skipped")
+				return
+			}
 		}
 		r.Flush(ctx)
 		r.flushMu.Lock()

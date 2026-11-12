@@ -455,8 +455,11 @@ never reported. Each request lands in a cell of:
 - the UTC day the request finished.
 
 Each cell holds a count and `units`, the cost units the request was charged.
-That is the route's cost, plus `costs.submit_tx` per transaction of an
-accepted `/txs` batch (a batch counts as one request), and 0 for a 429.
+With rate limiting on, that is what the limiter granted: the route's cost,
+plus `costs.submit_tx` per transaction of an accepted `/txs` batch (a batch
+counts as one request). A request it refused, or whose client hung up before
+the charge, gets 0, and a 429 is always 0. With rate limiting off it is the
+same nominal cost. A request whose handler panics is counted as `5xx`.
 
 **Protocol.** Every `flush_interval_ms` (±10%), at shutdown after the
 listeners drain, and early if `max_buckets` fills, each replica sends what
@@ -485,16 +488,19 @@ may already have recorded is never resent:
 | `200` | Done. |
 | `503`, `429` | Kept and retried after `Retry-After` (capped at 5 minutes), else 60s. |
 | `401`, `403` | Kept and retried after 5 minutes; logged (fix the token). |
-| no connection (the request was never written) | Kept, retried after 30s. |
+| could not connect (dial, DNS or TLS handshake failure: nothing was sent) | Kept, retried after 30s. |
 | `502`, any other status, a timeout once the request was written | **Dropped**: it may already be counted. |
 | `400` | That batch is dropped and logged; later batches still go. |
 | `501` | Reporting to that provider stops until restart. |
 
 Kept batches wait, intact and oldest first, in a queue bounded by
-`max_pending_entries`; when it is full the oldest are dropped. Every batch
+`max_pending_entries`, which bounds only what is left undelivered after a
+flush; when it is full the oldest are dropped. Every batch
 carries an `Idempotency-Key`, so a provider that de-duplicates on it can
 later let the broadcaster retry uncertain batches too. A replica that
-crashes loses at most one flush interval of counts.
+crashes loses at most one flush interval of counts. On shutdown a flush in
+progress is cancelled, and the final report must finish within
+`shutdown_flush_timeout_ms`.
 
 Metrics: `bsv_broadcaster_usage_requests_total{source,endpoint,class}`,
 `bsv_broadcaster_usage_flush_total{sink,result}`,

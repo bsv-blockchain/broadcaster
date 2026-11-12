@@ -8,6 +8,7 @@ import (
 
 	"github.com/bsv-blockchain/broadcaster/metrics"
 	"github.com/bsv-blockchain/broadcaster/services/apikey"
+	"github.com/bsv-blockchain/broadcaster/services/ratelimit"
 )
 
 const ctxTxCount = "usage.tx_count"
@@ -50,31 +51,48 @@ func NewRecorder(agg *Aggregator, providers []string, submitCost int64) *Recorde
 // Middleware counts requests to the route named endpoint, whose base cost
 // is baseUnits. Install it outermost, ahead of identification and the rate
 // limiter, so it sees their outcome: it records after the rest of the chain
-// has run, and only for a caller whose key resolved.
+// has run (or panicked: a panicking request is counted as 5xx, then the
+// panic continues to the router's recovery), and only for a caller whose
+// key resolved.
 //
-// Units are what the request was charged: the base cost, plus submitCost
-// per transaction of an accepted batch, and 0 for a 429 (the limiter
-// granted nothing worth billing).
+// Units are what the request was charged. With a rate limiter that is what
+// the limiter granted (ratelimit.Charged): nothing for a request it
+// refused or whose client hung up before the charge. Without one it is the
+// nominal cost: baseUnits plus submitCost per transaction of an accepted
+// batch. A 429 is always 0.
 func (r *Recorder) Middleware(endpoint string, baseUnits int64) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		defer func() {
+			if v := recover(); v != nil {
+				r.record(c, endpoint, baseUnits, http.StatusInternalServerError)
+				panic(v)
+			}
+		}()
 		c.Next()
-		p := apikey.PrincipalFrom(c)
-		if p.Provider == "" || !r.providers[p.Provider] {
-			return
-		}
-		status := c.Writer.Status()
-		class := Classify(status)
-		var units int64
-		if status != http.StatusTooManyRequests {
+		r.record(c, endpoint, baseUnits, c.Writer.Status())
+	}
+}
+
+func (r *Recorder) record(c *gin.Context, endpoint string, baseUnits int64, status int) {
+	p := apikey.PrincipalFrom(c)
+	if p.Provider == "" || !r.providers[p.Provider] {
+		return
+	}
+	class := Classify(status)
+	var units int64
+	if status != http.StatusTooManyRequests {
+		if charged, limited := ratelimit.Charged(c); limited {
+			units = charged
+		} else {
 			units = baseUnits + txCount(c)*r.submitCost
 		}
-		r.agg.Add(Bucket{
-			Source:   p.Provider,
-			KeyID:    p.ProviderKeyID,
-			Endpoint: endpoint,
-			Class:    class,
-			Day:      DayOf(r.now()),
-		}, units)
-		metrics.UsageRequestsTotal.WithLabelValues(p.Provider, endpoint, class).Inc()
 	}
+	r.agg.Add(Bucket{
+		Source:   p.Provider,
+		KeyID:    p.ProviderKeyID,
+		Endpoint: endpoint,
+		Class:    class,
+		Day:      DayOf(r.now()),
+	}, units)
+	metrics.UsageRequestsTotal.WithLabelValues(p.Provider, endpoint, class).Inc()
 }

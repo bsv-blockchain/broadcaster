@@ -4,12 +4,15 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
-	"net/http/httptrace"
 	"strconv"
 	"time"
 
@@ -137,7 +140,19 @@ func (s *HTTPSink) Send(ctx context.Context, entries []Entry) {
 			break
 		}
 	}
+	// Bound only what is left undelivered: a healthy receiver gets every
+	// fresh entry whatever max_pending_entries is.
+	s.trim()
 	metrics.UsagePendingEntries.WithLabelValues(s.name).Set(float64(s.pendingRows))
+}
+
+// trim drops the oldest pending chunks past maxPending.
+func (s *HTTPSink) trim() {
+	for s.pendingRows > s.maxPending && len(s.pending) > 0 {
+		s.drop(len(s.pending[0].entries), "overflow")
+		s.pendingRows -= len(s.pending[0].entries)
+		s.pending = s.pending[1:]
+	}
 }
 
 // DropPending discards everything still queued (shutdown).
@@ -147,8 +162,7 @@ func (s *HTTPSink) DropPending(reason string) {
 	metrics.UsagePendingEntries.WithLabelValues(s.name).Set(0)
 }
 
-// enqueue chunks entries onto the pending queue, then trims the oldest
-// chunks past maxPending.
+// enqueue chunks entries onto the pending queue.
 func (s *HTTPSink) enqueue(entries []Entry) {
 	const envelope = len(`{"entries":[]}`)
 	cur := make([]wireEntry, 0, min(len(entries), maxChunkEntries))
@@ -182,19 +196,12 @@ func (s *HTTPSink) enqueue(entries []Entry) {
 		size += len(row) + 1
 	}
 	flush()
-	for s.pendingRows > s.maxPending && len(s.pending) > 0 {
-		s.drop(len(s.pending[0].entries), "overflow")
-		s.pendingRows -= len(s.pending[0].entries)
-		s.pending = s.pending[1:]
-	}
 }
 
 // deliver sends the head chunk and applies the outcome. It reports whether
 // the next chunk may be sent now.
 func (s *HTTPSink) deliver(ctx context.Context, c chunk) bool {
-	wrote := false
-	trace := &httptrace.ClientTrace{WroteRequest: func(httptrace.WroteRequestInfo) { wrote = true }}
-	req, err := http.NewRequestWithContext(httptrace.WithClientTrace(ctx, trace), http.MethodPost, s.url, bytes.NewReader(c.body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.url, bytes.NewReader(c.body))
 	if err != nil {
 		s.pop(resultRejected, "invalid")
 		s.log("usage request could not be built", zap.Error(err))
@@ -206,10 +213,7 @@ func (s *HTTPSink) deliver(ctx context.Context, c chunk) bool {
 
 	resp, err := s.client.Do(req)
 	if err != nil {
-		if ctx.Err() != nil && !wrote {
-			return false // shutting down before sending: leave it queued
-		}
-		if !wrote {
+		if notSent(err) {
 			s.pause(pauseNotSent, resultRetry)
 			s.log("usage report not sent; will retry", zap.Error(err))
 			return false
@@ -224,9 +228,12 @@ func (s *HTTPSink) deliver(ctx context.Context, c chunk) bool {
 
 	switch code := resp.StatusCode; code {
 	case http.StatusOK:
+		// Recorded; the body is informational. One that doesn't add up (a
+		// negative or excessive count) is ignored rather than trusted.
 		var r wireResult
-		if err := json.Unmarshal(raw, &r); err != nil {
-			r.Accepted = int64(len(c.entries)) // recorded; the body is informational
+		if err := json.Unmarshal(raw, &r); err != nil ||
+			r.Accepted < 0 || r.Dropped < 0 || r.Accepted+r.Dropped > int64(len(c.entries)) {
+			r = wireResult{Accepted: int64(len(c.entries))}
 		}
 		s.pending = s.pending[1:]
 		s.pendingRows -= len(c.entries)
@@ -295,6 +302,29 @@ func (s *HTTPSink) log(msg string, fields ...zap.Field) {
 	}
 	s.loggedAt[msg] = now
 	s.logger.Error(msg, fields...)
+}
+
+// notSent reports whether a failed call certainly never reached the
+// receiver: no connection was made (dial, DNS) or the TLS handshake failed,
+// both before any byte of the request is written. Anything else, a
+// timeout, a reset or a cancellation included, may have been received and
+// is treated as uncertain.
+func notSent(err error) bool {
+	var op *net.OpError
+	if errors.As(err, &op) && op.Op == "dial" {
+		return true
+	}
+	var dns *net.DNSError
+	if errors.As(err, &dns) {
+		return true
+	}
+	var (
+		cert     *tls.CertificateVerificationError
+		header   tls.RecordHeaderError
+		unknown  x509.UnknownAuthorityError
+		hostname x509.HostnameError
+	)
+	return errors.As(err, &cert) || errors.As(err, &header) || errors.As(err, &unknown) || errors.As(err, &hostname)
 }
 
 // retryAfter parses Retry-After (seconds or an HTTP date), capped at
