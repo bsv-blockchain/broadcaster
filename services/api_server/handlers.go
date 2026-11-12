@@ -28,6 +28,7 @@ import (
 	"github.com/bsv-blockchain/broadcaster/metrics"
 	"github.com/bsv-blockchain/broadcaster/models"
 	"github.com/bsv-blockchain/broadcaster/services/ratelimit"
+	"github.com/bsv-blockchain/broadcaster/services/usage"
 	"github.com/bsv-blockchain/broadcaster/store"
 	"github.com/bsv-blockchain/broadcaster/telemetry"
 	"github.com/bsv-blockchain/broadcaster/teranode"
@@ -1449,6 +1450,7 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 	if !ratelimit.CheckBatch(c, len(parsed)) || !ratelimit.ChargeTxs(c, len(parsed)) {
 		return
 	}
+	usage.SetTxCount(c, len(parsed))
 
 	// Phase 2: synchronous policy + script + fee validation per tx
 	// (merkle proofs on BEEF parents are trusted; see

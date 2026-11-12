@@ -18,6 +18,11 @@ type Principal struct {
 	QuotaID  string
 	Tier     string // the key's tier; config.TierAnonymous for anonymous callers
 	ClientIP string
+	// Provider and ProviderKeyID are set for a key verified by a
+	// delegated-auth provider (store.APIKey.Provider): usage is reported to
+	// that provider under its own key id. Empty for local keys.
+	Provider      string
+	ProviderKeyID string
 }
 
 // Anonymous reports whether the caller presented no key.

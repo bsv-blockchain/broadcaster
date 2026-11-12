@@ -64,9 +64,9 @@ func TestGuardedSharesIdentifyThrottleAcrossRoutes(t *testing.T) {
 
 	ok := func(c *gin.Context) { c.Status(http.StatusNoContent) }
 	router := gin.New()
-	router.GET("/route-a", srv.guarded(1, ok)...)
-	router.GET("/route-b", srv.guarded(1, ok)...)
-	router.GET("/route-c", srv.guarded(1, ok)...)
+	router.GET("/route-a", srv.guarded("v1/test", 1, ok)...)
+	router.GET("/route-b", srv.guarded("v1/test", 1, ok)...)
+	router.GET("/route-c", srv.guarded("v1/test", 1, ok)...)
 
 	call := func(path string) *httptest.ResponseRecorder {
 		// httptest.NewRequest defaults RemoteAddr to the same value

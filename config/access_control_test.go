@@ -40,6 +40,10 @@ func testIntrospectionProvider() IntrospectionProvider {
 	}
 }
 
+func testUsage() UsageConfig {
+	return UsageConfig{Enabled: true, FlushIntervalMs: 60_000, MaxBuckets: 100_000, MaxPendingEntries: 100_000, ShutdownFlushTimeoutMs: 10_000}
+}
+
 func TestValidateAccessControl(t *testing.T) {
 	t.Setenv("TEST_INTROSPECTION_TOKEN", "service-token")
 	cases := []struct {
@@ -214,6 +218,37 @@ func TestValidateAccessControl(t *testing.T) {
 			c.RateLimit.Enabled = false
 			c.RateLimit.Tiers[TierFree] = TierConfig{RetentionDays: 1}
 		}, "retention_days"},
+		{"usage reported to a provider", func(c *Config) {
+			p := testIntrospectionProvider()
+			p.UsageURL = "https://auth.example.com/v1/usage"
+			c.Auth.Introspection = map[string]IntrospectionProvider{testProvider: p}
+			c.Usage = testUsage()
+		}, ""},
+		{"usage enabled with no provider usage_url", func(c *Config) {
+			c.Auth.Introspection = map[string]IntrospectionProvider{testProvider: testIntrospectionProvider()}
+			c.Usage = testUsage()
+		}, "no auth.introspection provider sets usage_url"},
+		{"usage enabled without auth", func(c *Config) {
+			c.Auth.Enabled, c.RateLimit.Enabled = false, false
+			c.Usage = testUsage()
+		}, "usage.enabled requires auth.enabled"},
+		{"usage flush interval too short", func(c *Config) {
+			p := testIntrospectionProvider()
+			p.UsageURL = "https://auth.example.com/v1/usage"
+			c.Auth.Introspection = map[string]IntrospectionProvider{testProvider: p}
+			c.Usage = testUsage()
+			c.Usage.FlushIntervalMs = 1000
+		}, "usage.flush_interval_ms"},
+		{"usage_url plain http to a remote host", func(c *Config) {
+			p := testIntrospectionProvider()
+			p.UsageURL = "http://auth.example.com/v1/usage"
+			c.Auth.Introspection = map[string]IntrospectionProvider{testProvider: p}
+		}, "usage_url must be an absolute https URL"},
+		{"usage_url with a query", func(c *Config) {
+			p := testIntrospectionProvider()
+			p.UsageURL = "https://auth.example.com/v1/usage?x=1"
+			c.Auth.Introspection = map[string]IntrospectionProvider{testProvider: p}
+		}, "usage_url must not contain a query"},
 		{"ratelimit without auth", func(c *Config) { c.Auth.Enabled = false }, "requires auth.enabled"},
 		{"auth with zero cache ttl", func(c *Config) { c.RateLimit.KeyCacheTTLMs = 0 }, "key_cache_ttl_ms"},
 		{"stale shorter than ttl", func(c *Config) { c.RateLimit.KeyCacheStaleMaxMs = 1 }, "key_cache_ttl_ms"},
@@ -466,5 +501,29 @@ func TestRetentionDaysBind(t *testing.T) {
 	}
 	if cfg.RateLimit.Anonymous.RetentionDays != 30 || cfg.RateLimit.Tiers[TierFree].RetentionDays != 90 {
 		t.Errorf("env overrides: anonymous=%d free=%d, want 30/90", cfg.RateLimit.Anonymous.RetentionDays, cfg.RateLimit.Tiers[TierFree].RetentionDays)
+	}
+}
+
+// TestUsageDefaultsBind pins the shipped usage defaults (off, 60s flushes)
+// and that BSV_BROADCASTER_USAGE_* overrides bind.
+func TestUsageDefaultsBind(t *testing.T) {
+	viper.Reset()
+	t.Cleanup(viper.Reset)
+	cfg, err := Load(&cobra.Command{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Usage.Enabled || cfg.Usage.FlushIntervalMs != 60_000 || cfg.Usage.MaxBuckets != 100_000 ||
+		cfg.Usage.MaxPendingEntries != 100_000 || cfg.Usage.ShutdownFlushTimeoutMs != 10_000 {
+		t.Fatalf("usage defaults = %+v", cfg.Usage)
+	}
+	viper.Reset()
+	t.Setenv("BSV_BROADCASTER_USAGE_FLUSH_INTERVAL_MS", "30000")
+	cfg, err = Load(&cobra.Command{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Usage.FlushIntervalMs != 30_000 {
+		t.Errorf("BSV_BROADCASTER_USAGE_FLUSH_INTERVAL_MS override = %d", cfg.Usage.FlushIntervalMs)
 	}
 }

@@ -144,6 +144,7 @@ type Config struct {
 	Auth          AuthConfig          `mapstructure:"auth"`
 	Admin         AdminConfig         `mapstructure:"admin"`
 	RateLimit     RateLimitConfig     `mapstructure:"ratelimit"`
+	Usage         UsageConfig         `mapstructure:"usage"`
 	// ChaintracksServer gates whether the embedded go-chaintracks HTTP API
 	// runs alongside api-server. Default is on so the refactor is a drop-in
 	// replacement for the original single-binary BSV Broadcaster.
@@ -254,6 +255,11 @@ type IntrospectionProvider struct {
 	// TimeoutMs bounds each introspection call. 0 means
 	// DefaultIntrospectionTimeoutMs.
 	TimeoutMs int `mapstructure:"timeout_ms"`
+	// UsageURL, when set, is the provider's usage endpoint: with
+	// usage.enabled, the api-server reports what each of this provider's
+	// keys used there, under the provider's own key id. Same URL rules and
+	// service token as URL. See docs/api-keys.md.
+	UsageURL string `mapstructure:"usage_url"`
 	// Tiers maps the tier names the provider returns to ratelimit.tiers
 	// names. A provider tier missing here gets free, so a provider can only
 	// grant the tiers the operator maps. Provider tier names match
@@ -285,6 +291,40 @@ func (p IntrospectionProvider) Timeout() time.Duration {
 		return DefaultIntrospectionTimeoutMs * time.Millisecond
 	}
 	return time.Duration(p.TimeoutMs) * time.Millisecond
+}
+
+// UsageConfig meters API usage per key and reports it to the delegated-auth
+// providers that set auth.introspection.<name>.usage_url. Off by default.
+type UsageConfig struct {
+	Enabled bool `mapstructure:"enabled"`
+	// FlushIntervalMs is how often each replica reports what it counted.
+	FlushIntervalMs int `mapstructure:"flush_interval_ms"`
+	// MaxBuckets bounds the (key, route, status class, day) cells a replica
+	// holds between flushes; past it new cells are dropped and counted.
+	MaxBuckets int `mapstructure:"max_buckets"`
+	// MaxPendingEntries bounds, per provider, the entries kept for a retry
+	// while the provider is unavailable; the oldest are dropped first.
+	MaxPendingEntries int `mapstructure:"max_pending_entries"`
+	// ShutdownFlushTimeoutMs bounds the final report on shutdown.
+	ShutdownFlushTimeoutMs int `mapstructure:"shutdown_flush_timeout_ms"`
+}
+
+// Usage reporting bounds.
+const (
+	MinUsageFlushIntervalMs = 10_000
+	MaxUsageFlushIntervalMs = 3_600_000
+)
+
+// UsageProviders are the auth.introspection providers with a usage_url, in
+// name order.
+func (c *Config) UsageProviders() []string {
+	var out []string
+	for _, name := range slices.Sorted(maps.Keys(c.Auth.Introspection)) {
+		if c.Auth.Introspection[name].UsageURL != "" {
+			out = append(out, name)
+		}
+	}
+	return out
 }
 
 // AuthStoreConfig is auth.store. Only MongoDB is supported.
@@ -1576,6 +1616,13 @@ func setDefaults() {
 	viper.SetDefault("admin.port", 8090)
 	viper.SetDefault("admin.token", "")
 	viper.SetDefault("ratelimit.enabled", false)
+	// Usage reporting ships off; each key is declared so
+	// BSV_BROADCASTER_USAGE_* overrides bind.
+	viper.SetDefault("usage.enabled", false)
+	viper.SetDefault("usage.flush_interval_ms", 60_000)
+	viper.SetDefault("usage.max_buckets", 100_000)
+	viper.SetDefault("usage.max_pending_entries", 100_000)
+	viper.SetDefault("usage.shutdown_flush_timeout_ms", 10_000)
 	viper.SetDefault("ratelimit.lease_fraction", 0.10)
 	viper.SetDefault("ratelimit.shrink_threshold", 0.80)
 	viper.SetDefault("ratelimit.key_cache_ttl_ms", 30000)
@@ -2135,15 +2182,13 @@ func validateIntrospection(cfg *Config) error {
 			}
 		}
 		prefixes[p.KeyPrefix] = field
-		u, err := url.Parse(p.URL)
-		if err != nil || u.Host == "" || (u.Scheme != "https" && (u.Scheme != "http" || !isLoopbackHost(u.Hostname()))) {
-			return fmt.Errorf("%s.url must be an absolute https URL (http only on a loopback host)", field)
+		if err := validateProviderURL(field+".url", p.URL); err != nil {
+			return err
 		}
-		if u.User != nil {
-			return fmt.Errorf("%s.url must not contain user info; the service token authenticates", field)
-		}
-		if u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
-			return fmt.Errorf("%s.url must not contain a query or fragment", field)
+		if p.UsageURL != "" {
+			if err := validateProviderURL(field+".usage_url", p.UsageURL); err != nil {
+				return err
+			}
 		}
 		switch {
 		case p.Token != "" && p.TokenEnv != "":
@@ -2166,6 +2211,44 @@ func validateIntrospection(cfg *Config) error {
 		if p.TimeoutMs < 0 || p.TimeoutMs > MaxIntrospectionTimeoutMs {
 			return fmt.Errorf("%s.timeout_ms must be between 0 (default %d) and %d", field, DefaultIntrospectionTimeoutMs, MaxIntrospectionTimeoutMs)
 		}
+	}
+	return nil
+}
+
+// validateProviderURL applies the rules for a URL the service token is sent
+// to: absolute https (http only on a loopback host), no user info, query or
+// fragment. field names it in the error.
+func validateProviderURL(field, raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" || (u.Scheme != "https" && (u.Scheme != "http" || !isLoopbackHost(u.Hostname()))) {
+		return fmt.Errorf("%s must be an absolute https URL (http only on a loopback host)", field)
+	}
+	if u.User != nil {
+		return fmt.Errorf("%s must not contain user info; the service token authenticates", field)
+	}
+	if u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
+		return fmt.Errorf("%s must not contain a query or fragment", field)
+	}
+	return nil
+}
+
+// validateUsage checks usage.*.
+func validateUsage(cfg *Config) error {
+	u := cfg.Usage
+	if !u.Enabled {
+		return nil
+	}
+	if !cfg.Auth.Enabled {
+		return fmt.Errorf("usage.enabled requires auth.enabled")
+	}
+	if len(cfg.UsageProviders()) == 0 {
+		return fmt.Errorf("usage.enabled but no auth.introspection provider sets usage_url: there is nowhere to report usage")
+	}
+	if u.FlushIntervalMs < MinUsageFlushIntervalMs || u.FlushIntervalMs > MaxUsageFlushIntervalMs {
+		return fmt.Errorf("usage.flush_interval_ms must be between %d and %d", MinUsageFlushIntervalMs, MaxUsageFlushIntervalMs)
+	}
+	if u.MaxBuckets <= 0 || u.MaxPendingEntries <= 0 || u.ShutdownFlushTimeoutMs <= 0 {
+		return fmt.Errorf("usage.max_buckets, usage.max_pending_entries and usage.shutdown_flush_timeout_ms must be > 0")
 	}
 	return nil
 }
@@ -2237,6 +2320,9 @@ func validateAccessControl(cfg *Config) error {
 		return err
 	}
 	if err := validateIntrospection(cfg); err != nil {
+		return err
+	}
+	if err := validateUsage(cfg); err != nil {
 		return err
 	}
 	if err := validateRetention(cfg.RateLimit); err != nil {

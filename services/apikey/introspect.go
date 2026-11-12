@@ -267,10 +267,12 @@ func (in *Introspector) introspect(ctx context.Context, hash string) (k *store.A
 		return nil, introspectError, 0, fmt.Errorf("introspect %s: valid answer without key_id", in.name)
 	}
 	k = &store.APIKey{
-		ID:     in.namespaced(r.KeyID),
-		Hash:   hash,
-		Tier:   in.localTier(r.Tier),
-		Status: store.APIKeyActive,
+		ID:            in.namespaced(r.KeyID),
+		Provider:      in.name,
+		ProviderKeyID: r.KeyID,
+		Hash:          hash,
+		Tier:          in.localTier(r.Tier),
+		Status:        store.APIKeyActive,
 	}
 	if r.LimitID != "" {
 		k.LimitID = in.namespaced(r.LimitID)

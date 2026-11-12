@@ -513,6 +513,15 @@ auth:
   #     timeout_ms: 3000
   #     tiers:                                # provider tier -> ratelimit.tiers name
   #       basic: free
+  #     usage_url: https://auth.example.com/v1/usage  # optional: report this provider's key usage (usage.enabled)
+# Per-key usage reporting to delegated-auth providers that set usage_url.
+# Off by default; requires auth.enabled. See docs/api-keys.md.
+usage:
+  enabled: false
+  flush_interval_ms: 60000
+  max_buckets: 100000
+  max_pending_entries: 100000
+  shutdown_flush_timeout_ms: 10000
 admin:
   enabled: false
   host: 127.0.0.1       # kubectl port-forward works with this; set 0.0.0.0 to opt in to in-cluster tooling reaching it directly
