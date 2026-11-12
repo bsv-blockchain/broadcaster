@@ -1435,11 +1435,13 @@ func Load(cmd *cobra.Command) (*Config, error) {
 	if len(legacyEnv) > 0 {
 		cfg.Deprecations = append(cfg.Deprecations, fmt.Sprintf(
 			"environment variables with the legacy %s_ prefix are deprecated; rename them to %s_*: %s",
-			LegacyEnvPrefix, EnvPrefix, strings.Join(legacyEnv, ", ")))
+			LegacyEnvPrefix, EnvPrefix, strings.Join(legacyEnv, ", "),
+		))
 	}
 	if used := viper.ConfigFileUsed(); strings.HasPrefix(used, legacyConfigDir+"/") {
 		cfg.Deprecations = append(cfg.Deprecations, fmt.Sprintf(
-			"config file %s is in the legacy directory %s; move it to /etc/bsv-broadcaster", used, legacyConfigDir))
+			"config file %s is in the legacy directory %s; move it to /etc/bsv-broadcaster", used, legacyConfigDir,
+		))
 	}
 
 	return &cfg, nil
