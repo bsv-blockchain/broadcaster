@@ -1028,7 +1028,6 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 		var existing *models.TransactionStatus
 		var dedupErr error
 		existing, inserted, dedupErr = s.store.GetOrInsertStatus(c.Request.Context(), row)
-		s.extendOnResubmit(c.Request.Context(), txid, existing, inserted, dedupErr, opts.ExpiresAt)
 		switch {
 		case dedupErr != nil || (!inserted && existing == nil):
 			// The propagation message carries the txid only (#329), so a
@@ -1036,6 +1035,11 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 			// consumer would have no raw tx to load. Shed it like
 			// backpressure; the retry's CAS inserts or finds the row.
 			s.logger.Error("dedup CAS failed", logfields.TxID(txid), zap.Error(dedupErr))
+			respondStoreUnavailable(c)
+			return
+		case s.extendOnResubmit(c.Request.Context(), txid, existing, inserted, opts.ExpiresAt) != nil:
+			// A resubmit whose row could not be extended to this caller's
+			// retention: nothing published yet, the retry repeats the extend.
 			respondStoreUnavailable(c)
 			return
 		case !inserted && shouldRepublishExisting(existing.Status):
@@ -1309,7 +1313,11 @@ func (s *Server) persistRejectedAtIntake(ctx context.Context, txid, reason strin
 		ExpiresAt:  expiresAt,
 	}
 	existing, inserted, err := s.store.GetOrInsertStatus(ctx, row)
-	s.extendOnResubmit(ctx, txid, existing, inserted, err, expiresAt)
+	// The client already has its 400; a failed extension here is logged and
+	// counted (extendOnResubmit), and the row keeps its earlier retention.
+	if err == nil {
+		_ = s.extendOnResubmit(ctx, txid, existing, inserted, expiresAt)
+	}
 	if err != nil {
 		s.logger.Warn(
 			"intake rejection persist failed",
@@ -1518,7 +1526,6 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 				ExpiresAt:    opts.ExpiresAt,
 			}
 			existing, inserted, dedupErr := s.store.GetOrInsertStatus(ctx, row)
-			s.extendOnResubmit(ctx, p.txid, existing, inserted, dedupErr, opts.ExpiresAt)
 			switch {
 			case dedupErr != nil || (!inserted && existing == nil):
 				// Row state unknown: a txid-only message (#329) cannot be
@@ -1526,6 +1533,10 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 				// reaches Kafka; rows already inserted are RECEIVED, which
 				// the retry republishes (shouldRepublishExisting).
 				s.logger.Error("dedup CAS failed", logfields.TxID(p.txid), zap.Error(dedupErr))
+				s.shedBatch(c, receivedTxIDs, receivedAt, opts)
+				return
+			case s.extendOnResubmit(ctx, p.txid, existing, inserted, opts.ExpiresAt) != nil:
+				// Nothing reached Kafka yet; the retry repeats the extend.
 				s.shedBatch(c, receivedTxIDs, receivedAt, opts)
 				return
 			case !inserted && shouldRepublishExisting(existing.Status):

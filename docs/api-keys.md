@@ -185,17 +185,30 @@ retention) is not an error, but its later status updates are dropped.
   `ratelimit.enabled` is set.
 - The expiry is stamped when a row is written: `now + retention_days`. A later
   tier change does not move it.
-- **Resubmits extend, never shorten.** When another caller submits a
-  transaction that is already stored, its row's expiry moves out to that
-  caller's if that is more than a day later. Resubmitting therefore also
-  keeps a row alive. A keep-forever caller removes the expiry, and a row
-  already kept forever never gains one. Each caller's submission row keeps
-  its own expiry. Normally that is no later than the transaction row's, but
-  the extension is best-effort: if it fails, a submission can outlive its
-  transaction row, and `GET /tx` then answers `404` for that txid.
-- Set `ratelimit.anonymous.retention_days` too: unkeyed callers otherwise
-  keep their rows forever, and their resubmits make any row they touch
-  permanent.
+- **Resubmits extend, never shorten.** When a caller submits a transaction
+  that is already stored, the row's expiry moves out to that caller's, so a
+  transaction lives `retention_days` after the latest submission entitled to
+  the most. To avoid a write on every resubmit (clients that poll by
+  resubmitting), the row is only rewritten when the new expiry is later by
+  more than a thirtieth of the retention, at most a day: a 7-day row by
+  more than about 5.6 hours, a 90-day row by more than a day. So a row
+  can expire up to that much earlier than "retention after my last
+  submission".
+- A keep-forever caller removes the expiry, and a row already kept forever
+  never gains one.
+- If the extension fails, `POST /tx` and `POST /txs` answer `503` with
+  `Retry-After` instead of acknowledging the submission, and the client's
+  retry repeats it (extending is idempotent). The failure is counted in
+  `bsv_broadcaster_retention_extend_failures_total`. An intake rejection
+  (`400`) only counts it.
+- Each caller's submission row keeps its own expiry, normally no later than
+  the transaction row's. It can be later only if an extension failed on the
+  intake-rejection path; `GET /tx` then answers `404` for that txid once the
+  transaction row is gone.
+- **Set `ratelimit.anonymous.retention_days`.** Left at `0`, unkeyed callers
+  keep their rows forever. Since keep-forever removes an expiry, anyone can
+  resubmit a transaction's public raw bytes without a key and make its row
+  permanent, whatever tier first submitted it.
 - Rows written before retention was configured have no expiry and are
   kept forever.
 
@@ -207,10 +220,11 @@ once a minute). On Postgres, Pebble and Aerospike, rows are kept forever and
 the api-server logs a warning at boot when a tier configures retention.
 
 The indexes are built only once retention is configured, by the
-api-server at boot (bounded by `store.mongodb.index_timeout_ms`); upgrading
-without configuring retention builds nothing. A failed or timed-out build
-is logged, not fatal: rows are still stamped and expire once the indexes
-exist. On a large `transactions` collection, create them ahead of the
+api-server in the background after boot (bounded by
+`store.mongodb.index_timeout_ms`), so readiness does not wait on them.
+Upgrading without configuring retention builds nothing. A failed or
+timed-out build is logged, not fatal: rows are still stamped and expire once
+the indexes exist. On a large `transactions` collection, create them ahead of the
 deploy (same names, keys and options) so boot finds them in place:
 
 ```js

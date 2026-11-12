@@ -8,15 +8,19 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/bsv-blockchain/broadcaster/logfields"
+	"github.com/bsv-blockchain/broadcaster/metrics"
 	"github.com/bsv-blockchain/broadcaster/models"
 	"github.com/bsv-blockchain/broadcaster/services/apikey"
 	"github.com/bsv-blockchain/broadcaster/store"
 )
 
-// extendSlack is how much later a resubmitter's expiry must be than the
-// row's before the row is rewritten. Without it every resubmit by a caller
-// of the same tier (clients that poll by resubmitting) would be a write.
-const extendSlack = 24 * time.Hour
+// maxExtendSlack bounds how much later a resubmitter's expiry must be than
+// the row's before the row is rewritten. Without a slack every resubmit by
+// a caller of the same tier (clients that poll by resubmitting) would be a
+// write. The slack is a thirtieth of the retention, capped here, so a short
+// retention is not cut noticeably short: a 7-day row is refreshed by a
+// resubmit more than ~5.6h after its last extension.
+const maxExtendSlack = 24 * time.Hour
 
 // initRetention enables per-tier data retention when a tier configures
 // retention_days and the store can enforce it, and provisions what deletes
@@ -35,10 +39,15 @@ func (s *Server) initRetention(ctx context.Context) {
 			zap.String("backend", s.cfg.Store.Backend))
 		return
 	}
-	if err := ext.EnsureRetentionIndexes(ctx); err != nil {
-		s.logger.Error("could not provision retention indexes; expired rows are not deleted until they exist", zap.Error(err))
-	}
 	s.retention = ext
+	// In the background: on a large collection the build can take up to
+	// index_timeout_ms, and readiness must not wait on it. Rows are stamped
+	// meanwhile and expire once the indexes exist.
+	go func() {
+		if err := ext.EnsureRetentionIndexes(ctx); err != nil {
+			s.logger.Error("could not provision retention indexes; expired rows are not deleted until they exist", zap.Error(err))
+		}
+	}()
 }
 
 // retentionExpiry is when the rows this request writes may be deleted,
@@ -56,39 +65,38 @@ func (s *Server) retentionExpiry(c *gin.Context) *time.Time {
 	return &t
 }
 
-// extendOnResubmit extends an existing row's retention after a
+// extendOnResubmit extends an existing row's retention after a successful
 // GetOrInsertStatus that found the row already there (a resubmit). A fresh
-// insert already carries this request's expiry, and a failed CAS leaves the
-// row state unknown.
-func (s *Server) extendOnResubmit(ctx context.Context, txid string, existing *models.TransactionStatus, inserted bool, err error, until *time.Time) {
-	if err != nil || inserted || existing == nil || !extends(existing.ExpiresAt, until) {
-		return
+// insert already carries this request's expiry. Callers handle a failed
+// CAS first: it leaves the row state unknown.
+//
+// A failed extension is returned: the caller answers 503 so the client's
+// retry repeats it (extending is idempotent), rather than acknowledging a
+// submission whose row would expire before the caller's retention.
+func (s *Server) extendOnResubmit(ctx context.Context, txid string, existing *models.TransactionStatus, inserted bool, until *time.Time) error {
+	if s.retention == nil || inserted || existing == nil || !extends(existing.ExpiresAt, until, time.Now()) {
+		return nil
 	}
-	s.extendRetention(ctx, txid, until)
+	if err := s.retention.ExtendTransactionExpiry(ctx, txid, until); err != nil {
+		metrics.RetentionExtendFailuresTotal.Inc()
+		s.logger.Error("could not extend transaction retention", logfields.TxID(txid), zap.Error(err))
+		return err
+	}
+	return nil
 }
 
 // extends reports whether until is meaningfully longer retention than the
 // row's current expiry: forever beats any date, nothing beats forever, and
-// a later date must be more than extendSlack later to be worth a write.
-func extends(current, until *time.Time) bool {
+// a later date must beat the current one by the slack (a thirtieth of the
+// retention until represents, at most maxExtendSlack) to be worth a write.
+func extends(current, until *time.Time, now time.Time) bool {
 	switch {
 	case current == nil:
 		return false
 	case until == nil:
 		return true
 	default:
-		return until.Sub(*current) > extendSlack
-	}
-}
-
-// extendRetention raises an existing transaction row's expiry to this
-// submitter's, so a row lives as long as its most entitled submitter needs.
-// Best-effort: a failure leaves the row's earlier retention in place.
-func (s *Server) extendRetention(ctx context.Context, txid string, until *time.Time) {
-	if s.retention == nil {
-		return
-	}
-	if err := s.retention.ExtendTransactionExpiry(ctx, txid, until); err != nil {
-		s.logger.Warn("could not extend transaction retention", logfields.TxID(txid), zap.Error(err))
+		slack := min(maxExtendSlack, until.Sub(now)/30)
+		return until.Sub(*current) > slack
 	}
 }
