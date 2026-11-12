@@ -34,8 +34,8 @@ func (s *Server) initUsage(ctx context.Context) {
 			// redirect elsewhere.
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		}
-		sinks = append(sinks, usage.NewHTTPSink(name, p.UsageURL, p.ServiceToken(), client, s.cfg.Usage.MaxPendingEntries, s.logger))
-		s.logger.Info("reporting api key usage to provider", zap.String("provider", name))
+		sinks = append(sinks, usage.NewHTTPSink(name, p.UsageURL, p.ServiceToken(), s.cfg.UsageNetwork(), client, s.cfg.Usage.MaxPendingEntries, s.logger))
+		s.logger.Info("reporting api key usage to provider", zap.String("provider", name), zap.String("usage_network", s.cfg.UsageNetwork()))
 	}
 	metrics.PreRegisterUsage(providers)
 	s.usageRecorder = usage.NewRecorder(agg, providers, s.cfg.RateLimit.Costs.SubmitTx)

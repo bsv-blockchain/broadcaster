@@ -522,6 +522,7 @@ usage:
   max_buckets: 100000
   max_pending_entries: 100000
   shutdown_flush_timeout_ms: 10000
+  network: ""   # network name reported with usage; "" = this deployment's network
 admin:
   enabled: false
   host: 127.0.0.1       # kubectl port-forward works with this; set 0.0.0.0 to opt in to in-cluster tooling reaching it directly
