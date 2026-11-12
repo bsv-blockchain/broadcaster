@@ -307,6 +307,24 @@ type UsageConfig struct {
 	MaxPendingEntries int `mapstructure:"max_pending_entries"`
 	// ShutdownFlushTimeoutMs bounds the final report on shutdown.
 	ShutdownFlushTimeoutMs int `mapstructure:"shutdown_flush_timeout_ms"`
+	// Network is the network name reported with every usage entry, so a
+	// provider whose keys work on several deployments can tell them apart.
+	// Empty (the default) reports the deployment's `network`; set it when
+	// the provider names a network differently (e.g. "ttn" for
+	// teratestnet).
+	Network string `mapstructure:"network"`
+}
+
+// usageNetworkRe bounds usage.network: a short lowercase label.
+var usageNetworkRe = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,31}$`)
+
+// UsageNetwork is the network name reported with usage: usage.network,
+// else the deployment's network.
+func (c *Config) UsageNetwork() string {
+	if c.Usage.Network != "" {
+		return c.Usage.Network
+	}
+	return c.Network
 }
 
 // Usage reporting bounds.
@@ -1623,6 +1641,7 @@ func setDefaults() {
 	viper.SetDefault("usage.max_buckets", 100_000)
 	viper.SetDefault("usage.max_pending_entries", 100_000)
 	viper.SetDefault("usage.shutdown_flush_timeout_ms", 10_000)
+	viper.SetDefault("usage.network", "")
 	viper.SetDefault("ratelimit.lease_fraction", 0.10)
 	viper.SetDefault("ratelimit.shrink_threshold", 0.80)
 	viper.SetDefault("ratelimit.key_cache_ttl_ms", 30000)
@@ -2249,6 +2268,9 @@ func validateUsage(cfg *Config) error {
 	}
 	if u.MaxBuckets <= 0 || u.MaxPendingEntries <= 0 || u.ShutdownFlushTimeoutMs <= 0 {
 		return fmt.Errorf("usage.max_buckets, usage.max_pending_entries and usage.shutdown_flush_timeout_ms must be > 0")
+	}
+	if u.Network != "" && !usageNetworkRe.MatchString(u.Network) {
+		return fmt.Errorf("usage.network %q must match %s", u.Network, usageNetworkRe.String())
 	}
 	return nil
 }

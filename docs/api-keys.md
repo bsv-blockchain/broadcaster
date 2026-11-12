@@ -434,6 +434,7 @@ usage:
   max_buckets: 100000           # cells held per replica between flushes
   max_pending_entries: 100000   # per provider, kept for a retry while it is down
   shutdown_flush_timeout_ms: 10000
+  network: ""                   # reported network name; "" = this deployment's `network`
 auth:
   introspection:
     acme:
@@ -471,9 +472,16 @@ Authorization: Bearer <service token>
 Content-Type: application/json
 Idempotency-Key: <stable per batch>
 
-{"entries": [{"key_id": "…", "endpoint": "v1/tx", "status_class": "2xx",
-              "date_utc": "2026-11-12", "count": 12, "units": 120}]}
+{"entries": [{"key_id": "…", "network": "mainnet", "endpoint": "v1/tx",
+              "status_class": "2xx", "date_utc": "2026-11-12", "count": 12, "units": 120}]}
 ```
+
+Every entry carries `network`, the network the deployment that served the
+requests runs on. A provider's key is often valid on several deployments
+(one per network, sharing an auth store), and this is how the provider tells
+their usage apart. It is the deployment's `network` unless `usage.network`
+overrides the reported name, for a provider that names a network differently
+(for example `ttn` for teratestnet).
 
 A call carries at most 1000 entries and 1 MiB. Counts are deltas: the
 receiver adds them up, so replicas and regions report independently. The

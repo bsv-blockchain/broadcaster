@@ -90,7 +90,7 @@ func (c *clock) advance(d time.Duration) { c.t = c.t.Add(d) }
 func newSink(t *testing.T, url string, timeout time.Duration, maxPending int) (*HTTPSink, *clock) {
 	t.Helper()
 	client := &http.Client{Timeout: timeout, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
-	s := NewHTTPSink(testSource, url, testToken, client, maxPending, zap.NewNop())
+	s := NewHTTPSink(testSource, url, testToken, "ttn", client, maxPending, zap.NewNop())
 	clk := &clock{t: time.Date(2026, 11, 12, 12, 0, 0, 0, time.UTC)}
 	s.now = clk.now
 	return s, clk
@@ -119,7 +119,7 @@ func TestHTTPSinkRequestShape(t *testing.T) {
 	require.Len(t, f.calls, 1)
 	require.Equal(t, "Bearer "+testToken, f.calls[0].auth)
 	require.NotEmpty(t, f.calls[0].idem)
-	require.Equal(t, []wireEntry{{KeyID: "c1566bac", Endpoint: "v1/txs", StatusClass: "429", DateUTC: "2026-11-11", Count: 2, Units: 0}}, f.calls[0].entries)
+	require.Equal(t, []wireEntry{{KeyID: "c1566bac", Network: "ttn", Endpoint: "v1/txs", StatusClass: "429", DateUTC: "2026-11-11", Count: 2, Units: 0}}, f.calls[0].entries)
 	require.Zero(t, s.Pending())
 }
 

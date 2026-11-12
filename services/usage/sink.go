@@ -48,6 +48,7 @@ const (
 // wireEntry is one row of the usage protocol.
 type wireEntry struct {
 	KeyID       string `json:"key_id"`
+	Network     string `json:"network"`
 	Endpoint    string `json:"endpoint"`
 	StatusClass string `json:"status_class"`
 	DateUTC     string `json:"date_utc"`
@@ -77,7 +78,7 @@ type chunk struct {
 //	POST <url>
 //	Authorization: Bearer <service token>
 //	Idempotency-Key: <stable per chunk>
-//	{"entries": [{"key_id","endpoint","status_class","date_utc","count","units"}]}
+//	{"entries": [{"key_id","network","endpoint","status_class","date_utc","count","units"}]}
 //
 // at most 1000 entries and 1 MiB per call. Counts add up at the receiver,
 // so delivery is at most once: a chunk the receiver may already have
@@ -93,6 +94,7 @@ type HTTPSink struct {
 	name       string
 	url        string
 	token      string
+	network    string
 	client     *http.Client
 	logger     *zap.Logger
 	maxPending int
@@ -109,11 +111,12 @@ type HTTPSink struct {
 
 // NewHTTPSink builds the sink for provider name. client must not follow
 // redirects (the token travels with every call).
-func NewHTTPSink(name, url, token string, client *http.Client, maxPending int, logger *zap.Logger) *HTTPSink {
+// network is the deployment's reported network name, sent with every entry.
+func NewHTTPSink(name, url, token, network string, client *http.Client, maxPending int, logger *zap.Logger) *HTTPSink {
 	var b [6]byte
 	_, _ = rand.Read(b[:])
 	return &HTTPSink{
-		name: name, url: url, token: token, client: client, maxPending: maxPending,
+		name: name, url: url, token: token, network: network, client: client, maxPending: maxPending,
 		logger:   logger.Named("usage").With(zap.String("provider", name)),
 		now:      time.Now,
 		prefix:   hex.EncodeToString(b[:]),
@@ -184,7 +187,7 @@ func (s *HTTPSink) enqueue(entries []Entry) {
 		cur, size = make([]wireEntry, 0, maxChunkEntries), envelope
 	}
 	for _, e := range entries {
-		w := wireEntry{KeyID: e.KeyID, Endpoint: e.Endpoint, StatusClass: e.Class, DateUTC: e.Day, Count: e.Count, Units: e.Units}
+		w := wireEntry{KeyID: e.KeyID, Network: s.network, Endpoint: e.Endpoint, StatusClass: e.Class, DateUTC: e.Day, Count: e.Count, Units: e.Units}
 		row, err := json.Marshal(w)
 		if err != nil { // plain strings and ints: cannot happen
 			s.drop(1, "invalid")

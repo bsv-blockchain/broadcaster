@@ -239,6 +239,20 @@ func TestValidateAccessControl(t *testing.T) {
 			c.Usage = testUsage()
 			c.Usage.FlushIntervalMs = 1000
 		}, "usage.flush_interval_ms"},
+		{"usage network override", func(c *Config) {
+			p := testIntrospectionProvider()
+			p.UsageURL = "https://auth.example.com/v1/usage"
+			c.Auth.Introspection = map[string]IntrospectionProvider{testProvider: p}
+			c.Usage = testUsage()
+			c.Usage.Network = "ttn"
+		}, ""},
+		{"usage network not a label", func(c *Config) {
+			p := testIntrospectionProvider()
+			p.UsageURL = "https://auth.example.com/v1/usage"
+			c.Auth.Introspection = map[string]IntrospectionProvider{testProvider: p}
+			c.Usage = testUsage()
+			c.Usage.Network = "Tera Testnet"
+		}, "usage.network"},
 		{"usage_url plain http to a remote host", func(c *Config) {
 			p := testIntrospectionProvider()
 			p.UsageURL = "http://auth.example.com/v1/usage"
@@ -525,5 +539,26 @@ func TestUsageDefaultsBind(t *testing.T) {
 	}
 	if cfg.Usage.FlushIntervalMs != 30_000 {
 		t.Errorf("BSV_BROADCASTER_USAGE_FLUSH_INTERVAL_MS override = %d", cfg.Usage.FlushIntervalMs)
+	}
+}
+
+func TestUsageNetwork(t *testing.T) {
+	c := &Config{Network: NetworkTeratestnet}
+	if got := c.UsageNetwork(); got != NetworkTeratestnet {
+		t.Errorf("default UsageNetwork = %q, want the deployment network", got)
+	}
+	c.Usage.Network = "ttn"
+	if got := c.UsageNetwork(); got != "ttn" {
+		t.Errorf("overridden UsageNetwork = %q, want ttn", got)
+	}
+	viper.Reset()
+	t.Cleanup(viper.Reset)
+	t.Setenv("BSV_BROADCASTER_USAGE_NETWORK", "ttn")
+	cfg, err := Load(&cobra.Command{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Usage.Network != "ttn" {
+		t.Errorf("BSV_BROADCASTER_USAGE_NETWORK override = %q", cfg.Usage.Network)
 	}
 }

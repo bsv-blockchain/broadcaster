@@ -32,6 +32,7 @@ func TestUsageReportedToProviderEndToEnd(t *testing.T) {
 	providerK := providerKey(t)
 	type row struct {
 		KeyID       string `json:"key_id"`
+		Network     string `json:"network"`
 		Endpoint    string `json:"endpoint"`
 		StatusClass string `json:"status_class"`
 		DateUTC     string `json:"date_utc"`
@@ -72,6 +73,7 @@ func TestUsageReportedToProviderEndToEnd(t *testing.T) {
 	t.Cleanup(provider.Close)
 
 	cfg := &config.Config{
+		Network: config.NetworkTeratestnet,
 		Auth: config.AuthConfig{Enabled: true, Introspection: map[string]config.IntrospectionProvider{
 			"acme": {
 				KeyPrefix: "acme_", URL: provider.URL + "/introspect", UsageURL: provider.URL + "/usage",
@@ -87,6 +89,7 @@ func TestUsageReportedToProviderEndToEnd(t *testing.T) {
 		},
 		Usage: config.UsageConfig{
 			Enabled: true, FlushIntervalMs: 3_600_000, MaxBuckets: 1000, MaxPendingEntries: 1000, ShutdownFlushTimeoutMs: 5000,
+			Network: "ttn", // the provider's name for teratestnet
 		},
 	}
 	srv := &Server{cfg: cfg, logger: zap.NewNop(), store: st}
@@ -120,7 +123,7 @@ func TestUsageReportedToProviderEndToEnd(t *testing.T) {
 	defer mu.Unlock()
 	today := time.Now().UTC().Format(time.DateOnly)
 	require.ElementsMatch(t, []row{
-		{KeyID: "k-123", Endpoint: "v1/thing", StatusClass: "2xx", DateUTC: today, Count: 3, Units: 3},
-		{KeyID: "k-123", Endpoint: "v1/thing", StatusClass: "429", DateUTC: today, Count: 1, Units: 0},
+		{KeyID: "k-123", Network: "ttn", Endpoint: "v1/thing", StatusClass: "2xx", DateUTC: today, Count: 3, Units: 3},
+		{KeyID: "k-123", Network: "ttn", Endpoint: "v1/thing", StatusClass: "429", DateUTC: today, Count: 1, Units: 0},
 	}, reported)
 }
