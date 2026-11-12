@@ -1403,3 +1403,13 @@ var APIKeyCacheTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "bsv_broadcaster_apikey_cache_total",
 	Help: "API key resolutions by cache result (hit|miss|negative|failing|stale|error|canceled).",
 }, []string{"result"})
+
+// APIKeyIntrospectTotal counts calls to external introspection providers
+// (auth.introspection) by provider and result: valid | invalid (the
+// provider answered that the key is not valid) | unauthorized (the provider
+// rejected our service token -- a config error, not an outage) | error |
+// backoff (not called: backing off after an earlier failure).
+var APIKeyIntrospectTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "bsv_broadcaster_apikey_introspect_total",
+	Help: "API key introspection calls by provider and result (valid|invalid|unauthorized|error|backoff).",
+}, []string{"provider", "result"})

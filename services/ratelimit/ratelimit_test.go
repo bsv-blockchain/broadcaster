@@ -254,3 +254,23 @@ func TestClientDisconnectDoesNotCountAsFailOpen(t *testing.T) {
 	require.InDelta(t, before, testutil.ToFloat64(metrics.RateLimitStoreFailOpenTotal), 0.0001,
 		"a client disconnect must not be counted as a store failure")
 }
+
+// TestKeysSharingALimitShareQuotaAndConcurrency pins that keys drawing from
+// one allowance (a provider's limit_id) are accounted together: a customer
+// must not multiply their plan by creating more keys.
+func TestKeysSharingALimitShareQuotaAndConcurrency(t *testing.T) {
+	rl := New(testConfig(), newFakeQuota(), zap.NewNop(), WithClock(func() time.Time { return noon }))
+	a := engine(rl, apikey.Principal{KeyID: "key_a", QuotaID: "lim_1", Tier: config.TierFree}, 10, ok)
+	b := engine(rl, apikey.Principal{KeyID: "key_b", QuotaID: "lim_1", Tier: config.TierFree}, 10, ok)
+	c := engine(rl, apikey.Principal{KeyID: "key_c", QuotaID: "lim_2", Tier: config.TierFree}, 10, ok)
+
+	// free is 25 units/minute: two 10-unit requests fit, the third does not.
+	require.Equal(t, http.StatusNoContent, do(t, a).Code)
+	require.Equal(t, http.StatusNoContent, do(t, b).Code)
+	require.Equal(t, http.StatusTooManyRequests, do(t, a).Code, "key_b spent key_a's shared allowance")
+	require.Equal(t, http.StatusNoContent, do(t, c).Code, "another limit has its own allowance")
+
+	require.Equal(t, "key:lim_1", apikey.Principal{KeyID: "key_a", QuotaID: "lim_1"}.Subject(),
+		"in-flight and fail-open buckets are per limit too")
+	require.Equal(t, "key:key_a", apikey.Principal{KeyID: "key_a"}.Subject())
+}

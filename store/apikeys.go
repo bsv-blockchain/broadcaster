@@ -33,6 +33,20 @@ type APIKey struct {
 	CreatedAt time.Time
 	UpdatedAt time.Time
 	RevokedAt *time.Time
+	// LimitID names the allowance the key draws quota and concurrency from;
+	// keys on one plan share it. Only keys verified by a delegated-auth
+	// provider carry one, and no backend persists it: empty means the key
+	// is its own allowance.
+	LimitID string
+}
+
+// QuotaID is the identity the rate limiter accounts this key under: its
+// LimitID when it has one, else its ID.
+func (k *APIKey) QuotaID() string {
+	if k.LimitID != "" {
+		return k.LimitID
+	}
+	return k.ID
 }
 
 // Usable reports whether the key may authenticate a request at now.

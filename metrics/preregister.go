@@ -158,3 +158,13 @@ func PreRegisterAPIKey() {
 		APIKeyCacheTotal.WithLabelValues(result)
 	}
 }
+
+// PreRegisterIntrospection exports every APIKeyIntrospectTotal series for
+// the configured providers at 0.
+func PreRegisterIntrospection(providers []string) {
+	for _, p := range providers {
+		for _, result := range []string{"valid", "invalid", "unauthorized", "error", "backoff"} {
+			APIKeyIntrospectTotal.WithLabelValues(p, result)
+		}
+	}
+}

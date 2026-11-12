@@ -1,8 +1,11 @@
 package config
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
@@ -26,7 +29,19 @@ func validAccessControl() *Config {
 	}
 }
 
+const testProvider = "acme"
+
+func testIntrospectionProvider() IntrospectionProvider {
+	return IntrospectionProvider{
+		KeyPrefix: "acme_",
+		URL:       "https://auth.example.com/v1/introspect",
+		Token:     "service-token",
+		Tiers:     map[string]string{"gold": "enterprise"},
+	}
+}
+
 func TestValidateAccessControl(t *testing.T) {
+	t.Setenv("TEST_INTROSPECTION_TOKEN", "service-token")
 	cases := []struct {
 		name    string
 		mutate  func(c *Config)
@@ -92,6 +107,99 @@ func TestValidateAccessControl(t *testing.T) {
 		{"auth store negative pool size", func(c *Config) {
 			c.Auth.Store.Mongo = Mongo{URI: "mongodb://auth:27017", Database: "bsv_broadcaster_auth", MaxPoolSize: -1}
 		}, "auth.store.mongodb.max_pool_size"},
+		{"introspection provider", func(c *Config) {
+			c.Auth.Introspection = map[string]IntrospectionProvider{testProvider: testIntrospectionProvider()}
+		}, ""},
+		{"introspection provider with token_env", func(c *Config) {
+			p := testIntrospectionProvider()
+			p.Token, p.TokenEnv = "", "TEST_INTROSPECTION_TOKEN"
+			c.Auth.Introspection = map[string]IntrospectionProvider{testProvider: p}
+		}, ""},
+		{"introspection token_env unset", func(c *Config) {
+			p := testIntrospectionProvider()
+			p.Token, p.TokenEnv = "", "TEST_INTROSPECTION_TOKEN_UNSET"
+			c.Auth.Introspection = map[string]IntrospectionProvider{testProvider: p}
+		}, "TEST_INTROSPECTION_TOKEN_UNSET is empty or unset"},
+		{"introspection token and token_env", func(c *Config) {
+			p := testIntrospectionProvider()
+			p.TokenEnv = "TEST_INTROSPECTION_TOKEN"
+			c.Auth.Introspection = map[string]IntrospectionProvider{testProvider: p}
+		}, "not both"},
+		{"introspection without token", func(c *Config) {
+			p := testIntrospectionProvider()
+			p.Token = ""
+			c.Auth.Introspection = map[string]IntrospectionProvider{testProvider: p}
+		}, "token or token_env is required"},
+		{"introspection without auth", func(c *Config) {
+			c.Auth.Enabled, c.RateLimit.Enabled = false, false
+			c.Auth.Introspection = map[string]IntrospectionProvider{testProvider: testIntrospectionProvider()}
+		}, "auth.introspection requires auth.enabled"},
+		{"introspection prefix shadows local keys", func(c *Config) {
+			p := testIntrospectionProvider()
+			p.KeyPrefix = "bsvb_"
+			c.Auth.Introspection = map[string]IntrospectionProvider{testProvider: p}
+		}, "overlaps"},
+		{"introspection duplicate prefix", func(c *Config) {
+			c.Auth.Introspection = map[string]IntrospectionProvider{"one": testIntrospectionProvider(), "two": testIntrospectionProvider()}
+		}, "overlaps"},
+		{"introspection prefix without underscore", func(c *Config) {
+			p := testIntrospectionProvider()
+			p.KeyPrefix = "bsv"
+			c.Auth.Introspection = map[string]IntrospectionProvider{testProvider: p}
+		}, "key_prefix"},
+		{"introspection relative url", func(c *Config) {
+			p := testIntrospectionProvider()
+			p.URL = "/v1/introspect"
+			c.Auth.Introspection = map[string]IntrospectionProvider{testProvider: p}
+		}, "absolute https URL"},
+		{"introspection timeout above max", func(c *Config) {
+			p := testIntrospectionProvider()
+			p.TimeoutMs = 5000
+			c.Auth.Introspection = map[string]IntrospectionProvider{testProvider: p}
+		}, "timeout_ms"},
+		{"introspection plain http to a remote host", func(c *Config) {
+			p := testIntrospectionProvider()
+			p.URL = "http://auth.example.com/v1/introspect"
+			c.Auth.Introspection = map[string]IntrospectionProvider{testProvider: p}
+		}, "https"},
+		{"introspection url with user info", func(c *Config) {
+			p := testIntrospectionProvider()
+			p.URL = "https://user:pass@auth.example.com/v1/introspect"
+			c.Auth.Introspection = map[string]IntrospectionProvider{testProvider: p}
+		}, "must not contain user info"},
+		{"introspection url with a query", func(c *Config) {
+			p := testIntrospectionProvider()
+			p.URL = "https://auth.example.com/v1/introspect?key=x"
+			c.Auth.Introspection = map[string]IntrospectionProvider{testProvider: p}
+		}, "must not contain a query or fragment"},
+		{"introspection plain http on loopback", func(c *Config) {
+			p := testIntrospectionProvider()
+			p.URL = "http://127.0.0.1:8099/introspect"
+			c.Auth.Introspection = map[string]IntrospectionProvider{testProvider: p}
+		}, ""},
+		{"introspection token with trailing newline is trimmed", func(c *Config) {
+			p := testIntrospectionProvider()
+			p.Token = "service-token\n"
+			c.Auth.Introspection = map[string]IntrospectionProvider{testProvider: p}
+		}, ""},
+		{"introspection token with inner whitespace", func(c *Config) {
+			p := testIntrospectionProvider()
+			p.Token = "service token"
+			c.Auth.Introspection = map[string]IntrospectionProvider{testProvider: p}
+		}, "whitespace or control characters"},
+		{"introspection tier maps to an unconfigured tier", func(c *Config) {
+			p := testIntrospectionProvider()
+			p.Tiers = map[string]string{"gold": "platinum"}
+			c.Auth.Introspection = map[string]IntrospectionProvider{testProvider: p}
+		}, `"platinum" is not a configured ratelimit tier`},
+		{"introspection without a tier map", func(c *Config) {
+			p := testIntrospectionProvider()
+			p.Tiers = nil
+			c.Auth.Introspection = map[string]IntrospectionProvider{testProvider: p}
+		}, ""},
+		{"introspection bad provider name", func(c *Config) {
+			c.Auth.Introspection = map[string]IntrospectionProvider{"Wo C": testIntrospectionProvider()}
+		}, "provider name"},
 		{"ratelimit without auth", func(c *Config) { c.Auth.Enabled = false }, "requires auth.enabled"},
 		{"auth with zero cache ttl", func(c *Config) { c.RateLimit.KeyCacheTTLMs = 0 }, "key_cache_ttl_ms"},
 		{"stale shorter than ttl", func(c *Config) { c.RateLimit.KeyCacheStaleMaxMs = 1 }, "key_cache_ttl_ms"},
@@ -239,5 +347,57 @@ func TestAuthStoreDefaultsAndEnv(t *testing.T) {
 	got := overridden.Auth.Store.Mongo
 	if !overridden.Auth.Store.Configured() || got.URI != "mongodb://auth-env:27017" || got.Database != "bsv_broadcaster_auth" || got.OpTimeoutMs != 1500 {
 		t.Errorf("env override = %+v", got)
+	}
+}
+
+// TestIntrospectionLoadsFromFile runs the real Load path: providers come
+// from the config file, the token from the variable token_env names.
+func TestIntrospectionLoadsFromFile(t *testing.T) {
+	viper.Reset()
+	t.Cleanup(viper.Reset)
+	t.Setenv("TEST_PROVIDER_SERVICE_TOKEN", "from-env\n")
+
+	cfgFile := filepath.Join(t.TempDir(), "config.yaml")
+	yaml := `kafka:
+  backend: memory
+store:
+  backend: pebble
+auth:
+  enabled: true
+  introspection:
+    acme:
+      key_prefix: acme_
+      url: https://auth.example.com/v1/introspect
+      token_env: TEST_PROVIDER_SERVICE_TOKEN
+      timeout_ms: 2000
+      tiers:
+        Gold: free
+`
+	if err := os.WriteFile(cfgFile, []byte(yaml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cmd := &cobra.Command{}
+	BindFlags(cmd)
+	if err := cmd.Flags().Set("config", cfgFile); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(cmd)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	p, ok := cfg.Auth.Introspection[testProvider]
+	if !ok {
+		t.Fatalf("auth.introspection.acme missing: %+v", cfg.Auth.Introspection)
+	}
+	if p.KeyPrefix != "acme_" || p.ServiceToken() != "from-env" || p.Timeout() != 2*time.Second {
+		t.Errorf("acme provider = %+v (token %q, timeout %v)", p, p.ServiceToken(), p.Timeout())
+	}
+	// viper lowercases map keys; the introspector matches provider tiers
+	// case-insensitively, so this is harmless.
+	if p.Tiers["gold"] != "free" {
+		t.Errorf("tiers = %v, want gold -> free", p.Tiers)
+	}
+	if (IntrospectionProvider{}).Timeout() != DefaultIntrospectionTimeoutMs*time.Millisecond {
+		t.Error("zero timeout_ms must default")
 	}
 }

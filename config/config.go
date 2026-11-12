@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"net"
 	"net/url"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	chaintracksconfig "github.com/bsv-blockchain/go-chaintracks/config"
 	"github.com/spf13/cobra"
@@ -228,6 +230,61 @@ type AuthConfig struct {
 	// key set and one quota window per key. Unset (uri empty) keeps keys and
 	// quota in the main store. See docs/api-keys.md.
 	Store AuthStoreConfig `mapstructure:"store"`
+	// Introspection maps a provider name to a delegated-auth endpoint that
+	// verifies the keys the provider issues under its own prefix. Keys
+	// under the broadcaster's own bsvb_ prefix always resolve from the key
+	// store. See docs/api-keys.md.
+	Introspection map[string]IntrospectionProvider `mapstructure:"introspection"`
+}
+
+// IntrospectionProvider is one auth.introspection entry.
+type IntrospectionProvider struct {
+	// KeyPrefix routes keys to this provider, e.g. "acme_". Keys must follow
+	// the broadcaster's format under it: prefix, 43 base62 characters, "_",
+	// then a 6-character base62 CRC32 of the body.
+	KeyPrefix string `mapstructure:"key_prefix"`
+	// URL is the introspection endpoint. It must be https, except on a
+	// loopback host: the service token travels with every call.
+	URL string `mapstructure:"url"`
+	// Token is the service token sent as a Bearer. Set exactly one of Token
+	// or TokenEnv; prefer TokenEnv so the secret stays out of config files.
+	Token string `mapstructure:"token"`
+	// TokenEnv names the environment variable holding the service token.
+	TokenEnv string `mapstructure:"token_env"`
+	// TimeoutMs bounds each introspection call. 0 means
+	// DefaultIntrospectionTimeoutMs.
+	TimeoutMs int `mapstructure:"timeout_ms"`
+	// Tiers maps the tier names the provider returns to ratelimit.tiers
+	// names. A provider tier missing here gets free, so a provider can only
+	// grant the tiers the operator maps. Provider tier names match
+	// case-insensitively.
+	Tiers map[string]string `mapstructure:"tiers"`
+}
+
+// Introspection timeouts. The maximum stays under the API key resolver's
+// own 5s lookup timeout, so a slow provider surfaces as this call's error
+// rather than the resolver abandoning it.
+const (
+	DefaultIntrospectionTimeoutMs = 3000
+	MaxIntrospectionTimeoutMs     = 4500
+)
+
+// ServiceToken returns the provider's service token, Token or the value of
+// the environment variable TokenEnv names, with surrounding whitespace
+// trimmed (a secret mounted from a file usually ends in a newline).
+func (p IntrospectionProvider) ServiceToken() string {
+	if p.TokenEnv != "" {
+		return strings.TrimSpace(os.Getenv(p.TokenEnv))
+	}
+	return strings.TrimSpace(p.Token)
+}
+
+// Timeout is TimeoutMs as a duration, defaulted.
+func (p IntrospectionProvider) Timeout() time.Duration {
+	if p.TimeoutMs == 0 {
+		return DefaultIntrospectionTimeoutMs * time.Millisecond
+	}
+	return time.Duration(p.TimeoutMs) * time.Millisecond
 }
 
 // AuthStoreConfig is auth.store. Only MongoDB is supported.
@@ -2001,6 +2058,84 @@ func validateAuthStore(cfg *Config) error {
 	return nil
 }
 
+// localKeyPrefix is apikey.Prefix, the prefix of keys the broadcaster
+// issues itself. config cannot import apikey (apikey imports config).
+const localKeyPrefix = "bsvb_"
+
+// keyPrefixRe bounds auth.introspection key prefixes: lowercase
+// alphanumerics ending in "_", like bsvb_ itself.
+var keyPrefixRe = regexp.MustCompile(`^[a-z0-9]+_$`)
+
+// validateIntrospection checks auth.introspection. Errors never echo a
+// token.
+func validateIntrospection(cfg *Config) error {
+	if len(cfg.Auth.Introspection) == 0 {
+		return nil
+	}
+	if !cfg.Auth.Enabled {
+		return fmt.Errorf("auth.introspection requires auth.enabled")
+	}
+	prefixes := map[string]string{localKeyPrefix: "the broadcaster's own keys"}
+	names := slices.Sorted(maps.Keys(cfg.Auth.Introspection))
+	for _, name := range names {
+		p := cfg.Auth.Introspection[name]
+		field := "auth.introspection." + name
+		if !tierNameRe.MatchString(name) {
+			return fmt.Errorf("%s: provider name must match %s", field, tierNameRe.String())
+		}
+		if !keyPrefixRe.MatchString(p.KeyPrefix) {
+			return fmt.Errorf("%s.key_prefix %q must match %s", field, p.KeyPrefix, keyPrefixRe.String())
+		}
+		for other, owner := range prefixes {
+			if strings.HasPrefix(p.KeyPrefix, other) || strings.HasPrefix(other, p.KeyPrefix) {
+				return fmt.Errorf("%s.key_prefix %q overlaps %q (%s)", field, p.KeyPrefix, other, owner)
+			}
+		}
+		prefixes[p.KeyPrefix] = field
+		u, err := url.Parse(p.URL)
+		if err != nil || u.Host == "" || (u.Scheme != "https" && (u.Scheme != "http" || !isLoopbackHost(u.Hostname()))) {
+			return fmt.Errorf("%s.url must be an absolute https URL (http only on a loopback host)", field)
+		}
+		if u.User != nil {
+			return fmt.Errorf("%s.url must not contain user info; the service token authenticates", field)
+		}
+		if u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
+			return fmt.Errorf("%s.url must not contain a query or fragment", field)
+		}
+		switch {
+		case p.Token != "" && p.TokenEnv != "":
+			return fmt.Errorf("%s: set token or token_env, not both", field)
+		case p.TokenEnv != "" && p.ServiceToken() == "":
+			return fmt.Errorf("%s.token_env: environment variable %s is empty or unset", field, p.TokenEnv)
+		case p.ServiceToken() == "":
+			return fmt.Errorf("%s: token or token_env is required", field)
+		case strings.IndexFunc(p.ServiceToken(), func(r rune) bool { return r <= ' ' || r == 0x7f }) >= 0:
+			return fmt.Errorf("%s: the service token contains whitespace or control characters", field)
+		}
+		for providerTier, local := range p.Tiers {
+			if providerTier == "" {
+				return fmt.Errorf("%s.tiers: empty provider tier name", field)
+			}
+			if _, ok := cfg.RateLimit.Tiers[local]; !ok {
+				return fmt.Errorf("%s.tiers.%s: %q is not a configured ratelimit tier", field, providerTier, local)
+			}
+		}
+		if p.TimeoutMs < 0 || p.TimeoutMs > MaxIntrospectionTimeoutMs {
+			return fmt.Errorf("%s.timeout_ms must be between 0 (default %d) and %d", field, DefaultIntrospectionTimeoutMs, MaxIntrospectionTimeoutMs)
+		}
+	}
+	return nil
+}
+
+// isLoopbackHost reports whether host is localhost or a loopback IP.
+func isLoopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
 // validateAccessControl checks the API-key, admin and rate-limit settings.
 func validateAccessControl(cfg *Config) error {
 	switch cfg.APIServer.TrustedPlatform {
@@ -2025,6 +2160,9 @@ func validateAccessControl(cfg *Config) error {
 		}
 	}
 	if err := validateAuthStore(cfg); err != nil {
+		return err
+	}
+	if err := validateIntrospection(cfg); err != nil {
 		return err
 	}
 	rl := cfg.RateLimit

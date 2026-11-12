@@ -11,6 +11,10 @@ Send your key as a bearer token, the same header ARC clients already use:
 Authorization: Bearer bsvb_…
 ```
 
+Keys issued by a delegated-auth provider the deployment trusts (see
+[`auth.introspection`](#delegated-authentication-authintrospection)) are sent
+the same way.
+
 Requests without a key are served at the anonymous tier, limited per client
 IP by a bucket local to the replica that handled the request (not shared
 across replicas). An IPv6 client is bucketed by its `/64`, not its exact
@@ -242,6 +246,110 @@ When several deployments share one auth store:
   working up to `key_cache_stale_max_ms`, uncached keys get `503`, and quota
   fails open to a per-replica bucket. Host it where every region reaches it
   within `op_timeout_ms`.
+
+### Delegated authentication (`auth.introspection`)
+
+A deployment can delegate verification of some API keys to another service
+(a "provider") that issues and manages them, such as a customer dashboard
+or billing system. Each provider is configured with the prefix its keys
+carry and an introspection endpoint. Keys under that prefix are verified
+there and never reach the key store. Keys under `bsvb_` (the broadcaster's
+own) always resolve from the key store, and a key with any other prefix gets
+`401`.
+
+```yaml
+auth:
+  enabled: true                       # required when auth.introspection is set
+  introspection:
+    acme:                             # provider name: logs, metrics, id namespace
+      key_prefix: acme_
+      url: https://auth.example.com/v1/introspect
+      token_env: ACME_INTROSPECTION_TOKEN  # or token: <literal>; exactly one
+      timeout_ms: 3000                # default 3000, max 4500
+      tiers:                          # provider tier -> ratelimit.tiers name
+        basic: free
+        gold: pro
+```
+
+- `key_prefix` is lowercase alphanumerics ending in `_`, and must not overlap
+  `bsvb_` or another provider's prefix. Provider keys must use the
+  broadcaster's key format under it: the prefix, 43 base62 characters, `_`,
+  then a 6-character base62 CRC32 of the body. Malformed keys are rejected
+  before any network call.
+- `url` must be `https` (plain `http` is accepted only on a loopback host):
+  the service token travels with every call. It must not carry user info, a
+  query or a fragment. Redirects are not followed.
+- The service token is trimmed of surrounding whitespace (a secret mounted
+  from a file usually ends in a newline) and must not contain any other
+  whitespace or control characters.
+- `tiers` maps the tier names the provider returns (matched
+  case-insensitively) to tiers under `ratelimit.tiers`. A provider tier that
+  is not mapped, or a missing tier, gets `free`, so a provider can only grant
+  the tiers you map: it cannot claim an internal or unbounded tier by
+  returning its name.
+
+**Protocol.** For a key it has not seen (or whose cached answer is older than
+`key_cache_ttl_ms`), the api-server sends:
+
+```
+POST <url>
+Authorization: Bearer <service token>
+Content-Type: application/json
+
+{"key_hash": "<hex SHA-256 of the full key, prefix included>"}
+```
+
+The key itself never leaves the broadcaster. The provider answers:
+
+| Response | Meaning |
+|---|---|
+| `200 {"valid": true, "key_id", "tier"?, "limit_id"?, "expires_at"?}` | Usable key. `key_id` identifies the caller. `tier` is mapped through `tiers`. `expires_at` is an RFC 3339 timestamp, or null/absent for no expiry, and is enforced on every request, even from cache. Other fields are ignored. |
+| `200 {"valid": false}` | Unknown, revoked or out-of-scope key: `401`, cached for `key_cache_ttl_ms`. |
+| `401` / `403` | The provider rejected the service token. |
+| `429` / `5xx`, a timeout, any other status, or an answer that can't be decoded | The key can't be verified right now. |
+
+Every failure other than `{"valid": false}` is treated as an outage, never
+as an unknown key: cached keys keep working up to `key_cache_stale_max_ms`,
+uncached keys get `503`, and the cause is logged (at most once per 10s per
+kind).
+
+**Ids are namespaced.** The broadcaster records a provider key as
+`<provider>:<key_id>` (in logs, traces and quota accounting), and its
+`limit_id` as `<provider>:<limit_id>`. Two providers, or a provider and a
+local key, can never collide on an id.
+
+**Shared allowances.** When the answer carries a `limit_id`, every key with
+that `limit_id` shares one quota window, one `max_in_flight` budget and one
+fail-open bucket, so a customer cannot raise their limits by creating more
+keys. Without a `limit_id`, each key is its own allowance, like a `bsvb_` key.
+The provider must return the same tier for every key on one `limit_id`.
+
+**Backoff.** After a failed call the api-server stops calling that provider
+for a while and fails fast instead:
+
+| Failure | Backoff |
+|---|---|
+| `401` / `403`, or an unexpected status such as `404` or a redirect | 30s (a configuration fix is needed) |
+| `429` | `Retry-After` (seconds or an HTTP date, capped at 60s), else 5s |
+| `5xx` | `Retry-After` (capped at 60s), else 2s |
+| timeout, connection error, undecodable answer | 2s |
+| a valid answer without `key_id`, or an `expires_at` that isn't RFC 3339 | none: only that key gets `503` |
+
+A backoff only ever extends. During it, cached keys keep working and uncached
+keys get `503`. This keeps an outage or a bad token from sending every
+request to the provider, which matters for providers that rate-limit per
+source IP: a burst from one replica would otherwise throttle every replica
+behind the same egress. Each replica also makes at most 16 concurrent calls
+to one provider (a cap on calls, not just connections, so it holds over
+HTTP/2); further lookups queue for a free slot.
+
+Revoking a provider key takes effect within the provider's own propagation
+delay plus `key_cache_ttl_ms`. The admin endpoints (`/admin/keys`) manage
+only `bsvb_` keys.
+
+Metric: `bsv_broadcaster_apikey_introspect_total{provider,result}`, where
+`result` is `valid`, `invalid`, `unauthorized` (bad service token), `error`,
+or `backoff` (not called because of an earlier failure).
 
 ### Managing keys
 

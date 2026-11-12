@@ -279,6 +279,9 @@ func TestLogFields(t *testing.T) {
 
 	WithPrincipal(c, Principal{KeyID: "key_1", Tier: "pro", ClientIP: "203.0.113.1"})
 	require.Equal(t, []zap.Field{zap.String("key_id", "key_1"), zap.String("tier", "pro")}, LogFields(c))
+
+	WithPrincipal(c, Principal{KeyID: "key_1", QuotaID: "lim_1", Tier: "standard", ClientIP: "203.0.113.1"})
+	require.Equal(t, []zap.Field{zap.String("key_id", "key_1"), zap.String("tier", "standard"), zap.String("limit_id", "lim_1")}, LogFields(c))
 }
 
 // TestPrincipalFromWithoutMiddleware checks the documented fallback: a

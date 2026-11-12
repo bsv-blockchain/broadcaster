@@ -502,6 +502,17 @@ auth:
   #   mongodb:
   #     uri: ""              # BSV_BROADCASTER_AUTH_STORE_MONGODB_URI
   #     database: bsv_broadcaster_auth
+  # Optional delegated-auth providers that verify the keys they issue under
+  # their own prefix (bsvb_ keys always come from the key store). A provider
+  # tier not mapped under tiers gets free. See docs/api-keys.md.
+  # introspection:
+  #   acme:
+  #     key_prefix: acme_
+  #     url: https://auth.example.com/v1/introspect   # https (http only on loopback)
+  #     token_env: ACME_INTROSPECTION_TOKEN   # or token: <literal>
+  #     timeout_ms: 3000
+  #     tiers:                                # provider tier -> ratelimit.tiers name
+  #       basic: free
 admin:
   enabled: false
   host: 127.0.0.1       # kubectl port-forward works with this; set 0.0.0.0 to opt in to in-cluster tooling reaching it directly
