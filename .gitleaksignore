@@ -3,3 +3,4 @@ d7381c5b38cfbc5022685163d3553c4bd73f7815:tests/e2e/fixtures/blocks/0000000000000
 tests/e2e/fixtures/blocks/000000000000000001bc8a601dd5f0659d36a9b077808850375dfa2d9f009396/meta.json:coinbase-access-token:3
 tests/e2e/fixtures/blocks/000000000000000001bc8a601dd5f0659d36a9b077808850375dfa2d9f009396/meta.json:coinbase-access-token:10
 tools/fetch-block-fixture/fetch_test.go:coinbase-access-token:30
+b68c3f812b05c90f7a47870a45e28e19ffdcbbea:services/apikey/introspect_test.go:generic-api-key:21

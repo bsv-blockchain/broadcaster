@@ -18,7 +18,7 @@ import (
 )
 
 const (
-	testServiceToken = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	testServiceToken = "test-service-token"
 	testProvider     = "acme"
 	testPrefix       = "acme_"
 	testLocalTier    = "pro"
