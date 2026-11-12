@@ -140,7 +140,10 @@ func newMiddleware(r *Resolver, failures *authFailureLimiter) gin.HandlerFunc {
 // authenticated records the resolved key as the request's principal and
 // lets the request proceed.
 func authenticated(c *gin.Context, ip string, k *store.APIKey) {
-	WithPrincipal(c, Principal{KeyID: k.ID, QuotaID: k.QuotaID(), Tier: k.Tier, ClientIP: ip})
+	WithPrincipal(c, Principal{
+		KeyID: k.ID, QuotaID: k.QuotaID(), Tier: k.Tier, ClientIP: ip,
+		Provider: k.Provider, ProviderKeyID: k.ProviderKeyID,
+	})
 	attrs := []attribute.KeyValue{attribute.String("key_id", k.ID), attribute.String("tier", k.Tier)}
 	if k.LimitID != "" {
 		attrs = append(attrs, attribute.String("limit_id", k.LimitID))

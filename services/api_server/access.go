@@ -13,6 +13,7 @@ import (
 	"github.com/bsv-blockchain/broadcaster/metrics"
 	"github.com/bsv-blockchain/broadcaster/services/apikey"
 	"github.com/bsv-blockchain/broadcaster/services/ratelimit"
+	"github.com/bsv-blockchain/broadcaster/services/usage"
 	"github.com/bsv-blockchain/broadcaster/store"
 )
 
@@ -120,10 +121,18 @@ func (s *Server) introspectionRoutes() []apikey.Route {
 	return routes
 }
 
-// guarded prefixes h with the identify and rate-limit middleware the config
-// enables, charging units for the route. With both off it is just h.
-func (s *Server) guarded(units int64, h gin.HandlerFunc) []gin.HandlerFunc {
+// guarded prefixes h with the usage, identify and rate-limit middleware the
+// config enables, charging units for the route. name is the route's stable
+// usage name (usage.RouteName rules: lowercase, at most 3 "/" segments and
+// 64 characters, never an id). With everything off it is just h.
+func (s *Server) guarded(name string, units int64, h gin.HandlerFunc) []gin.HandlerFunc {
+	if !usage.ValidEndpoint(name) {
+		panic(fmt.Sprintf("guarded: invalid usage route name %q", name)) // a programming error, caught at boot
+	}
 	var hs []gin.HandlerFunc
+	if s.usageRecorder != nil {
+		hs = append(hs, s.usageRecorder.Middleware(name, units))
+	}
 	if s.identify != nil {
 		hs = append(hs, s.identify)
 	}

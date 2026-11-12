@@ -24,6 +24,7 @@ import (
 	"github.com/bsv-blockchain/broadcaster/services/apikey"
 	"github.com/bsv-blockchain/broadcaster/services/httpmiddleware"
 	"github.com/bsv-blockchain/broadcaster/services/ratelimit"
+	"github.com/bsv-blockchain/broadcaster/services/usage"
 	"github.com/bsv-blockchain/broadcaster/store"
 	"github.com/bsv-blockchain/broadcaster/telemetry"
 	"github.com/bsv-blockchain/broadcaster/teranode"
@@ -47,6 +48,10 @@ type Server struct {
 
 	cfg    *config.Config
 	logger *zap.Logger
+	// usageRecorder meters guarded routes and usageReporter delivers the
+	// counts to providers; both nil unless usage.enabled (see initUsage).
+	usageRecorder *usage.Recorder
+	usageReporter *usage.Reporter
 	// retention enforces per-tier data retention; nil when no tier
 	// configures it or the store cannot (see initRetention).
 	retention    store.RetentionExtender
@@ -188,6 +193,7 @@ func (s *Server) Start(ctx context.Context) error {
 		return err
 	}
 	s.initRetention(ctx)
+	s.initUsage(ctx)
 	if s.cfg.Admin.Enabled {
 		if err := s.startAdmin(ctx); err != nil {
 			return err
@@ -412,5 +418,7 @@ func (s *Server) Stop() error {
 	}()
 
 	wg.Wait()
+	// After the listeners drained, so the last requests are counted.
+	s.stopUsage()
 	return errors.Join(publicErr, adminErr)
 }

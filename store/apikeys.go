@@ -38,6 +38,12 @@ type APIKey struct {
 	// provider carry one, and no backend persists it: empty means the key
 	// is its own allowance.
 	LimitID string
+	// Provider and ProviderKeyID identify a key verified by a delegated-auth
+	// provider: the provider's name and the key id it issued, before ID's
+	// "<provider>:" namespace. Usage reported to that provider is keyed by
+	// ProviderKeyID. Empty for the broadcaster's own keys; never persisted.
+	Provider      string
+	ProviderKeyID string
 }
 
 // QuotaID is the identity the rate limiter accounts this key under: its

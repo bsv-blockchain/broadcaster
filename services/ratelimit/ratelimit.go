@@ -27,6 +27,7 @@ const HeaderReason = apikey.HeaderRateLimitReason
 const (
 	ctxLimiter          = "ratelimit.limiter"
 	ctxTier             = "ratelimit.tier"
+	ctxCharged          = "ratelimit.charged"
 	localBucketCapacity = 100_000
 	warnInterval        = 10 * time.Second
 	// StatusClientClosedRequest aliases apikey's exported constant so both
@@ -222,6 +223,7 @@ func tierFromContext(c *gin.Context) (Tier, bool) {
 func (rl *RateLimiter) charge(c *gin.Context, p apikey.Principal, tier Tier, units int64) bool {
 	if units <= 0 || tier.UnitsPerMinute == 0 {
 		metrics.RateLimitDecisionsTotal.WithLabelValues(tier.Name, "allowed").Inc()
+		addCharged(c, units)
 		return true
 	}
 	if units > tier.UnitsPerMinute {
@@ -241,7 +243,32 @@ func (rl *RateLimiter) charge(c *gin.Context, p apikey.Principal, tier Tier, uni
 		return false
 	}
 	metrics.RateLimitDecisionsTotal.WithLabelValues(tier.Name, "allowed").Inc()
+	addCharged(c, units)
 	return true
+}
+
+// addCharged adds units to what this request has been charged.
+func addCharged(c *gin.Context, units int64) {
+	if units <= 0 {
+		return
+	}
+	prev, _ := c.Get(ctxCharged)
+	n, _ := prev.(int64)
+	c.Set(ctxCharged, n+units)
+}
+
+// Charged returns the cost units the limiter granted this request (the
+// route's charge plus any ChargeTxs), and whether a limiter guards the
+// route at all. A request the limiter refused, or whose client hung up
+// before the quota was granted, was charged 0. An unbounded tier is
+// charged its nominal cost.
+func Charged(c *gin.Context) (units int64, limited bool) {
+	if _, ok := c.Get(ctxLimiter); !ok {
+		return 0, false
+	}
+	v, _ := c.Get(ctxCharged)
+	units, _ = v.(int64)
+	return units, true
 }
 
 // takeDecision resolves one Decision for the caller's tier: the anonymous

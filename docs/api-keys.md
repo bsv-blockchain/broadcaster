@@ -421,6 +421,97 @@ Metric: `bsv_broadcaster_apikey_introspect_total{provider,result}`, where
 `result` is `valid`, `invalid`, `unauthorized` (bad service token), `error`,
 or `backoff` (not called because of an earlier failure).
 
+### Usage reporting to a provider (`usage`)
+
+A provider that sets `usage_url` can receive what each of its keys used. The
+provider can then show customers their usage, or bill for it. This is off
+unless `usage.enabled` is set:
+
+```yaml
+usage:
+  enabled: true                 # requires auth.enabled and a provider usage_url
+  flush_interval_ms: 60000      # how often each replica reports; 10s .. 1h
+  max_buckets: 100000           # cells held per replica between flushes
+  max_pending_entries: 100000   # per provider, kept for a retry while it is down
+  shutdown_flush_timeout_ms: 10000
+auth:
+  introspection:
+    acme:
+      # … key_prefix, url, token_env, tiers as above …
+      usage_url: https://auth.example.com/v1/usage   # same URL rules and token as url
+```
+
+**What is counted.** One count per request to a rate-limited route (`/tx`,
+`/txs`, `GET /tx/{txid}`, `/policy`, block processing status) by a key from
+that provider. Anonymous requests, invalid keys and local `bsvb_` keys are
+never reported. Each request lands in a cell of:
+
+- the provider's own `key_id` (as introspection returned it, without the
+  broadcaster's `<provider>:` namespace);
+- the route's stable name, never a path: `v1/tx`, `v1/txs`, `v1/tx/status`,
+  `v1/policy`, `v1/blocks/status`;
+- a status class: `2xx`, `4xx`, `5xx`, or `429` for a request the rate limiter
+  refused;
+- the UTC day the request finished.
+
+Each cell holds a count and `units`, the cost units the request was charged.
+With rate limiting on, that is what the limiter granted: the route's cost,
+plus `costs.submit_tx` per transaction of an accepted `/txs` batch (a batch
+counts as one request). A request it refused, or whose client hung up before
+the charge, gets 0, and a 429 is always 0. With rate limiting off it is the
+same nominal cost. A request whose handler panics is counted as `5xx`.
+
+**Protocol.** Every `flush_interval_ms` (±10%), at shutdown after the
+listeners drain, and early if `max_buckets` fills, each replica sends what
+it counted since its last flush:
+
+```
+POST <usage_url>
+Authorization: Bearer <service token>
+Content-Type: application/json
+Idempotency-Key: <stable per batch>
+
+{"entries": [{"key_id": "…", "endpoint": "v1/tx", "status_class": "2xx",
+              "date_utc": "2026-11-12", "count": 12, "units": 120}]}
+```
+
+A call carries at most 1000 entries and 1 MiB. Counts are deltas: the
+receiver adds them up, so replicas and regions report independently. The
+provider answers `200 {"accepted": n, "dropped": n}`. `dropped` covers
+entries it considered invalid, which are counted and not resent.
+
+**Delivery is at most once.** The receiver adds counts up, so a batch it
+may already have recorded is never resent:
+
+| Answer | What happens |
+|---|---|
+| `200` | Done. |
+| `503`, `429` | Kept and retried after `Retry-After` (capped at 5 minutes), else 60s. |
+| `401`, `403` | Kept and retried after 5 minutes; logged (fix the token). |
+| `404` | Kept and retried after 5 minutes; logged (fix `usage_url`, or wait for the provider to enable usage for this token). |
+| could not connect (dial, DNS or TLS handshake failure: nothing was sent) | Kept, retried after 30s. |
+| `502`, any other status, a timeout once the request was written | **Dropped**: it may already be counted. |
+| `400` | That batch is dropped and logged; later batches still go. |
+| `501` | Reporting to that provider stops until restart. |
+
+Kept batches wait, intact and oldest first, in a queue bounded by
+`max_pending_entries`, which bounds only what is left undelivered after a
+flush; when it is full the oldest are dropped. Every batch
+carries an `Idempotency-Key`, so a provider that de-duplicates on it can
+later let the broadcaster retry uncertain batches too. A replica that
+crashes loses at most one flush interval of counts. On shutdown a flush in
+progress is cancelled, and the final report must finish within
+`shutdown_flush_timeout_ms`.
+
+Metrics: `bsv_broadcaster_usage_requests_total{source,endpoint,class}`,
+`bsv_broadcaster_usage_flush_total{sink,result}` (`ok`, `retry`, `unauthorized`,
+`misconfigured`, `uncertain`, `rejected`, `disabled`),
+`bsv_broadcaster_usage_entries_sent_total{sink}`,
+`bsv_broadcaster_usage_entries_dropped_total{sink,reason}` (`uncertain`,
+`rejected`, `invalid`, `overflow`, `disabled`, `shutdown`),
+`bsv_broadcaster_usage_pending_entries{sink}` and
+`bsv_broadcaster_usage_buckets`. None of them carries a key label.
+
 ### Managing keys
 
 ```bash

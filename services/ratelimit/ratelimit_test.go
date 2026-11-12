@@ -274,3 +274,54 @@ func TestKeysSharingALimitShareQuotaAndConcurrency(t *testing.T) {
 		"in-flight and fail-open buckets are per limit too")
 	require.Equal(t, "key:key_a", apikey.Principal{KeyID: "key_a"}.Subject())
 }
+
+// TestChargedReportsWhatWasGranted pins ratelimit.Charged, which usage
+// reporting bills from: a granted charge (plus ChargeTxs), the nominal cost
+// on an unbounded tier, and nothing for a refused request or a client that
+// hung up before the quota was granted.
+func TestChargedReportsWhatWasGranted(t *testing.T) {
+	charged := func(rl *RateLimiter, p apikey.Principal, units int64, txs int, req *http.Request) (int64, bool) {
+		var got int64
+		var limited bool
+		gin.SetMode(gin.TestMode)
+		e := gin.New()
+		e.GET("/x", func(c *gin.Context) { apikey.WithPrincipal(c, p); c.Next() },
+			func(c *gin.Context) {
+				c.Next()
+				got, limited = Charged(c)
+			},
+			rl.Middleware(units),
+			func(c *gin.Context) {
+				if txs > 0 && !ChargeTxs(c, txs) {
+					return
+				}
+				c.Status(http.StatusNoContent)
+			})
+		e.ServeHTTP(httptest.NewRecorder(), req)
+		return got, limited
+	}
+
+	rl := New(testConfig(), newFakeQuota(), zap.NewNop(), WithClock(func() time.Time { return noon }))
+	got, limited := charged(rl, freeKey, 1, 0, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/x", nil))
+	require.True(t, limited)
+	require.EqualValues(t, 1, got, "a granted charge")
+
+	got, _ = charged(rl, apikey.Principal{KeyID: "key_e", Tier: "enterprise"}, 1, 3, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/x", nil))
+	require.EqualValues(t, 1+3*10, got, "an unbounded tier is charged its nominal cost, ChargeTxs included")
+
+	got, _ = charged(rl, freeKey, 100, 0, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/x", nil)) // free is 25/minute: unpayable
+	require.Zero(t, got, "a refused request was charged nothing")
+
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	hungUp := New(testConfig(), cancelAwareQuota{newFakeQuota()}, zap.NewNop(), WithClock(func() time.Time { return noon }))
+	got, limited = charged(hungUp, freeKey, 10, 0, httptest.NewRequestWithContext(cancelled, http.MethodGet, "/x", nil))
+	require.True(t, limited)
+	require.Zero(t, got, "a client that hung up before the quota was granted was charged nothing")
+
+	e := gin.New()
+	var noLimiter bool
+	e.GET("/x", func(c *gin.Context) { _, noLimiter = Charged(c) })
+	e.ServeHTTP(httptest.NewRecorder(), httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/x", nil))
+	require.False(t, noLimiter, "no limiter on the route")
+}

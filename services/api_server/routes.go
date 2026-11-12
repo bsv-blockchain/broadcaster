@@ -290,20 +290,20 @@ func (s *Server) registerRoutes(r *gin.Engine) {
 	// Public routes. guarded() adds API-key identification and the tier
 	// quota when auth/ratelimit are enabled, charging the given cost units.
 	read := s.cfg.RateLimit.Costs.Read
-	r.GET("/api/v1/blocks/processing-status", s.guarded(read, s.handleListBlockProcessingStatus)...)
-	r.GET("/api/v1/blocks/processing-status/:blockHash", s.guarded(read, s.handleGetBlockProcessingStatus)...)
+	r.GET("/api/v1/blocks/processing-status", s.guarded("v1/blocks/status", read, s.handleListBlockProcessingStatus)...)
+	r.GET("/api/v1/blocks/processing-status/:blockHash", s.guarded("v1/blocks/status", read, s.handleGetBlockProcessingStatus)...)
 	// With the admin listener enabled, reprocess is served only there
 	// (admin.go), behind the admin token.
 	if !s.cfg.Admin.Enabled {
 		r.POST("/api/v1/blocks/:blockHash/reprocess", s.handleReprocessBlock)
 	}
-	r.GET("/tx/:txid", s.guarded(read, s.handleGetTransaction)...)
-	r.POST("/tx", s.guarded(s.cfg.RateLimit.Costs.SubmitTx, s.handleSubmitTransaction)...)
+	r.GET("/tx/:txid", s.guarded("v1/tx/status", read, s.handleGetTransaction)...)
+	r.POST("/tx", s.guarded("v1/tx", s.cfg.RateLimit.Costs.SubmitTx, s.handleSubmitTransaction)...)
 	// /txs pays the read cost up front, then ChargeTxs(n × submit_tx) once
 	// the batch is parsed (handleSubmitTransactions).
-	r.POST("/txs", s.guarded(read, s.handleSubmitTransactions)...)
+	r.POST("/txs", s.guarded("v1/txs", read, s.handleSubmitTransactions)...)
 	// ARC-compatible policy discovery (issue #212). Bare /policy matches the
 	// path clients 404'd on; /v1/policy is the alias used by the ARC spec.
-	r.GET("/policy", s.guarded(read, s.handlePolicy)...)
-	r.GET("/v1/policy", s.guarded(read, s.handlePolicy)...)
+	r.GET("/policy", s.guarded("v1/policy", read, s.handlePolicy)...)
+	r.GET("/v1/policy", s.guarded("v1/policy", read, s.handlePolicy)...)
 }

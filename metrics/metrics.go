@@ -1414,6 +1414,51 @@ var APIKeyIntrospectTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 	Help: "API key introspection calls by provider and result (valid|invalid|unauthorized|error|backoff).",
 }, []string{"provider", "result"})
 
+// UsageRequestsTotal counts requests metered for usage reporting, by
+// provider (source), route name and status class. No key label: per-key
+// totals go to the provider, not to Prometheus.
+var UsageRequestsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "bsv_broadcaster_usage_requests_total",
+	Help: "Requests metered for usage reporting, by provider, endpoint and status class.",
+}, []string{"source", "endpoint", "class"})
+
+// UsageFlushTotal counts usage report calls by provider and result: ok |
+// retry (kept for a later flush: 503/429, or not sent) | unauthorized |
+// misconfigured (404: no usage endpoint for this token yet; kept) |
+// uncertain (dropped: the receiver may have recorded it) | rejected (400)
+// | disabled (501).
+var UsageFlushTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "bsv_broadcaster_usage_flush_total",
+	Help: "Usage report calls by provider and result (ok|retry|unauthorized|misconfigured|uncertain|rejected|disabled).",
+}, []string{"sink", "result"})
+
+// UsageEntriesSentTotal counts usage entries a provider accepted.
+var UsageEntriesSentTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "bsv_broadcaster_usage_entries_sent_total",
+	Help: "Usage entries accepted by the provider.",
+}, []string{"sink"})
+
+// UsageEntriesDroppedTotal counts usage entries never delivered, by reason:
+// uncertain | rejected | invalid | overflow | disabled | shutdown.
+var UsageEntriesDroppedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "bsv_broadcaster_usage_entries_dropped_total",
+	Help: "Usage entries never delivered, by provider and reason.",
+}, []string{"sink", "reason"})
+
+// UsagePendingEntries is how many usage entries wait for a retry, per
+// provider.
+var UsagePendingEntries = promauto.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "bsv_broadcaster_usage_pending_entries",
+	Help: "Usage entries waiting to be retried, per provider.",
+}, []string{"sink"})
+
+// UsageBuckets is how many usage buckets this replica holds before the
+// next flush.
+var UsageBuckets = promauto.NewGauge(prometheus.GaugeOpts{
+	Name: "bsv_broadcaster_usage_buckets",
+	Help: "Usage buckets held in memory until the next flush.",
+})
+
 // RetentionExtendFailuresTotal counts resubmits whose transaction row could
 // not be extended to the submitter's retention. The submit answers 503 so
 // the client's retry repeats the extend; intake rejections only count it.

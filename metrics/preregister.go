@@ -159,6 +159,21 @@ func PreRegisterAPIKey() {
 	}
 }
 
+// PreRegisterUsage exports the usage-reporting series for each provider
+// with a usage sink at 0.
+func PreRegisterUsage(providers []string) {
+	for _, p := range providers {
+		for _, result := range []string{"ok", "retry", "unauthorized", "misconfigured", "uncertain", "rejected", "disabled"} {
+			UsageFlushTotal.WithLabelValues(p, result)
+		}
+		for _, reason := range []string{"uncertain", "rejected", "invalid", "overflow", "disabled", "shutdown"} {
+			UsageEntriesDroppedTotal.WithLabelValues(p, reason)
+		}
+		UsageEntriesSentTotal.WithLabelValues(p)
+		UsagePendingEntries.WithLabelValues(p)
+	}
+}
+
 // PreRegisterIntrospection exports every APIKeyIntrospectTotal series for
 // the configured providers at 0.
 func PreRegisterIntrospection(providers []string) {

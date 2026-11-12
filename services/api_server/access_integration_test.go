@@ -47,7 +47,7 @@ func TestAccessControlEndToEnd(t *testing.T) {
 	srv.limiter = ratelimit.New(cfg.RateLimit, st, zap.NewNop(), ratelimit.WithClock(func() time.Time { return fixed }))
 
 	api := gin.New()
-	api.GET("/limited", srv.guarded(1, func(c *gin.Context) { c.Status(http.StatusNoContent) })...)
+	api.GET("/limited", srv.guarded("v1/test", 1, func(c *gin.Context) { c.Status(http.StatusNoContent) })...)
 	admin := srv.newAdminRouter()
 
 	call := func(key string) *httptest.ResponseRecorder {
@@ -161,7 +161,7 @@ func TestIntrospectionProviderEndToEnd(t *testing.T) {
 	srv.limiter = ratelimit.New(cfg.RateLimit, st, zap.NewNop(), ratelimit.WithClock(func() time.Time { return fixed }))
 
 	api := gin.New()
-	api.GET("/limited", srv.guarded(1, func(c *gin.Context) { c.Status(http.StatusNoContent) })...)
+	api.GET("/limited", srv.guarded("v1/test", 1, func(c *gin.Context) { c.Status(http.StatusNoContent) })...)
 	call := func(key string) int {
 		req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/limited", nil)
 		if key != "" {
