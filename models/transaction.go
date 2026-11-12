@@ -101,6 +101,11 @@ type TransactionStatus struct {
 	// never persist it, the SSE frame builder never serializes it, and the
 	// webhook service blanks it before posting a status to a receiver.
 	CallbackTokenHint string `json:"callbackTokenHint,omitempty"`
+	// ExpiresAt is when the stored row may be deleted (data retention, set
+	// from the submitter's tier — see store.RetentionExtender). nil keeps
+	// the row forever. Only backends that implement retention persist it;
+	// never serialized.
+	ExpiresAt *time.Time `json:"-"`
 }
 
 // Status represents the various states a transaction can be in
@@ -334,6 +339,10 @@ type Submission struct {
 	LastAttemptAt *time.Time
 	LastResult    string
 	CreatedAt     time.Time
+	// ExpiresAt is when the row may be deleted (data retention, from the
+	// submitter's tier); nil keeps it forever. Only backends that implement
+	// retention persist it.
+	ExpiresAt *time.Time
 }
 
 // OrphanedAnchor is one historical MINED anchor a reorg superseded: the

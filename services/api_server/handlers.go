@@ -110,6 +110,9 @@ type submitOptions struct {
 	CallbackURL       string
 	CallbackToken     string
 	FullStatusUpdates bool
+	// ExpiresAt is the retention deadline for the rows this request writes
+	// (Server.retentionExpiry); nil keeps them forever.
+	ExpiresAt *time.Time
 }
 
 // extractSubmitOptions reads the callback-subscription headers off a submit
@@ -180,6 +183,7 @@ func (s *Server) recordSubmission(_ context.Context, txid string, opts submitOpt
 		CallbackToken:     opts.CallbackToken,
 		FullStatusUpdates: opts.FullStatusUpdates,
 		CreatedAt:         time.Now(),
+		ExpiresAt:         opts.ExpiresAt,
 	}
 	select {
 	case s.submissionCh <- submissionRecord{sub: sub}:
@@ -871,6 +875,7 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 	// predicate runs again at dial time on the webhook delivery client to
 	// catch DNS rebinding.
 	opts := extractSubmitOptions(c)
+	opts.ExpiresAt = s.retentionExpiry(c)
 	if !s.validateCallbackURL(c, opts.CallbackURL) {
 		return
 	}
@@ -1018,6 +1023,7 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 			RawTx: rawTx,
 			// Persist the key so a child submitted later can follow it.
 			PartitionKey: partitionKey,
+			ExpiresAt:    opts.ExpiresAt,
 		}
 		var existing *models.TransactionStatus
 		var dedupErr error
@@ -1029,6 +1035,11 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 			// consumer would have no raw tx to load. Shed it like
 			// backpressure; the retry's CAS inserts or finds the row.
 			s.logger.Error("dedup CAS failed", logfields.TxID(txid), zap.Error(dedupErr))
+			respondStoreUnavailable(c)
+			return
+		case s.extendOnResubmit(c.Request.Context(), txid, existing, inserted, opts.ExpiresAt) != nil:
+			// A resubmit whose row could not be extended to this caller's
+			// retention: nothing published yet, the retry repeats the extend.
 			respondStoreUnavailable(c)
 			return
 		case !inserted && shouldRepublishExisting(existing.Status):
@@ -1256,7 +1267,7 @@ func (s *Server) rejectAtIntake(ctx context.Context, txid, reason string, status
 		zap.String("reason", reason),
 		logfields.Stage(logfields.StageIntake),
 	)
-	wrote := s.persistRejectedAtIntake(ctx, txid, reason, statusCode)
+	wrote := s.persistRejectedAtIntake(ctx, txid, reason, statusCode, opts.ExpiresAt)
 	s.recordSubmission(ctx, txid, opts)
 	if !wrote || s.publisher == nil {
 		return
@@ -1289,7 +1300,7 @@ func (s *Server) rejectAtIntake(ctx context.Context, txid, reason string, status
 // wrote is false when an existing row already forbids a REJECTED
 // transition (SEEN_*/MINED/IMMUTABLE — issue #251). Callers must not
 // publish a REJECTED status event in that case.
-func (s *Server) persistRejectedAtIntake(ctx context.Context, txid, reason string, statusCode int) (wrote bool) {
+func (s *Server) persistRejectedAtIntake(ctx context.Context, txid, reason string, statusCode int, expiresAt *time.Time) (wrote bool) {
 	if s.store == nil {
 		return true
 	}
@@ -1299,8 +1310,14 @@ func (s *Server) persistRejectedAtIntake(ctx context.Context, txid, reason strin
 		StatusCode: statusCode,
 		ExtraInfo:  reason,
 		Timestamp:  time.Now(),
+		ExpiresAt:  expiresAt,
 	}
 	existing, inserted, err := s.store.GetOrInsertStatus(ctx, row)
+	// The client already has its 400; a failed extension here is logged and
+	// counted (extendOnResubmit), and the row keeps its earlier retention.
+	if err == nil {
+		_ = s.extendOnResubmit(ctx, txid, existing, inserted, expiresAt)
+	}
 	if err != nil {
 		s.logger.Warn(
 			"intake rejection persist failed",
@@ -1345,6 +1362,7 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 	// SSRF guard: reject early so a hostile client posting a 256 MiB batch
 	// with a banned callback host doesn't get to consume any ingress.
 	opts := extractSubmitOptions(c)
+	opts.ExpiresAt = s.retentionExpiry(c)
 	if !s.validateCallbackURL(c, opts.CallbackURL) {
 		return
 	}
@@ -1505,6 +1523,7 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 				// reaper can rebroadcast stuck txs without re-fetching.
 				RawTx:        p.raw,
 				PartitionKey: keyByTxid[p.txid],
+				ExpiresAt:    opts.ExpiresAt,
 			}
 			existing, inserted, dedupErr := s.store.GetOrInsertStatus(ctx, row)
 			switch {
@@ -1514,6 +1533,10 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 				// reaches Kafka; rows already inserted are RECEIVED, which
 				// the retry republishes (shouldRepublishExisting).
 				s.logger.Error("dedup CAS failed", logfields.TxID(p.txid), zap.Error(dedupErr))
+				s.shedBatch(c, receivedTxIDs, receivedAt, opts)
+				return
+			case s.extendOnResubmit(ctx, p.txid, existing, inserted, opts.ExpiresAt) != nil:
+				// Nothing reached Kafka yet; the retry repeats the extend.
 				s.shedBatch(c, receivedTxIDs, receivedAt, opts)
 				return
 			case !inserted && shouldRepublishExisting(existing.Status):

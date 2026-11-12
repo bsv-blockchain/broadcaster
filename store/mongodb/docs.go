@@ -166,6 +166,7 @@ type txDoc struct {
 	MerkleRegisteredAt time.Time           `bson:"merkle_registered_at,omitempty"`
 	OrphanedAnchors    []orphanedAnchorDoc `bson:"orphaned_anchors,omitempty"`
 	PartitionKey       string              `bson:"partition_key,omitempty"`
+	ExpiresAt          *time.Time          `bson:"expires_at,omitempty"`
 	Version            int64               `bson:"version"`
 }
 
@@ -186,6 +187,7 @@ func txDocFromStatus(st *models.TransactionStatus) txDoc {
 	st.CreatedAt = msTrunc(st.CreatedAt)
 	st.NextRetryAt = msTrunc(st.NextRetryAt)
 	st.MerkleRegisteredAt = msTrunc(st.MerkleRegisteredAt)
+	st.ExpiresAt = msTruncPtr(st.ExpiresAt)
 	return txDoc{
 		TxID:               st.TxID,
 		Status:             string(st.Status),
@@ -203,6 +205,7 @@ func txDocFromStatus(st *models.TransactionStatus) txDoc {
 		MerkleRegisteredAt: st.MerkleRegisteredAt,
 		OrphanedAnchors:    anchorsToDocs(st.OrphanedProofs),
 		PartitionKey:       st.PartitionKey,
+		ExpiresAt:          st.ExpiresAt,
 	}
 }
 
@@ -223,6 +226,7 @@ func (d txDoc) toStatus() *models.TransactionStatus {
 		MerkleRegisteredAt: d.MerkleRegisteredAt,
 		OrphanedProofs:     anchorsFromDocs(d.OrphanedAnchors),
 		PartitionKey:       d.PartitionKey,
+		ExpiresAt:          d.ExpiresAt,
 	}
 	if len(d.MerklePath) > 0 {
 		st.MerklePath = models.HexBytes(d.MerklePath)
@@ -278,6 +282,7 @@ type submissionDoc struct {
 	LastAttemptAt       *time.Time `bson:"last_attempt_at,omitempty"`
 	LastResult          string     `bson:"last_result,omitempty"`
 	CreatedAt           time.Time  `bson:"created_at"`
+	ExpiresAt           *time.Time `bson:"expires_at,omitempty"`
 }
 
 // submissionDocFromModel truncates in the caller's struct as well as in the
@@ -287,6 +292,7 @@ func submissionDocFromModel(sub *models.Submission) submissionDoc {
 	sub.CreatedAt = msTrunc(sub.CreatedAt)
 	sub.NextRetryAt = msTruncPtr(sub.NextRetryAt)
 	sub.LastAttemptAt = msTruncPtr(sub.LastAttemptAt)
+	sub.ExpiresAt = msTruncPtr(sub.ExpiresAt)
 	return submissionDoc{
 		SubmissionID:        sub.SubmissionID,
 		TxID:                sub.TxID,
@@ -300,6 +306,7 @@ func submissionDocFromModel(sub *models.Submission) submissionDoc {
 		LastAttemptAt:       sub.LastAttemptAt,
 		LastResult:          sub.LastResult,
 		CreatedAt:           sub.CreatedAt,
+		ExpiresAt:           sub.ExpiresAt,
 	}
 }
 
@@ -317,6 +324,7 @@ func (d submissionDoc) toModel() *models.Submission {
 		LastAttemptAt:       d.LastAttemptAt,
 		LastResult:          d.LastResult,
 		CreatedAt:           d.CreatedAt,
+		ExpiresAt:           d.ExpiresAt,
 	}
 }
 

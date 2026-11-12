@@ -532,15 +532,18 @@ ratelimit:
     units_per_minute: 50
     max_in_flight: 5
     max_batch: 1
+    retention_days: 30  # 0 = keep forever; see docs/api-keys.md "Data retention per tier"
   # free is required whenever ratelimit.enabled: it's the fallback tier for
   # a key whose configured tier is later removed. Tier names must be
   # lowercase and match ^[a-z0-9][a-z0-9_-]*$. A bounded tier
   # (units_per_minute > 0) must be "payable": costs.submit_tx <=
   # units_per_minute, and, when max_batch > 0, max_batch * costs.submit_tx +
   # costs.read <= units_per_minute. units_per_minute: 0 (e.g. unlimited
-  # below) has no budget to check.
+  # below) has no budget to check. retention_days (0 = keep forever, else
+  # >= 7) is how long a tier's transaction and submission rows are kept;
+  # only the mongodb backend enforces it.
   tiers:
-    free:       { units_per_minute: 50,    max_in_flight: 5,   max_batch: 1 }
-    standard:    { units_per_minute: 3000,  max_in_flight: 20,  max_batch: 100 }
-    high:        { units_per_minute: 30000, max_in_flight: 100, max_batch: 1000 }
-    unlimited: { units_per_minute: 0,     max_in_flight: 500, max_batch: 10000 }
+    free:      { units_per_minute: 50,    max_in_flight: 5,   max_batch: 1,     retention_days: 30 }
+    standard:  { units_per_minute: 3000,  max_in_flight: 20,  max_batch: 100,   retention_days: 90 }
+    high:      { units_per_minute: 30000, max_in_flight: 100, max_batch: 1000,  retention_days: 365 }
+    unlimited: { units_per_minute: 0,     max_in_flight: 500, max_batch: 10000, retention_days: 730 }

@@ -1413,3 +1413,11 @@ var APIKeyIntrospectTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "bsv_broadcaster_apikey_introspect_total",
 	Help: "API key introspection calls by provider and result (valid|invalid|unauthorized|error|backoff).",
 }, []string{"provider", "result"})
+
+// RetentionExtendFailuresTotal counts resubmits whose transaction row could
+// not be extended to the submitter's retention. The submit answers 503 so
+// the client's retry repeats the extend; intake rejections only count it.
+var RetentionExtendFailuresTotal = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "bsv_broadcaster_retention_extend_failures_total",
+	Help: "Resubmits whose transaction row could not be extended to the submitter's retention.",
+})
