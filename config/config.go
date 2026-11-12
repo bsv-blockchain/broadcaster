@@ -2096,6 +2096,12 @@ func validateIntrospection(cfg *Config) error {
 		if err != nil || u.Host == "" || (u.Scheme != "https" && (u.Scheme != "http" || !isLoopbackHost(u.Hostname()))) {
 			return fmt.Errorf("%s.url must be an absolute https URL (http only on a loopback host)", field)
 		}
+		if u.User != nil {
+			return fmt.Errorf("%s.url must not contain user info; the service token authenticates", field)
+		}
+		if u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
+			return fmt.Errorf("%s.url must not contain a query or fragment", field)
+		}
 		switch {
 		case p.Token != "" && p.TokenEnv != "":
 			return fmt.Errorf("%s: set token or token_env, not both", field)

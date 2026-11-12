@@ -162,6 +162,16 @@ func TestValidateAccessControl(t *testing.T) {
 			p.URL = "http://auth.example.com/v1/introspect"
 			c.Auth.Introspection = map[string]IntrospectionProvider{testProvider: p}
 		}, "https"},
+		{"introspection url with user info", func(c *Config) {
+			p := testIntrospectionProvider()
+			p.URL = "https://user:pass@auth.example.com/v1/introspect"
+			c.Auth.Introspection = map[string]IntrospectionProvider{testProvider: p}
+		}, "must not contain user info"},
+		{"introspection url with a query", func(c *Config) {
+			p := testIntrospectionProvider()
+			p.URL = "https://auth.example.com/v1/introspect?key=x"
+			c.Auth.Introspection = map[string]IntrospectionProvider{testProvider: p}
+		}, "must not contain a query or fragment"},
 		{"introspection plain http on loopback", func(c *Config) {
 			p := testIntrospectionProvider()
 			p.URL = "http://127.0.0.1:8099/introspect"

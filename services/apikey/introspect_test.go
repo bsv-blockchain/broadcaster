@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -150,6 +151,8 @@ func TestIntrospectorBacksOffAfterFailures(t *testing.T) {
 		"rejected token":              {http.StatusOK, "", "wrong", ``, backoffMisconfigured},
 		"404 (wrong url)":             {http.StatusNotFound, "", testServiceToken, ``, backoffMisconfigured},
 		"undecodable answer":          {http.StatusOK, "", testServiceToken, `nope`, backoffTransient},
+		"valid without key_id":        {http.StatusOK, "", testServiceToken, `{"valid":true,"tier":"gold"}`, 0},
+		"expiry not RFC 3339":         {http.StatusOK, "", testServiceToken, `{"valid":true,"key_id":"k","expires_at":"2027-01-31"}`, 0},
 		"invalid key":                 {http.StatusOK, "", testServiceToken, `{"valid":false}`, 0},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -278,4 +281,96 @@ func generateWithPrefix(t *testing.T, prefix string) string {
 	raw, err := Generate()
 	require.NoError(t, err)
 	return prefix + raw[len(Prefix):]
+}
+
+// TestIntrospectorCapsConcurrentCalls pins that in-flight calls to one
+// provider are capped by the Introspector itself, not by the transport's
+// connection limit: over HTTP/2 a single connection multiplexes many
+// requests, so MaxConnsPerHost alone would let a cold-cache burst through.
+func TestIntrospectorCapsConcurrentCalls(t *testing.T) {
+	var inflight, peak atomic.Int32
+	var http2 atomic.Bool
+	release := make(chan struct{})
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http2.Store(r.ProtoMajor == 2)
+		n := inflight.Add(1)
+		for {
+			p := peak.Load()
+			if n <= p || peak.CompareAndSwap(p, n) {
+				break
+			}
+		}
+		<-release
+		inflight.Add(-1)
+		_, _ = w.Write([]byte(`{"valid":false}`))
+	}))
+	srv.EnableHTTP2 = true
+	srv.StartTLS()
+	t.Cleanup(srv.Close)
+
+	in := NewIntrospector(IntrospectorConfig{Name: testProvider, URL: srv.URL, Token: testServiceToken, Timeout: 10 * time.Second}, zap.NewNop())
+	// The test server's client trusts its certificate and speaks HTTP/2 with
+	// no connection limit, so only the Introspector's own cap can hold.
+	in.client.Transport = srv.Client().Transport
+
+	const callers = 4 * introspectMaxConcurrent
+	done := make(chan struct{}, callers)
+	for i := range callers {
+		go func() {
+			_, _ = in.GetAPIKeyByHash(context.Background(), Hash(fmt.Sprintf("key-%d", i)))
+			done <- struct{}{}
+		}()
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for inflight.Load() < introspectMaxConcurrent && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	time.Sleep(100 * time.Millisecond) // give any excess calls time to arrive
+	require.EqualValues(t, introspectMaxConcurrent, peak.Load(), "concurrent calls to the provider")
+	require.True(t, http2.Load(), "the fake provider must be reached over HTTP/2 for this test to mean anything")
+
+	close(release)
+	for range callers {
+		<-done
+	}
+	require.EqualValues(t, introspectMaxConcurrent, peak.Load())
+}
+
+// TestIntrospectorRechecksBackoffAfterWaiting pins that a call queued for a
+// slot does not go out once a backoff started while it waited.
+func TestIntrospectorRechecksBackoffAfterWaiting(t *testing.T) {
+	var calls atomic.Int32
+	srv := fakeProvider(t, http.StatusOK, `{"valid":false}`)
+	srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		_, _ = w.Write([]byte(`{"valid":false}`))
+	})
+	in := introspectorFor(srv, testServiceToken)
+	for range introspectMaxConcurrent {
+		in.sem <- struct{}{} // every slot busy
+	}
+	errc := make(chan error, 1)
+	go func() {
+		_, err := in.GetAPIKeyByHash(context.Background(), Hash("queued"))
+		errc <- err
+	}()
+	time.Sleep(50 * time.Millisecond) // let it queue
+	in.extendBackoff(backoffMax)
+	<-in.sem // free one slot
+	err := <-errc
+	require.ErrorIs(t, err, errIntrospectionBackoff)
+	require.Zero(t, calls.Load(), "the provider was called despite the backoff")
+}
+
+// TestIntrospectorQueuedCallHonoursContext pins that a call waiting for a
+// slot gives up when its context ends.
+func TestIntrospectorQueuedCallHonoursContext(t *testing.T) {
+	in := introspectorFor(fakeProvider(t, http.StatusOK, `{"valid":false}`), testServiceToken)
+	for range introspectMaxConcurrent {
+		in.sem <- struct{}{}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	_, err := in.GetAPIKeyByHash(ctx, Hash("x"))
+	require.ErrorIs(t, err, context.DeadlineExceeded)
 }

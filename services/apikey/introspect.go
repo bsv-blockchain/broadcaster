@@ -23,10 +23,12 @@ import (
 const (
 	introspectMaxBody   = 64 << 10
 	introspectWarnEvery = 10 * time.Second
-	// introspectMaxConns caps concurrent connections to one provider, so a
+	// introspectMaxConcurrent caps in-flight calls to one provider, so a
 	// burst of distinct uncached keys (a cold cache after a deploy) queues
-	// here instead of arriving at the provider all at once.
-	introspectMaxConns = 16
+	// here instead of arriving at the provider all at once. It is enforced
+	// with a semaphore around the call, not by the transport alone: over
+	// HTTP/2 one connection multiplexes many concurrent requests.
+	introspectMaxConcurrent = 16
 
 	// After a failed call the provider is left alone for a while: every
 	// uncached key's lookup would otherwise go straight back to a provider
@@ -34,7 +36,7 @@ const (
 	// rate-limit per source IP would otherwise throttle every replica behind
 	// the same egress. Cached keys keep working throughout via the
 	// resolver's stale policy.
-	backoffTransient     = 2 * time.Second  // timeout, connection error, 5xx, malformed answer
+	backoffTransient     = 2 * time.Second  // timeout, connection error, 5xx, undecodable answer
 	backoffThrottled     = 5 * time.Second  // 429 without Retry-After
 	backoffMisconfigured = 30 * time.Second // 401/403 or another unexpected status: needs a config fix
 	backoffMax           = time.Minute      // cap on a provider's Retry-After
@@ -105,6 +107,7 @@ type Introspector struct {
 	tiers  map[string]string
 	client *http.Client
 	logger *zap.Logger
+	sem    chan struct{} // introspectMaxConcurrent slots
 
 	now func() time.Time
 
@@ -116,8 +119,8 @@ type Introspector struct {
 // NewIntrospector builds an Introspector.
 func NewIntrospector(cfg IntrospectorConfig, logger *zap.Logger) *Introspector {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.MaxConnsPerHost = introspectMaxConns
-	transport.MaxIdleConnsPerHost = introspectMaxConns
+	transport.MaxConnsPerHost = introspectMaxConcurrent
+	transport.MaxIdleConnsPerHost = introspectMaxConcurrent
 	tiers := make(map[string]string, len(cfg.Tiers))
 	for k, v := range cfg.Tiers {
 		tiers[strings.ToLower(k)] = v
@@ -132,6 +135,7 @@ func NewIntrospector(cfg IntrospectorConfig, logger *zap.Logger) *Introspector {
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		},
 		logger:   logger.Named("introspect").With(zap.String("provider", cfg.Name)),
+		sem:      make(chan struct{}, introspectMaxConcurrent),
 		now:      time.Now,
 		warnedAt: map[string]time.Time{},
 	}
@@ -151,12 +155,18 @@ type introspectResponse struct {
 
 // GetAPIKeyByHash implements Lookup.
 func (in *Introspector) GetAPIKeyByHash(ctx context.Context, hash string) (*store.APIKey, error) {
-	in.mu.Lock()
-	until := in.openUntil
-	in.mu.Unlock()
-	if in.now().Before(until) {
-		metrics.APIKeyIntrospectTotal.WithLabelValues(in.name, introspectBackoff).Inc()
-		return nil, fmt.Errorf("introspect %s: %w until %s", in.name, errIntrospectionBackoff, until.UTC().Format(time.RFC3339))
+	if err := in.backingOff(); err != nil {
+		return nil, err
+	}
+	select {
+	case in.sem <- struct{}{}:
+	case <-ctx.Done():
+		return nil, fmt.Errorf("introspect %s: waiting for a free call slot: %w", in.name, ctx.Err())
+	}
+	defer func() { <-in.sem }()
+	// A call that failed while this one queued may have started a backoff.
+	if err := in.backingOff(); err != nil {
+		return nil, err
 	}
 	k, result, backoff, err := in.introspect(ctx, hash)
 	metrics.APIKeyIntrospectTotal.WithLabelValues(in.name, result).Inc()
@@ -164,6 +174,19 @@ func (in *Introspector) GetAPIKeyByHash(ctx context.Context, hash string) (*stor
 		in.extendBackoff(backoff)
 	}
 	return k, err
+}
+
+// backingOff returns errIntrospectionBackoff, and counts it, while a
+// backoff is in force.
+func (in *Introspector) backingOff() error {
+	in.mu.Lock()
+	until := in.openUntil
+	in.mu.Unlock()
+	if !in.now().Before(until) {
+		return nil
+	}
+	metrics.APIKeyIntrospectTotal.WithLabelValues(in.name, introspectBackoff).Inc()
+	return fmt.Errorf("introspect %s: %w until %s", in.name, errIntrospectionBackoff, until.UTC().Format(time.RFC3339))
 }
 
 // extendBackoff stops calls for d from now, unless a longer backoff is
@@ -237,9 +260,11 @@ func (in *Introspector) introspect(ctx context.Context, hash string) (k *store.A
 	if !r.Valid {
 		return nil, introspectInvalid, 0, store.ErrAPIKeyNotFound
 	}
+	// A malformed record fails only its own key: backing off the provider
+	// for it would 503 every other uncached key while one client retries.
 	if r.KeyID == "" {
 		in.throttledLog("introspection provider sent a valid answer without key_id")
-		return nil, introspectError, backoffTransient, fmt.Errorf("introspect %s: valid answer without key_id", in.name)
+		return nil, introspectError, 0, fmt.Errorf("introspect %s: valid answer without key_id", in.name)
 	}
 	k = &store.APIKey{
 		ID:     in.namespaced(r.KeyID),
@@ -254,7 +279,7 @@ func (in *Introspector) introspect(ctx context.Context, hash string) (k *store.A
 		t, err := time.Parse(time.RFC3339Nano, *r.ExpiresAt)
 		if err != nil {
 			in.throttledLog("introspection provider sent an expires_at that is not RFC 3339", zap.Error(err))
-			return nil, introspectError, backoffTransient, fmt.Errorf("introspect %s: expires_at: %w", in.name, err)
+			return nil, introspectError, 0, fmt.Errorf("introspect %s: expires_at: %w", in.name, err)
 		}
 		t = t.UTC()
 		k.ExpiresAt = &t

@@ -277,7 +277,8 @@ auth:
   then a 6-character base62 CRC32 of the body. Malformed keys are rejected
   before any network call.
 - `url` must be `https` (plain `http` is accepted only on a loopback host):
-  the service token travels with every call. Redirects are not followed.
+  the service token travels with every call. It must not carry user info, a
+  query or a fragment. Redirects are not followed.
 - The service token is trimmed of surrounding whitespace (a secret mounted
   from a file usually ends in a newline) and must not contain any other
   whitespace or control characters.
@@ -332,13 +333,15 @@ for a while and fails fast instead:
 | `429` | `Retry-After` (seconds or an HTTP date, capped at 60s), else 5s |
 | `5xx` | `Retry-After` (capped at 60s), else 2s |
 | timeout, connection error, undecodable answer | 2s |
+| a valid answer without `key_id`, or an `expires_at` that isn't RFC 3339 | none: only that key gets `503` |
 
 A backoff only ever extends. During it, cached keys keep working and uncached
 keys get `503`. This keeps an outage or a bad token from sending every
 request to the provider, which matters for providers that rate-limit per
 source IP: a burst from one replica would otherwise throttle every replica
-behind the same egress. Calls to one provider are also limited to 16
-concurrent connections per replica.
+behind the same egress. Each replica also makes at most 16 concurrent calls
+to one provider (a cap on calls, not just connections, so it holds over
+HTTP/2); further lookups queue for a free slot.
 
 Revoking a provider key takes effect within the provider's own propagation
 delay plus `key_cache_ttl_ms`. The admin endpoints (`/admin/keys`) manage
