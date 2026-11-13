@@ -9,33 +9,35 @@ import (
 // Requirement is one of "Required", "Recommended", "Optional" — these map
 // directly onto pill styling in the rendered docs.
 type RouteHeader struct {
-	Name        string
-	Requirement string
-	Description string
+	Name        string `json:"name"`
+	Requirement string `json:"requirement"`
+	Description string `json:"description"`
 }
 
 // RouteBody documents one acceptable request body shape for a route. Routes
 // with multiple bodies (e.g. POST /tx) render a content-type selector so
 // clients only see one example at a time.
 type RouteBody struct {
-	ContentType string
-	Description string
-	Example     string
+	ContentType string `json:"contentType"`
+	Description string `json:"description,omitempty"`
+	Example     string `json:"example,omitempty"`
 }
 
 // RouteDoc describes a single API endpoint for the rendered docs page.
 // Summary is the short tagline shown in the collapsed card header;
 // Description is the long-form explanation revealed on expand.
+//
+// The JSON shape is the docs site's web/content/routes.json (WriteRoutesJSON).
 type RouteDoc struct {
-	Method         string
-	Path           string
-	Summary        string
-	Description    string
-	Headers        []RouteHeader
-	RequestBodies  []RouteBody
-	ResponseStatus string
-	ResponseBody   string
-	Notes          string
+	Method         string        `json:"method"`
+	Path           string        `json:"path"`
+	Summary        string        `json:"summary"`
+	Description    string        `json:"description,omitempty"`
+	Headers        []RouteHeader `json:"headers"`
+	RequestBodies  []RouteBody   `json:"requestBodies"`
+	ResponseStatus string        `json:"responseStatus,omitempty"`
+	ResponseBody   string        `json:"responseBody,omitempty"`
+	Notes          string        `json:"notes,omitempty"`
 }
 
 // docsPage is the template data root: the route list plus any page-level
@@ -307,3 +309,4 @@ func (s *Server) registerRoutes(r *gin.Engine) {
 	r.GET("/policy", s.guarded("v1/policy", read, s.handlePolicy)...)
 	r.GET("/v1/policy", s.guarded("v1/policy", read, s.handlePolicy)...)
 }
+
