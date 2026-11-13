@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net/http"
 	"sync"
 	"time"
@@ -72,6 +73,12 @@ type Server struct {
 	// Nil-safe: nil (no chain source configured, or disabled) skips the gate.
 	finality *finality.Checker
 	server   *http.Server
+	// site is the docs site's static export; nil means the one embedded in
+	// the binary (web.FS). Tests inject their own.
+	site fs.FS
+	// siteRoutes holds the route patterns the docs site registered. Written
+	// once while the router is built, read-only while it serves.
+	siteRoutes map[string]bool
 
 	// keyResolver, identify and limiter are built by initAccessControl from
 	// auth.* and ratelimit.*; nil when disabled (the default), in which case
@@ -178,7 +185,9 @@ func (s *Server) newRouter() *gin.Engine {
 	s.applyTrustedPlatform(router)
 	router.Use(otelgin.Middleware(s.cfg.Telemetry.ServiceName, otelgin.WithGinFilter(func(c *gin.Context) bool {
 		p := c.FullPath()
-		return p != "/health" && p != "/ready" && p != "/metrics"
+		// The docs site (a page view fetches a few dozen assets) is filtered
+		// out too: it is not API traffic.
+		return p != "/health" && p != "/ready" && p != "/metrics" && !s.siteRoutes[p]
 	})))
 	router.Use(gin.CustomRecovery(s.recoverPanic))
 	router.Use(s.requestLogger())
@@ -356,6 +365,10 @@ func (s *Server) requestLogger() gin.HandlerFunc {
 			// keeps an unrelated 401 (e.g. the merkle callback's own bearer
 			// check in handleCallback) at Warn: it carries neither header, so
 			// a misconfigured callback token is still reported loudly.
+			s.logger.Debug("request", fields...)
+		case status == http.StatusNotFound && s.siteRoutes[route]:
+			// A missing docs-site asset (a stale cached page asking for an old
+			// build's chunk, a crawler guessing a path) is not an API fault.
 			s.logger.Debug("request", fields...)
 		case status >= 400:
 			s.logger.Warn("request", fields...)

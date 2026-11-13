@@ -214,18 +214,8 @@ var docsTmpl = template.Must(template.New("docs").Funcs(template.FuncMap{
 	"lower": strings.ToLower,
 }).Parse(docsTemplate))
 
-func (s *Server) handleDocs(c *gin.Context) {
-	c.Header("Content-Type", "text/html; charset=utf-8")
-	c.Status(http.StatusOK)
-	if err := RenderDocs(c.Writer); err != nil {
-		s.logger.Error("failed to render docs", zap.Error(err))
-	}
-}
-
-// RenderDocs writes the rendered API docs HTML to w. Exported so the
-// docs-preview dev command (cmd/docs-preview) can spin up the same page
-// without standing up the full API server with its Kafka / store / etc
-// dependencies.
+// RenderDocs writes the built-in API docs HTML to w: the page "/" serves when
+// the binary was built without the web export (see RegisterSite).
 func RenderDocs(w io.Writer) error {
 	return docsTmpl.Execute(w, docsPage{Routes: routeDocs})
 }

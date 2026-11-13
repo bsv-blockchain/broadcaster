@@ -1,8 +1,13 @@
 package api_server
 
 import (
+	"io/fs"
+
 	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"go.uber.org/zap"
+
+	"github.com/bsv-blockchain/broadcaster/web"
 )
 
 // RouteHeader documents a single HTTP request header for the API docs page.
@@ -277,7 +282,20 @@ var routeDocs = []RouteDoc{
 }
 
 func (s *Server) registerRoutes(r *gin.Engine) {
-	r.GET("/", s.handleDocs)
+	// The docs site: "/", "/docs" and their assets (site.go). Not guarded, so
+	// page views are neither rate limited nor counted as API usage, and
+	// recorded in siteRoutes so they stay out of traces (newRouter) and their
+	// 404s out of Warn logs (requestLogger).
+	routes, err := registerSite(r, s.siteFS())
+	if err != nil {
+		s.logger.Error("docs site unreadable; serving the built-in docs page", zap.Error(err))
+		handleGetHead(r, "/", serveFallbackDocs)
+		routes = []string{"/"}
+	}
+	s.siteRoutes = make(map[string]bool, len(routes))
+	for _, route := range routes {
+		s.siteRoutes[route] = true
+	}
 
 	r.GET("/health", s.handleHealth)
 	r.GET("/ready", s.handleReady)
@@ -310,3 +328,11 @@ func (s *Server) registerRoutes(r *gin.Engine) {
 	r.GET("/v1/policy", s.guarded("v1/policy", read, s.handlePolicy)...)
 }
 
+// siteFS is the docs site export the server serves: the embedded one unless a
+// test injected its own.
+func (s *Server) siteFS() fs.FS {
+	if s.site != nil {
+		return s.site
+	}
+	return web.FS()
+}

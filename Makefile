@@ -1,4 +1,4 @@
-.PHONY: build test lint docker-up docker-down docker-build run
+.PHONY: build test lint docker-up docker-down docker-build run web docs-preview docs-routes
 
 GOARCH ?= $(shell go env GOARCH)
 
@@ -33,7 +33,8 @@ docker-down:
 # that layout for the host's architecture and tags the image bsv-broadcaster:local.
 # Requires a Linux host: CGO + gobdk's per-platform static archive cannot
 # cross-compile to linux, so building the binary off-Linux would fail.
-docker-build:
+# Depends on `web` so the image embeds the docs site, as CI's does.
+docker-build: web
 	@if [ "$$(go env GOOS)" != "linux" ]; then \
 		echo "docker-build requires a Linux host: CGO + gobdk cannot cross-compile a linux binary from $$(go env GOOS). Run on Linux or inside a Linux container."; \
 		exit 1; \
@@ -44,3 +45,19 @@ docker-build:
 
 run:
 	go run ./cmd/bsv-broadcaster
+
+# Docs site (web/): a Next.js static export embedded into the binary by
+# package web (web/embed.go). Without `make web`, binaries serve the built-in
+# docs page instead. Requires Node.js 20+.
+web:
+	cd web && npm ci && npm run build
+
+# Build the docs site, then serve it as the API server does at
+# http://localhost:8080/ (PORT=... to change). The quickest end-to-end check of
+# a design change.
+docs-preview: web
+	go run ./cmd/docs-preview
+
+# Regenerate web/content/routes.json from services/api_server/routes.go.
+docs-routes:
+	go run ./cmd/docs-routes

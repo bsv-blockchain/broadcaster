@@ -68,21 +68,24 @@ func TestNewRouter_CreatesServerSpanWithRoutePattern(t *testing.T) {
 
 	core, logs := observer.New(zap.DebugLevel)
 	router := newTestRouter(zap.New(core))
+	// "/" is the docs site, which is deliberately untraced (site.go), so use
+	// a route of the test's own.
+	router.GET("/span-test/:id", func(c *gin.Context) { c.Status(http.StatusOK) })
 
-	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/", nil)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/span-test/42", nil)
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 
 	if w.Code != http.StatusOK {
-		t.Fatalf("GET / status = %d, want 200", w.Code)
+		t.Fatalf("GET /span-test/42 status = %d, want 200", w.Code)
 	}
 
 	spans := exporter.GetSpans()
 	if len(spans) != 1 {
-		t.Fatalf("got %d spans for GET /, want 1: %+v", len(spans), spans)
+		t.Fatalf("got %d spans for GET /span-test/42, want 1: %+v", len(spans), spans)
 	}
 	span := spans[0]
-	if want := "GET /"; span.Name != want {
+	if want := "GET /span-test/:id"; span.Name != want {
 		t.Errorf("span name = %q, want %q (route pattern as name)", span.Name, want)
 	}
 	if !span.SpanContext.IsValid() {
