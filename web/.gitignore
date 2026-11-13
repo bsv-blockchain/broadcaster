@@ -1,0 +1,22 @@
+# dependencies
+/node_modules
+
+# next.js build cache
+/.next/
+
+# Static export: built by `npm run build`, embedded by the Go binary.
+# Only the placeholder is committed so a plain `go build` still compiles.
+/out/*
+!/out/.gitkeep
+
+# Generated from ../openapi/bsv-broadcaster.openapi.yaml by scripts/sync-openapi.mjs
+/public/openapi.yaml
+/public/openapi.json
+
+# misc
+.DS_Store
+*.pem
+*.tsbuildinfo
+next-env.d.ts
+npm-debug.log*
+.env*

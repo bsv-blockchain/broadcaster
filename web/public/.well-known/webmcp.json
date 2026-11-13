@@ -1,0 +1,41 @@
+{
+  "spec": "webmcp/0.1",
+  "name": "BSV Broadcaster",
+  "description": "Documentation for BSV Broadcaster, a BSV transaction broadcast and status-tracking API, and the read-only calls on its public API server.",
+  "tools": [
+    {
+      "name": "filter-api-routes",
+      "description": "Open the API reference filtered to routes whose method, path, summary or description contain the query.",
+      "url": "/docs",
+      "method": "GET",
+      "parameters": [
+        { "name": "q", "type": "string", "description": "Text to match, e.g. 'webhook', 'merkle' or '/tx'", "required": true }
+      ]
+    },
+    {
+      "name": "get-transaction-status",
+      "description": "Look up the current status of a BSV transaction by txid on this BSV Broadcaster API server.",
+      "url": "/tx/{txid}",
+      "method": "GET",
+      "parameters": [
+        { "name": "txid", "type": "string", "description": "64-character hex transaction id", "required": true }
+      ]
+    },
+    {
+      "name": "get-policy",
+      "description": "Read the current fee and size policy (ARC-compatible) of this BSV Broadcaster API server.",
+      "url": "/policy",
+      "method": "GET",
+      "parameters": []
+    },
+    {
+      "name": "get-health",
+      "description": "Check liveness and chain-tip height of this BSV Broadcaster API server.",
+      "url": "/health",
+      "method": "GET",
+      "parameters": []
+    }
+  ],
+  "openapi": "/openapi.json",
+  "llms": "/llms.txt"
+}

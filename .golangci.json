@@ -112,6 +112,9 @@
             "zerologlint"
         ],
         "exclusions": {
+            "paths": [
+                "web/node_modules"
+            ],
             "rules": [
                 {
                     "linters": [
