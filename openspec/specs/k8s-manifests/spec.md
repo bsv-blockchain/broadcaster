@@ -12,11 +12,11 @@ The project SHALL provide a Kubernetes Deployment manifest for each service mode
 - **THEN** the container SHALL run with args `["--mode", "<service-mode>"]` matching the deployment's service
 
 ### Requirement: Container image specification
-All Deployments SHALL use the container image `ghcr.io/galt-tr/arcade-refactor:latest`.
+BSV Broadcaster workload Deployments SHALL use the container image `ghcr.io/bsv-blockchain/broadcaster` pinned to the git SHA published by `.github/workflows/build.yml`. The mutable `:latest` tag and the foreign `ghcr.io/galt-tr/arcade-refactor` namespace SHALL NOT be used.
 
 #### Scenario: Image reference
-- **WHEN** any Deployment manifest is inspected
-- **THEN** the container image SHALL be `ghcr.io/galt-tr/arcade-refactor:latest`
+- **WHEN** any BSV Broadcaster workload Deployment manifest is inspected
+- **THEN** the container image SHALL be `ghcr.io/bsv-blockchain/broadcaster:<git sha>` (the manifests ship a `GIT_SHA` placeholder for operators to replace)
 
 ### Requirement: Replica count
 All Deployments SHALL specify exactly 1 replica.
@@ -44,11 +44,11 @@ A Kubernetes Service manifest SHALL expose the `api-server` Deployment on port 8
 - **THEN** it SHALL select pods with the `api-server` Deployment's labels and forward port 8080 to container port 8080
 
 ### Requirement: Environment variable configuration
-All Deployments SHALL include environment variables for Kafka brokers (`BSV_BROADCASTER_KAFKA_BROKERS`), Aerospike hosts (`BSV_BROADCASTER_AEROSPIKE_HOSTS`), and Aerospike namespace (`BSV_BROADCASTER_AEROSPIKE_NAMESPACE`) with placeholder values that operators can override.
+All BSV Broadcaster workload Deployments SHALL include environment variables for Kafka brokers (`BSV_BROADCASTER_KAFKA_BROKERS`), Aerospike hosts (`BSV_BROADCASTER_STORE_AEROSPIKE_HOSTS`), and Aerospike namespace (`BSV_BROADCASTER_STORE_AEROSPIKE_NAMESPACE`) with placeholder values that operators can override. Viper maps `store.aerospike.*` to the `BSV_BROADCASTER_STORE_AEROSPIKE_*` prefix; the shorter `BSV_BROADCASTER_AEROSPIKE_*` names are not read.
 
 #### Scenario: Required env vars present
-- **WHEN** any Deployment manifest is inspected
-- **THEN** the container spec SHALL include `BSV_BROADCASTER_KAFKA_BROKERS`, `BSV_BROADCASTER_AEROSPIKE_HOSTS`, and `BSV_BROADCASTER_AEROSPIKE_NAMESPACE` environment variables
+- **WHEN** any BSV Broadcaster workload Deployment manifest is inspected
+- **THEN** the container spec SHALL include `BSV_BROADCASTER_KAFKA_BROKERS`, `BSV_BROADCASTER_STORE_AEROSPIKE_HOSTS`, and `BSV_BROADCASTER_STORE_AEROSPIKE_NAMESPACE` environment variables
 
 ### Requirement: Manifest directory structure
 All Kubernetes manifests SHALL be placed in the `deploy/` directory at the repository root.

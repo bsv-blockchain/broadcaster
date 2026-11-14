@@ -27,7 +27,9 @@ spec:
     spec:
       containers:
         - name: bsv-broadcaster
-          image: ghcr.io/bsv-blockchain/broadcaster:latest
+          # Pin to the git SHA published by .github/workflows/build.yml
+          # (ghcr.io/bsv-blockchain/broadcaster:<sha>). The :latest tag moves.
+          image: ghcr.io/bsv-blockchain/broadcaster:GIT_SHA
           args: ["--mode", "api-server"]
           ports:
             - containerPort: 8080

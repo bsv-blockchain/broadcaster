@@ -177,6 +177,8 @@ Kubernetes manifests for each service live in [`deploy/`](./deploy/):
 - `api-server.yaml`, `tx-validator.yaml`, `propagation.yaml`, `bump-builder.yaml`, `p2p-client.yaml` — one Deployment per service
 - `aerospike.yaml`, `kafka.yaml`, `namespace.yaml` — supporting infra
 
+BSV Broadcaster workload images are `ghcr.io/bsv-blockchain/broadcaster:GIT_SHA`. Replace `GIT_SHA` with the commit SHA published by the build workflow before applying, for example `sed -i "s/GIT_SHA/$(git rev-parse HEAD)/" deploy/*.yaml`.
+
 In horizontally-scaled deployments, set `kafka.min_partitions` to at least the replica count of the largest consumer so misconfigured topics surface at startup rather than under live traffic.
 
 ## Repository layout

@@ -465,6 +465,34 @@ func TestValidate_MongoDBBackend(t *testing.T) {
 	}
 }
 
+// Issue #90: Aerospike batch loops advance by batch_size. Zero (or negative)
+// never moves the index, so mined-status / BUMP / STUMP cleanup hangs. The
+// viper default is DefaultAerospikeBatchSize; an explicit non-positive value
+// must be rejected.
+func TestValidate_AerospikeBatchSizeMustBePositive(t *testing.T) {
+	cfg := baseValidConfig()
+	cfg.Store.Backend = "aerospike"
+	cfg.Store.Aerospike.Hosts = []string{"localhost:3000"}
+	cfg.Store.Aerospike.BatchSize = DefaultAerospikeBatchSize
+	if err := validate(cfg); err != nil {
+		t.Fatalf("positive store.aerospike.batch_size should be accepted: %v", err)
+	}
+	for _, n := range []int{0, -1} {
+		cfg.Store.Aerospike.BatchSize = n
+		err := validate(cfg)
+		if err == nil || !strings.Contains(err.Error(), "store.aerospike.batch_size") {
+			t.Fatalf("batch_size %d must be rejected naming store.aerospike.batch_size, got: %v", n, err)
+		}
+	}
+
+	viper.Reset()
+	t.Cleanup(viper.Reset)
+	setDefaults()
+	if got := viper.GetInt("store.aerospike.batch_size"); got != DefaultAerospikeBatchSize {
+		t.Fatalf("store.aerospike.batch_size default = %d, want DefaultAerospikeBatchSize %d", got, DefaultAerospikeBatchSize)
+	}
+}
+
 // Every store.mongodb.* key must have a SetDefault so BSV_BROADCASTER_STORE_MONGODB_*
 // env overrides are honored by viper's AutomaticEnv (see setDefaults).
 func TestSetDefaults_MongoDBKeysBound(t *testing.T) {

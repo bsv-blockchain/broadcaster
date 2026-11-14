@@ -29,7 +29,7 @@ import (
 func New(ctx context.Context, cfg *config.Config, logger *zap.Logger) (store.Store, store.Leaser, error) {
 	switch cfg.Store.Backend {
 	case "", "aerospike":
-		s, err := aerospike.New(ctx, cfg.Store.Aerospike)
+		s, err := aerospike.New(ctx, cfg.Store.Aerospike, logger)
 		if err != nil {
 			return nil, nil, err
 		}
