@@ -53,10 +53,11 @@ kafka:
   # topic_prefix: bsv-broadcaster
   max_retries: 5
   buffer_size: 10000
-  # Minimum partitions required on hot-path topics (transaction, propagation).
-  # Set to the replica count of the largest horizontally-scaled consumer when
-  # running in Kubernetes so BSV Broadcaster fails fast on misconfigured topics. Leave
-  # at 0 for standalone / single-replica deployments.
+  # Floor for <topic_prefix>.block_processed and <topic_prefix>.tx_status.
+  # When greater than 1, startup fails if either topic is missing or has
+  # fewer partitions. The check does not create topics. propagation is
+  # checked separately via propagation.partitions. Leave at 0 for
+  # standalone / single-replica deployments.
   # min_partitions: 0
 
 # Persistence backend. `backend` dispatches construction in storefactory.New;

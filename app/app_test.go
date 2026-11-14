@@ -1,10 +1,16 @@
 package app
 
 import (
+	"context"
+	"errors"
 	"reflect"
+	"strings"
 	"testing"
 
+	"go.uber.org/zap"
+
 	"github.com/bsv-blockchain/broadcaster/config"
+	"github.com/bsv-blockchain/broadcaster/kafka"
 )
 
 func TestModeNeedsChaintracks(t *testing.T) {
@@ -207,5 +213,112 @@ func TestResolveChaintracksBootstrapPeers(t *testing.T) {
 				t.Errorf("resolveChaintracksBootstrapPeers() = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+// partitionProbe records every PartitionCount call. width is returned for
+// topics that are not listed in missing; those return ErrTopicNotFound.
+type partitionProbe struct {
+	width   int
+	missing map[string]bool
+	seen    []string
+}
+
+func (p *partitionProbe) Send(context.Context, string, string, []byte) error { return nil }
+
+func (p *partitionProbe) SendAsync(context.Context, string, string, []byte) error { return nil }
+
+func (p *partitionProbe) SendBatch(context.Context, string, []kafka.KeyValue) error { return nil }
+
+func (p *partitionProbe) Subscribe(string, []string, kafka.StartOffset) (kafka.Subscription, error) {
+	return nil, errors.New("partitionProbe: Subscribe not used")
+}
+
+func (p *partitionProbe) Close() error { return nil }
+
+func (p *partitionProbe) PartitionCount(topic string) (int, error) {
+	p.seen = append(p.seen, topic)
+	if p.missing[topic] {
+		return 0, kafka.ErrTopicNotFound
+	}
+	return p.width, nil
+}
+
+func TestPartitionPreflight_ChecksHorizontalScaleTopics(t *testing.T) {
+	kafka.SetTopicPrefix("bsv-broadcaster")
+	t.Cleanup(func() { kafka.SetTopicPrefix(kafka.DefaultTopicPrefix) })
+
+	probe := &partitionProbe{width: 4}
+	cfg := &config.Config{}
+	cfg.Propagation.Partitions = 2
+	cfg.Kafka.MinPartitions = 3
+	if err := partitionPreflight(probe, cfg, zap.NewNop()); err != nil {
+		t.Fatalf("preflight: %v", err)
+	}
+	want := append([]string{kafka.TopicPropagation}, kafka.HorizontalScaleTopics()...)
+	if !reflect.DeepEqual(probe.seen, want) {
+		t.Fatalf("checked topics %v, want %v", probe.seen, want)
+	}
+}
+
+func TestPartitionPreflight_MissingScaleTopicFails(t *testing.T) {
+	kafka.SetTopicPrefix("bsv-broadcaster")
+	t.Cleanup(func() { kafka.SetTopicPrefix(kafka.DefaultTopicPrefix) })
+
+	probe := &partitionProbe{
+		width:   4,
+		missing: map[string]bool{kafka.TopicBlockProcessed: true},
+	}
+	cfg := &config.Config{}
+	cfg.Propagation.Partitions = 1
+	cfg.Kafka.MinPartitions = 3
+	err := partitionPreflight(probe, cfg, zap.NewNop())
+	if !errors.Is(err, kafka.ErrTopicNotFound) {
+		t.Fatalf("error %v should wrap ErrTopicNotFound", err)
+	}
+	if !strings.Contains(err.Error(), kafka.TopicBlockProcessed) {
+		t.Fatalf("error %q should name the missing fan-out topic", err)
+	}
+	for _, topic := range probe.seen {
+		if topic == kafka.TopicStatusUpdate {
+			t.Fatal("preflight continued past the missing topic")
+		}
+	}
+}
+
+func TestPartitionPreflight_FloorAtMostOneSkipsScaleTopics(t *testing.T) {
+	kafka.SetTopicPrefix("bsv-broadcaster")
+	t.Cleanup(func() { kafka.SetTopicPrefix(kafka.DefaultTopicPrefix) })
+
+	probe := &partitionProbe{width: 1}
+	cfg := &config.Config{}
+	cfg.Propagation.Partitions = 1
+	cfg.Kafka.MinPartitions = 1
+	if err := partitionPreflight(probe, cfg, zap.NewNop()); err != nil {
+		t.Fatalf("preflight: %v", err)
+	}
+	if !reflect.DeepEqual(probe.seen, []string{kafka.TopicPropagation}) {
+		t.Fatalf("checked topics %v, want only propagation", probe.seen)
+	}
+}
+
+func TestBootstrap_MinPartitionsFailsOnNarrowHotPathTopic(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Kafka.Backend = "memory"
+	cfg.Kafka.MinPartitions = 3
+	cfg.Propagation.Partitions = 1
+
+	_, cleanup, err := Bootstrap(context.Background(), cfg, zap.NewNop())
+	if cleanup != nil {
+		defer cleanup()
+	}
+	if err == nil {
+		t.Fatal("expected startup to fail the partition preflight")
+	}
+	if !strings.Contains(err.Error(), "kafka partition check") {
+		t.Fatalf("error %q should come from the partition preflight", err)
+	}
+	if !strings.Contains(err.Error(), kafka.TopicBlockProcessed) {
+		t.Fatalf("error %q should name %s", err, kafka.TopicBlockProcessed)
 	}
 }
