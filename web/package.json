@@ -34,5 +34,10 @@
     "tailwindcss": "^4",
     "typescript": "^5",
     "yaml": "^2.9.1"
+  },
+  "overrides": {
+    "@typescript-eslint/typescript-estree": {
+      "minimatch": "^11.0.1"
+    }
   }
 }
