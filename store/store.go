@@ -271,9 +271,17 @@ type Store interface {
 	// reports whether statuses[i] was newly inserted, and result[i].Existing
 	// carries the existing row when !Inserted (it is nil for new inserts).
 	//
-	// Backends with native batch support (e.g. Postgres via the xmax trick)
-	// implement this as a single round-trip; backends without (Aerospike,
-	// Pebble) fall back to a bounded-concurrency loop over GetOrInsertStatus.
+	// Backends with native batch support (Postgres via the xmax trick,
+	// MongoDB via an unordered InsertMany) implement this in one or two round
+	// trips; backends without (Aerospike, Pebble) fall back to a
+	// bounded-concurrency loop over GetOrInsertStatus.
+	//
+	// On error the slice is either nil (no row's outcome is known, as when
+	// Postgres's single statement fails) or has one entry per input, where
+	// Inserted marks every row this call did insert and a zero value marks a
+	// row whose outcome is unknown. Callers that must know exactly which
+	// rows they inserted (the /txs handler publishes RECEIVED only for
+	// those, #391) rely on this.
 	BatchGetOrInsertStatus(ctx context.Context, statuses []*models.TransactionStatus) ([]BatchInsertResult, error)
 
 	// UpdateStatus updates an existing transaction status (used for P2P, blocks, etc.).

@@ -12,6 +12,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -81,6 +82,8 @@ type mockStore struct {
 	getOrInsertFn func(status *models.TransactionStatus) (*models.TransactionStatus, bool, error)
 	// /txs CASes its rows concurrently, so the hook runs on several
 	// goroutines at once: it must guard any state it records into.
+	// batchCASCalls counts BatchGetOrInsertStatus calls.
+	batchCASCalls atomic.Int32
 	// tipHeight is served by GetActiveTipBlockHeight (the /health
 	// blockHeight source); tipCalls counts reads so tests can assert the
 	// handler's TTL cache actually coalesces probes.
@@ -126,8 +129,12 @@ func (m *mockStore) SetRawTx(_ context.Context, txid string, rawTx []byte) error
 	return nil
 }
 
-func (m *mockStore) BatchGetOrInsertStatus(context.Context, []*models.TransactionStatus) ([]store.BatchInsertResult, error) {
-	return nil, nil
+// BatchGetOrInsertStatus counts calls and runs GetOrInsertStatus per row
+// through the shared parallel helper, so getOrInsertFn drives batch results
+// the way it drives single ones: per-row outcomes, partial results on error.
+func (m *mockStore) BatchGetOrInsertStatus(ctx context.Context, statuses []*models.TransactionStatus) ([]store.BatchInsertResult, error) {
+	m.batchCASCalls.Add(1)
+	return store.BatchGetOrInsertStatusParallel(ctx, m, statuses)
 }
 
 func (m *mockStore) BatchUpdateStatus(context.Context, []*models.TransactionStatus) error {

@@ -71,6 +71,18 @@ func chunks(ids []string, n int) [][]string {
 	return out
 }
 
+// chunkInts splits idx into slices of at most n.
+func chunkInts(idx []int, n int) [][]int {
+	if n <= 0 {
+		n = defaultBatchSize
+	}
+	out := make([][]int, 0, len(idx)/n+1)
+	for start := 0; start < len(idx); start += n {
+		out = append(out, idx[start:min(start+n, len(idx))])
+	}
+	return out
+}
+
 // msNow is the millisecond-aligned write timestamp. msTrunc normalizes to UTC
 // so that a value this package hands back to a caller compares equal (==, not
 // just Equal) to the same instant read back from the server, which always

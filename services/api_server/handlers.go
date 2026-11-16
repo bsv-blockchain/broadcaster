@@ -123,15 +123,15 @@ func (s *Server) shedBatch(c *gin.Context, inserted []string, receivedAt time.Ti
 // stalled broker cannot hold the handler after its client has gone.
 const shedPublishTimeout = 5 * time.Second
 
-// intakeFanOut runs fn(i) for i in [0, n) the way a /txs batch writes to the
-// store: store.BatchConcurrency calls at a time for this request, each
-// holding a pod-wide intake slot, and no new call once one has failed or the
-// request is gone (store.ForEach). A batch therefore costs about one store
-// round trip per BatchConcurrency rows rather than one per row (on Atlas a
-// write waits for a cross-region majority, ~150-200 ms), an outage costs one
-// failed round trip rather than one per row, and concurrent batches cannot
-// together take more of the store's connection pool than
-// api.intake_store_concurrency.
+// intakeFanOut runs fn(i) for i in [0, n) the way a /txs batch makes its
+// per-row store writes (retention extends, raw-tx restores):
+// store.BatchConcurrency calls at a time for this request, each holding a
+// pod-wide intake slot, and no new call once one has failed or the request
+// is gone (store.ForEach). A batch therefore costs about one store round trip
+// per BatchConcurrency rows rather than one per row (on Atlas a write waits
+// for a cross-region majority, ~150-200 ms), an outage costs one failed
+// round trip rather than one per row, and concurrent batches cannot together
+// take more of the store's connection pool than api.intake_store_concurrency.
 func (s *Server) intakeFanOut(ctx context.Context, n int, fn func(i int) error) error {
 	return store.ForEach(ctx, n, store.BatchConcurrency(), func(i int) error {
 		return s.withIntakeSlot(ctx, func() error { return fn(i) })
@@ -150,50 +150,30 @@ func (s *Server) withIntakeSlot(ctx context.Context, fn func() error) error {
 	return fn()
 }
 
-// intakeCAS is the store as the /txs dedup CAS sees it, so the batch can run
-// through store.BatchGetOrInsertStatusParallel: each row holds an intake slot
-// for its CAS, and is stamped when its CAS actually starts. Stamping the
-// whole batch up front would make it one equal-timestamp run at a
-// millisecond-precision store (catchup must drain such a run whole), and a
-// row queued behind the concurrency limit would commit well after the time
-// it carries, landing behind a catchup cursor that had already passed it.
-// Stamped at dispatch, a tie is at most one wave of concurrent rows, and a
-// row's commit trails its timestamp by its own round trip, as for /tx.
+// dedupRows runs the /txs dedup CAS for every unique submission as one
+// store.BatchGetOrInsertStatus call, then extends the retention of each
+// resubmitted row that needs it, and returns the rows with their CAS results
+// by index. On MongoDB the batch is one unordered InsertMany plus one read
+// for the rows that existed, so a 100-tx batch costs two round trips rather
+// than one per BatchConcurrency rows; the call holds one intake slot.
 //
-// store.Store.BatchGetOrInsertStatus is not used: it does neither, and on
-// error some backends drop the per-row results, while the handler must know
-// exactly which rows it inserted, since only the inserter publishes RECEIVED
-// (#391), including when it sheds.
-type intakeCAS struct {
-	store.Store
-
-	srv *Server
-}
-
-func (c intakeCAS) GetOrInsertStatus(ctx context.Context, row *models.TransactionStatus) (existing *models.TransactionStatus, inserted bool, err error) {
-	err = c.srv.withIntakeSlot(ctx, func() error {
-		row.Timestamp = time.Now()
-		var casErr error
-		existing, inserted, casErr = c.Store.GetOrInsertStatus(ctx, row)
-		return casErr
-	})
-	return existing, inserted, err
-}
-
-// dedupRows runs the /txs dedup CAS for every unique submission, then
-// extends the retention of each resubmitted row that needs it, and returns
-// the rows with their CAS results by index. Rows CAS concurrently and stop at
-// the first failure, like intakeFanOut, so on error the inserted rows can sit
-// anywhere in the batch; insertedTxIDs finds them for the shed. An error
+// On error the inserted rows can sit anywhere in the batch (the store
+// reports them per row); insertedTxIDs finds them for the shed. An error
 // means nothing may be published: a row whose state is unknown cannot get a
 // txid-only message (#329), and a failed extend is repeated by the retry.
+//
+// Every row carries the same timestamp, so at a millisecond-precision store
+// the batch is one equal-timestamp run. SSE catchup drains such runs whole
+// (it must already for SetMinedByTxIDs, which stamps a block's rows alike),
+// and the bulk RECEIVED is stamped just below the run (bulkReceivedAt).
 func (s *Server) dedupRows(ctx context.Context, unique []parsedItem, keyByTxid map[string]string, expiresAt *time.Time) ([]*models.TransactionStatus, []store.BatchInsertResult, error) {
+	now := time.Now()
 	rows := make([]*models.TransactionStatus, len(unique))
 	for i, p := range unique {
 		rows[i] = &models.TransactionStatus{
-			TxID:   p.txid,
-			Status: models.StatusReceived,
-			// Timestamp is set as the row's CAS starts (intakeCAS).
+			TxID:      p.txid,
+			Status:    models.StatusReceived,
+			Timestamp: now,
 			// Carry the raw bytes on the row so the propagation
 			// reaper can rebroadcast stuck txs without re-fetching.
 			RawTx:        p.raw,
@@ -201,7 +181,19 @@ func (s *Server) dedupRows(ctx context.Context, unique []parsedItem, keyByTxid m
 			ExpiresAt:    expiresAt,
 		}
 	}
-	cas, err := store.BatchGetOrInsertStatusParallel(ctx, intakeCAS{Store: s.store, srv: s}, rows)
+	var cas []store.BatchInsertResult
+	err := s.withIntakeSlot(ctx, func() error {
+		var casErr error
+		cas, casErr = s.store.BatchGetOrInsertStatus(ctx, rows)
+		return casErr
+	})
+	if len(cas) != len(rows) {
+		// nil on error: no row's outcome is known (store.Store contract).
+		if err == nil {
+			err = fmt.Errorf("dedup CAS returned %d results for %d rows", len(cas), len(rows))
+		}
+		cas = make([]store.BatchInsertResult, len(rows))
+	}
 	if err == nil {
 		for i, r := range cas {
 			if !r.Inserted && r.Existing == nil {
@@ -271,9 +263,8 @@ func (s *Server) tallyCAS(ctx context.Context, unique []parsedItem, cas []store.
 
 // insertedTxIDs returns the txids of the rows this request's CAS inserted, in
 // submission order, and the earliest of their timestamps — the inputs
-// publishReceived and shedBatch need. Rows are stamped as their CAS starts,
-// so submission order and timestamp order can differ within a wave; the
-// minimum keeps a bulk event's id below every row (bulkReceivedAt).
+// publishReceived and shedBatch need. The minimum keeps a bulk event's id
+// below every row (bulkReceivedAt) whatever order the rows were stamped in.
 func insertedTxIDs(rows []*models.TransactionStatus, cas []store.BatchInsertResult) ([]string, time.Time) {
 	ids := make([]string, 0, len(rows))
 	var receivedAt time.Time

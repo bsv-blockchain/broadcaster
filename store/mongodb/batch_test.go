@@ -4,9 +4,12 @@ package mongodb
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
+
+	"go.mongodb.org/mongo-driver/v2/bson"
 
 	"github.com/bsv-blockchain/broadcaster/models"
 )
@@ -313,4 +316,86 @@ func pgBatchTxID(i int) string {
 		buf[k] = hex[(i>>(k*4))&0xf]
 	}
 	return "pg-batch-" + string(buf[:])
+}
+
+// A batch larger than batch_size is inserted chunk by chunk. Rows that
+// already exist and txids repeated across chunks must still resolve per
+// position: pre-existing rows report Existing, every later repeat reports the
+// first occurrence's outcome.
+func TestBatchGetOrInsertStatus_MultiChunkMixed(t *testing.T) {
+	s := newTestStore(t)
+	s.batchSize = 7
+	ctx := context.Background()
+
+	id := func(i int) string { return fmt.Sprintf("chunk-%02d", i) }
+	var seed []*models.TransactionStatus
+	for i := 0; i < 30; i += 4 {
+		seed = append(seed, &models.TransactionStatus{TxID: id(i), Status: models.StatusSeenOnNetwork})
+	}
+	if _, err := s.BatchGetOrInsertStatus(ctx, seed); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	var in []*models.TransactionStatus
+	for i := 0; i < 30; i++ {
+		in = append(in, &models.TransactionStatus{TxID: id(i)})
+	}
+	in = append(in, &models.TransactionStatus{TxID: id(1)}, &models.TransactionStatus{TxID: id(4)})
+
+	results, err := s.BatchGetOrInsertStatus(ctx, in)
+	if err != nil {
+		t.Fatalf("BatchGetOrInsertStatus: %v", err)
+	}
+	for i := 0; i < 30; i++ {
+		existed := i%4 == 0
+		r := results[i]
+		if r.Inserted == existed {
+			t.Errorf("results[%d].Inserted = %v, want %v", i, r.Inserted, !existed)
+		}
+		if existed && (r.Existing == nil || r.Existing.Status != models.StatusSeenOnNetwork) {
+			t.Errorf("results[%d].Existing = %+v, want the seeded SEEN_ON_NETWORK row", i, r.Existing)
+		}
+	}
+	if r := results[30]; r.Inserted || r.Existing == nil || r.Existing.TxID != id(1) {
+		t.Errorf("repeat of an inserted txid = %+v, want Existing for %s", r, id(1))
+	}
+	if r := results[31]; r.Inserted || r.Existing == nil || r.Existing.Status != models.StatusSeenOnNetwork {
+		t.Errorf("repeat of an existing txid = %+v, want the seeded row", r)
+	}
+}
+
+// A row the server rejects for a reason other than a duplicate key fails the
+// batch, but the rows around it are still inserted (the insert is unordered)
+// and must be reported as Inserted: the caller publishes RECEIVED for exactly
+// those.
+func TestBatchGetOrInsertStatus_WriteErrorKeepsOtherRows(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	if err := s.db.RunCommand(ctx, bson.D{
+		{Key: "collMod", Value: s.tx.Name()},
+		{Key: "validator", Value: bson.D{{Key: "partition_key", Value: bson.D{{Key: "$ne", Value: "poison"}}}}},
+	}).Err(); err != nil {
+		t.Fatalf("collMod validator: %v", err)
+	}
+
+	in := []*models.TransactionStatus{
+		{TxID: "werr-1"},
+		{TxID: "werr-2", PartitionKey: "poison"},
+		{TxID: "werr-3"},
+	}
+	results, err := s.BatchGetOrInsertStatus(ctx, in)
+	if err == nil {
+		t.Fatal("err = nil, want the rejected row's error")
+	}
+	if !results[0].Inserted || !results[2].Inserted {
+		t.Errorf("results = %+v, want rows 0 and 2 Inserted", results)
+	}
+	if results[1].Inserted || results[1].Existing != nil {
+		t.Errorf("results[1] = %+v, want the zero value (outcome unknown)", results[1])
+	}
+	for _, txid := range []string{"werr-1", "werr-3"} {
+		if st, err := s.GetStatus(ctx, txid); err != nil || st == nil {
+			t.Errorf("GetStatus(%s) = %v, %v; want the inserted row", txid, st, err)
+		}
+	}
 }
