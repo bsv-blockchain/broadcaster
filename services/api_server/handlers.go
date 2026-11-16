@@ -105,14 +105,23 @@ func (s *Server) extendExpiries(ctx context.Context, txids []string, until *time
 // client's retry republishes them, but as CAS losers: only the inserter
 // publishes RECEIVED (#391), so it goes out here or never. Nothing reached
 // Kafka, so it cannot trail a verdict.
+//
+// The publish is detached from the request: a batch often sheds because the
+// client gave up, and the request context is then already cancelled, which
+// would drop the only RECEIVED those rows will ever get.
 func (s *Server) shedBatch(c *gin.Context, inserted []string, receivedAt time.Time, opts submitOptions) {
-	ctx := c.Request.Context()
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), shedPublishTimeout)
+	defer cancel()
 	for _, txid := range inserted {
 		s.recordSubmission(ctx, txid, opts)
 	}
 	s.publishReceived(ctx, inserted, bulkReceivedAt(receivedAt, len(inserted)), opts)
 	respondStoreUnavailable(c)
 }
+
+// shedPublishTimeout bounds shedBatch's detached RECEIVED publish, so a
+// stalled broker cannot hold the handler after its client has gone.
+const shedPublishTimeout = 5 * time.Second
 
 // intakeFanOut runs fn(i) for i in [0, n) the way a /txs batch writes to the
 // store: store.BatchConcurrency calls at a time for this request, each
