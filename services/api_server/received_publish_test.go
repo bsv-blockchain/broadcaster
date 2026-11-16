@@ -813,3 +813,56 @@ func TestHandleSubmitTransactions_RepeatedTxidCASedOnce(t *testing.T) {
 		t.Errorf("response = %+v, want submitted 1, duplicates 1, total 2", resp)
 	}
 }
+
+// ctxCheckingPub fails a publish whose context is already done, as the Kafka
+// producer does.
+type ctxCheckingPub struct{ *orderingPub }
+
+func (p ctxCheckingPub) Publish(ctx context.Context, st *models.TransactionStatus) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return p.orderingPub.Publish(ctx, st)
+}
+
+func (p ctxCheckingPub) PublishBulk(ctx context.Context, st *models.TransactionStatus) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return p.orderingPub.PublishBulk(ctx, st)
+}
+
+// A client that gives up mid-batch cancels the request, and the batch sheds.
+// The rows it inserted still get their RECEIVED: only the inserter publishes
+// it (#391), so dropping it here would lose it for good.
+func TestHandleSubmitTransactions_ShedAfterClientCancel_PublishesReceived(t *testing.T) {
+	prev := store.BatchConcurrency()
+	store.SetBatchConcurrency(1)
+	t.Cleanup(func() { store.SetBatchConcurrency(prev) })
+
+	rawA, rawB, txidA, txidB := twoDistinctTxs(t)
+	ctx, cancel := context.WithCancel(t.Context())
+	ms := &mockStore{getOrInsertFn: func(in *models.TransactionStatus) (*models.TransactionStatus, bool, error) {
+		if in.TxID == txidB {
+			cancel() // the client times out while B's write is in flight
+			return nil, false, context.Canceled
+		}
+		return in, true, nil
+	}}
+	var pub ctxCheckingPub
+	_, _, router := newReceivedServerWith(ms, func(s *Server) {
+		pub = ctxCheckingPub{s.publisher.(*orderingPub)}
+		s.publisher = pub
+	})
+	req := httptest.NewRequestWithContext(ctx, http.MethodPost, "/txs", bytes.NewReader(append(append([]byte(nil), rawA...), rawB...)))
+	req.Header.Set("Content-Type", "application/octet-stream")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503; body=%s", w.Code, w.Body.String())
+	}
+	if len(pub.publishes) != 1 || pub.publishes[0].TxID != txidA || pub.publishes[0].Status != models.StatusReceived {
+		t.Errorf("publishes = %+v, want one RECEIVED for the inserted %s", pub.publishes, txidA)
+	}
+}
