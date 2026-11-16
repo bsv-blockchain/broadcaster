@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -592,5 +593,90 @@ func TestHandleSubmitTransactions_PartialCASFailure_PublishesReceivedForInserted
 	want := txidA + ":" + string(models.StatusReceived)
 	if !slices.Contains(got, want) || len(events) != 1 {
 		t.Errorf("events = %v, want exactly one RECEIVED for the inserted %s", got, txidA)
+	}
+}
+
+// Rows after a failed CAS are inserted too now that the batch CASes
+// concurrently, so a shed must publish RECEIVED for every row this request
+// inserted, not only the rows ahead of the failure.
+func TestHandleSubmitTransactions_EarlyCASFailure_PublishesReceivedForLaterInserted(t *testing.T) {
+	rawA, rawB, txidA, txidB := twoDistinctTxs(t)
+	ms := &mockStore{
+		getOrInsertFn: func(in *models.TransactionStatus) (*models.TransactionStatus, bool, error) {
+			if in.TxID == txidA {
+				return nil, false, errors.New("store unavailable")
+			}
+			return in, true, nil
+		},
+	}
+	pub, broker, router := newReceivedServer(ms)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/txs", bytes.NewReader(append(append([]byte(nil), rawA...), rawB...)))
+	req.Header.Set("Content-Type", "application/octet-stream")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503; body=%s", w.Code, w.Body.String())
+	}
+	if n := len(broker.Sends) + broker.BatchCalls; n != 0 {
+		t.Errorf("shed batch queued propagation: sends=%d batches=%d", len(broker.Sends), broker.BatchCalls)
+	}
+	events := append(append([]*models.TransactionStatus(nil), pub.publishes...), pub.bulkPublishes...)
+	var got []string
+	for _, e := range events {
+		got = append(got, e.TxID+":"+string(e.Status))
+		for _, id := range e.TxIDs {
+			got = append(got, id+":"+string(e.Status))
+		}
+	}
+	want := txidB + ":" + string(models.StatusReceived)
+	if !slices.Contains(got, want) || len(events) != 1 {
+		t.Errorf("events = %v, want exactly one RECEIVED for the inserted %s", got, txidB)
+	}
+}
+
+// A /txs batch must not pay one store round trip per transaction: the CASes
+// overlap. Each call waits until a second one is in flight, so a sequential
+// handler stalls here until the fallback timer and the test fails.
+func TestHandleSubmitTransactions_CASRunsConcurrently(t *testing.T) {
+	prev := store.BatchConcurrency()
+	store.SetBatchConcurrency(4)
+	t.Cleanup(func() { store.SetBatchConcurrency(prev) })
+
+	rawA, rawB, _, _ := twoDistinctTxs(t)
+	var mu sync.Mutex
+	inFlight, maxInFlight := 0, 0
+	both := make(chan struct{})
+	ms := &mockStore{
+		getOrInsertConcurrent: true,
+		getOrInsertFn: func(in *models.TransactionStatus) (*models.TransactionStatus, bool, error) {
+			mu.Lock()
+			inFlight++
+			maxInFlight = max(maxInFlight, inFlight)
+			if inFlight == 2 {
+				close(both)
+			}
+			mu.Unlock()
+			select {
+			case <-both:
+			case <-time.After(2 * time.Second):
+			}
+			mu.Lock()
+			inFlight--
+			mu.Unlock()
+			return in, true, nil
+		},
+	}
+	_, _, router := newReceivedServer(ms)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/txs", bytes.NewReader(append(append([]byte(nil), rawA...), rawB...)))
+	req.Header.Set("Content-Type", "application/octet-stream")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code >= 300 {
+		t.Fatalf("status = %d; body=%s", w.Code, w.Body.String())
+	}
+	if maxInFlight < 2 {
+		t.Errorf("max concurrent CAS calls = %d, want 2: the batch CASed row by row", maxInFlight)
 	}
 }

@@ -18,6 +18,7 @@ import (
 	sdkTx "github.com/bsv-blockchain/go-sdk/transaction"
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/bsv-blockchain/broadcaster/callbackurl"
 	"github.com/bsv-blockchain/broadcaster/config"
@@ -94,6 +95,53 @@ func (s *Server) shedBatch(c *gin.Context, inserted []string, receivedAt time.Ti
 	}
 	s.publishReceived(ctx, inserted, bulkReceivedAt(receivedAt, len(inserted)), opts)
 	respondStoreUnavailable(c)
+}
+
+// casOutcome is one row's result from insertStatusesConcurrently.
+type casOutcome struct {
+	existing *models.TransactionStatus
+	inserted bool
+	err      error
+}
+
+// insertStatusesConcurrently runs the dedup CAS (GetOrInsertStatus) for every
+// row at once, bounded by store.BatchConcurrency, and returns each row's
+// outcome at its index. A /txs batch used to CAS row by row, so it paid one
+// full write round trip per transaction; on a store whose writes wait for a
+// cross-region majority (~150-200 ms on Atlas) a 10-tx batch took ~1.5 s.
+// Concurrent, the batch costs about one round trip per BatchConcurrency rows.
+//
+// store.BatchGetOrInsertStatus is not used because its error contract drops
+// per-row results, and the handler must know exactly which rows it inserted:
+// only the inserter publishes RECEIVED (#391), including when it sheds.
+func (s *Server) insertStatusesConcurrently(ctx context.Context, rows []*models.TransactionStatus) []casOutcome {
+	out := make([]casOutcome, len(rows))
+	var g errgroup.Group
+	g.SetLimit(store.BatchConcurrency())
+	for i, row := range rows {
+		g.Go(func() error {
+			existing, inserted, err := s.store.GetOrInsertStatus(ctx, row)
+			out[i] = casOutcome{existing: existing, inserted: inserted, err: err}
+			return nil
+		})
+	}
+	_ = g.Wait() // every Go func returns nil; errors travel per row in out
+	return out
+}
+
+// insertedTxIDs returns the txids of the rows this request's CAS inserted, in
+// submission order, and the earliest inserted row's timestamp — the inputs
+// shedBatch needs to publish RECEIVED for them.
+func insertedTxIDs(rows []*models.TransactionStatus, cas []casOutcome) ([]string, time.Time) {
+	var ids []string
+	var receivedAt time.Time
+	for i, r := range cas {
+		if r.err == nil && r.inserted {
+			ids = append(ids, rows[i].TxID)
+			receivedAt = cmp.Or(receivedAt, rows[i].Timestamp)
+		}
+	}
+	return ids, receivedAt
 }
 
 // respondStoreUnavailable answers a submission whose store write failed or
@@ -1506,8 +1554,9 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 	var receivedAt time.Time // the first inserted row's timestamp
 	if s.store != nil {
 		ctx := c.Request.Context()
-		for _, p := range parsed {
-			row := &models.TransactionStatus{
+		rows := make([]*models.TransactionStatus, len(parsed))
+		for i, p := range parsed {
+			rows[i] = &models.TransactionStatus{
 				TxID:      p.txid,
 				Status:    models.StatusReceived,
 				Timestamp: time.Now(),
@@ -1517,7 +1566,13 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 				PartitionKey: keyByTxid[p.txid],
 				ExpiresAt:    opts.ExpiresAt,
 			}
-			existing, inserted, dedupErr := s.store.GetOrInsertStatus(ctx, row)
+		}
+		// Every CAS runs before any outcome is acted on, so a failure at row k
+		// no longer means rows after k were never tried: shed with all of
+		// this request's inserts, wherever they sit in the batch.
+		cas := s.insertStatusesConcurrently(ctx, rows)
+		for i, p := range parsed {
+			row, existing, inserted, dedupErr := rows[i], cas[i].existing, cas[i].inserted, cas[i].err
 			switch {
 			case dedupErr != nil || (!inserted && existing == nil):
 				// Row state unknown: a txid-only message (#329) cannot be
@@ -1525,11 +1580,13 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 				// reaches Kafka; rows already inserted are RECEIVED, which
 				// the retry republishes (shouldRepublishExisting).
 				s.logger.Error("dedup CAS failed", logfields.TxID(p.txid), zap.Error(dedupErr))
-				s.shedBatch(c, receivedTxIDs, receivedAt, opts)
+				ids, at := insertedTxIDs(rows, cas)
+				s.shedBatch(c, ids, at, opts)
 				return
 			case s.extendOnResubmit(ctx, p.txid, existing, inserted, opts.ExpiresAt) != nil:
 				// Nothing reached Kafka yet; the retry repeats the extend.
-				s.shedBatch(c, receivedTxIDs, receivedAt, opts)
+				ids, at := insertedTxIDs(rows, cas)
+				s.shedBatch(c, ids, at, opts)
 				return
 			case !inserted && shouldRepublishExisting(existing.Status):
 				// REJECTED resubmit and stranded RECEIVED (Kafka send failed

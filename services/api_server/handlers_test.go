@@ -79,6 +79,11 @@ type mockStore struct {
 	// used directly. Default behavior (nil hook) is the legacy "always
 	// fresh insert" stub: (nil, false, nil).
 	getOrInsertFn func(status *models.TransactionStatus) (*models.TransactionStatus, bool, error)
+	// /txs CASes its rows concurrently, so getOrInsertFn calls are serialized
+	// under getOrInsertMu for hooks that record into unguarded state. A test
+	// that needs the calls to overlap sets getOrInsertConcurrent.
+	getOrInsertMu         sync.Mutex
+	getOrInsertConcurrent bool
 	// tipHeight is served by GetActiveTipBlockHeight (the /health
 	// blockHeight source); tipCalls counts reads so tests can assert the
 	// handler's TTL cache actually coalesces probes.
@@ -104,6 +109,10 @@ func (m *mockStore) UpdateStatus(_ context.Context, status *models.TransactionSt
 
 func (m *mockStore) GetOrInsertStatus(_ context.Context, status *models.TransactionStatus) (*models.TransactionStatus, bool, error) {
 	if m.getOrInsertFn != nil {
+		if !m.getOrInsertConcurrent {
+			m.getOrInsertMu.Lock()
+			defer m.getOrInsertMu.Unlock()
+		}
 		return m.getOrInsertFn(status)
 	}
 	// Default: the CAS inserts, as a real store does for a fresh txid.
