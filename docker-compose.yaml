@@ -55,7 +55,7 @@ services:
   # docker.io mirror of docker.redpanda.com/redpandadata/redpanda — the
   # vendor registry stalls podman pulls from some networks.
   redpanda:
-    image: docker.io/redpandadata/redpanda:v26.2.6
+    image: docker.io/redpandadata/redpanda:v26.2.7
     command:
       - redpanda
       - start
@@ -83,7 +83,7 @@ services:
 
   # One-shot analogue of _base/topics.yaml; see compose/topic-init.sh.
   topic-init:
-    image: docker.io/redpandadata/redpanda:v26.2.6
+    image: docker.io/redpandadata/redpanda:v26.2.7
     entrypoint: ["/bin/bash", "/topic-init.sh"]
     # Keep in step with propagation.partitions in compose/bsv-broadcaster-config.yaml:
     # BSV Broadcaster hard-fails at boot if the topic has fewer partitions than the
@@ -175,7 +175,7 @@ services:
   # RFC1918 and merkle-service's SSRF guard would otherwise reject it. BSV Broadcaster
   # forwards callback_url + callback_token per tx registration.
   merkle-service:
-    image: ${MERKLE_IMAGE:-ghcr.io/bsv-blockchain/merkle-service@sha256:e8589dfdf896f39d7f5c8da2a71e9d220b4857735be7390166fdf80f83eb6845}
+    image: ${MERKLE_IMAGE:-ghcr.io/bsv-blockchain/merkle-service@sha256:f0576e2038c984d0ca6d585c7c0d073efd2deca6cd9cbf09e95cf51a7e2667d5}
     environment:
       MODE: all-in-one
       LOG_LEVEL: info
