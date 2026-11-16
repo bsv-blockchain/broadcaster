@@ -80,9 +80,14 @@ var siteExtTypes = map[string]string{
 
 // RegisterSite registers the docs site from fsys (the root of a static export)
 // on r. Exported so cmd/docs-preview serves the page exactly as the API server
-// does, headers included.
+// does, headers included. Register any other routes first: on a *gin.Engine, entries that would
+// collide with them are skipped, as on the API server.
 func RegisterSite(r gin.IRoutes, fsys fs.FS) error {
-	_, _, err := registerSite(r, fsys, nil)
+	var reserved map[string]bool
+	if e, ok := r.(*gin.Engine); ok {
+		reserved = firstSegments(e.Routes())
+	}
+	_, _, err := registerSite(r, fsys, reserved)
 	return err
 }
 

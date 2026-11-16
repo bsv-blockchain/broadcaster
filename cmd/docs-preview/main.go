@@ -55,12 +55,12 @@ func main() {
 	gin.SetMode(gin.ReleaseMode)
 	router := gin.New()
 	router.Use(gin.Recovery())
-	if err := api_server.RegisterSite(router, site); err != nil {
-		log.Fatal(err)
-	}
 	router.GET("/health", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"healthy": true, "version": "docs-preview", "status": "ok"})
 	})
+	if err := api_server.RegisterSite(router, site); err != nil {
+		log.Fatal(err)
+	}
 
 	srv := &http.Server{
 		Addr:              addr,
