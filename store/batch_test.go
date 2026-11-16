@@ -142,8 +142,10 @@ func TestBatchGetOrInsertStatusParallel_PartialFailure(t *testing.T) {
 	wantErr := errors.New("transient db error")
 	f.insertErr["tx-bad"] = wantErr
 
+	// The failing row is last so both good rows start before it fails: the
+	// helper stops starting rows after a failure.
 	in := []*models.TransactionStatus{
-		{TxID: "tx-good-1"}, {TxID: "tx-bad"}, {TxID: "tx-good-2"},
+		{TxID: "tx-good-1"}, {TxID: "tx-good-2"}, {TxID: "tx-bad"},
 	}
 	results, err := store.BatchGetOrInsertStatusParallel(context.Background(), f, in)
 	if !errors.Is(err, wantErr) {
@@ -153,13 +155,37 @@ func TestBatchGetOrInsertStatusParallel_PartialFailure(t *testing.T) {
 	if !results[0].Inserted {
 		t.Errorf("results[0].Inserted = false, want true")
 	}
-	if !results[2].Inserted {
-		t.Errorf("results[2].Inserted = false, want true")
+	if !results[1].Inserted {
+		t.Errorf("results[1].Inserted = false, want true")
 	}
 	// The bad row's slot is the zero value — Inserted=false, Existing=nil.
-	// This is the signal phaseDedup uses to count a store_error.
-	if results[1].Inserted || results[1].Existing != nil {
-		t.Errorf("results[1] = %+v, want zero value", results[1])
+	// This is the signal callers use to tell it from an inserted row.
+	if results[2].Inserted || results[2].Existing != nil {
+		t.Errorf("results[2] = %+v, want zero value", results[2])
+	}
+}
+
+// After a failure no further rows start: with the store gone, a large batch
+// would otherwise pay a timeout for every remaining row before returning.
+func TestBatchGetOrInsertStatusParallel_StopsAtFirstFailure(t *testing.T) {
+	store.SetBatchConcurrency(1)
+	t.Cleanup(func() { store.SetBatchConcurrency(0) })
+	f := newFakeStore()
+	wantErr := errors.New("store unavailable")
+	f.insertErr["tx-bad"] = wantErr
+
+	in := []*models.TransactionStatus{{TxID: "tx-bad"}, {TxID: "tx-2"}, {TxID: "tx-3"}}
+	results, err := store.BatchGetOrInsertStatusParallel(context.Background(), f, in)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("err = %v, want wrapping wantErr", err)
+	}
+	if got := f.insertCalls.Load(); got != 1 {
+		t.Errorf("insertCalls = %d, want 1: rows after the failure must not start", got)
+	}
+	for i, r := range results {
+		if r.Inserted || r.Existing != nil {
+			t.Errorf("results[%d] = %+v, want zero value", i, r)
+		}
 	}
 }
 

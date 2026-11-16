@@ -76,7 +76,14 @@ included.
 | Global Cluster with cross-region shard majorities | ≈ today | ≈ today | ≈ today | survives | ~$2–2.4k/mo |
 
 For option 1, the range depends on `batch_concurrency`: the default `NumCPU`
-(8 on m8i.2xlarge) gives two rounds for 10 txs, and 16 gives one.
+(8 on m8i.2xlarge) gives two rounds for 10 txs, and 16 gives one. The
+retention extends and raw-tx restores of a resubmitted batch run the same way,
+so a retry costs a round or two more rather than one write per tx. Across
+concurrent requests the store writes in flight are capped pod-wide by
+`api.intake_store_concurrency` (default half the Mongo pool: 16 at the
+broadcast `max_pool_size: 32`, 6 at 12), so raising `batch_concurrency`
+cannot take more of the connection pool than that; note it also widens the
+other batch loops that share the knob.
 
 Only async intake gives equal latency in every region while keeping regional
 failover. Option 1 should ship regardless: the consumer below needs it, and it
@@ -224,7 +231,9 @@ Monitoring envelope age at write keeps the window visible.
 ## Rollout
 
 1. Ship concurrent CAS (option 1). Set `batch_concurrency: 16` in the broadcast
-   configmaps.
+   configmaps. The derived intake cap (half `max_pool_size`) then binds
+   before `batch_concurrency` does under concurrent batches; raise the pool
+   to raise it.
 2. Native `BatchGetOrInsertStatus` for Mongo, with per-row results on error.
 3. Redpanda: AZ topology spread, then create `arcade.intake` (RF 3, min ISR 2)
    per network per region.

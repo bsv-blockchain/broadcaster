@@ -207,6 +207,41 @@ type API struct {
 	// default) trusts none, so the header is never honored regardless of
 	// TrustedPlatform.
 	TrustedProxies []string `mapstructure:"trusted_proxies"`
+	// IntakeStoreConcurrency caps the store writes POST /txs intake keeps in
+	// flight across the whole pod (dedup CAS, retention extends, raw-tx
+	// restores). Each request runs its rows store.batch_concurrency at a
+	// time; this bound stops concurrent batches from multiplying that past
+	// the store's connection pool and starving every other endpoint's
+	// queries. 0 (the default) derives it: half of store.mongodb.max_pool_size
+	// on MongoDB (half the driver's default pool of 100 when that is unset),
+	// else DefaultIntakeStoreConcurrency.
+	IntakeStoreConcurrency int `mapstructure:"intake_store_concurrency"`
+}
+
+// DefaultIntakeStoreConcurrency is the intake write cap on backends whose
+// pool api.intake_store_concurrency cannot derive from.
+const DefaultIntakeStoreConcurrency = 32
+
+// mongoDriverDefaultPool is the MongoDB driver's own max pool size, in force
+// when neither store.mongodb.max_pool_size nor the URI sets one.
+const mongoDriverDefaultPool = 100
+
+// IntakeStoreConcurrencyLimit resolves api.intake_store_concurrency (see
+// API.IntakeStoreConcurrency). Half the pool leaves the rest to the point
+// reads, the submission recorder, SSE catchup and the other services in the
+// process.
+func (c *Config) IntakeStoreConcurrencyLimit() int {
+	if c.APIServer.IntakeStoreConcurrency > 0 {
+		return c.APIServer.IntakeStoreConcurrency
+	}
+	if c.Store.Backend != "mongodb" {
+		return DefaultIntakeStoreConcurrency
+	}
+	pool := c.Store.Mongo.MaxPoolSize
+	if pool <= 0 {
+		pool = mongoDriverDefaultPool
+	}
+	return max(1, pool/2)
 }
 
 // TrustedPlatformCloudflare is the api.trusted_platform value for
@@ -1627,6 +1662,7 @@ func setDefaults() {
 	viper.SetDefault("api.port", 8080)
 	viper.SetDefault("api.trusted_platform", "")
 	viper.SetDefault("api.trusted_proxies", []string{})
+	viper.SetDefault("api.intake_store_concurrency", 0)
 	// API keys, admin and rate limiting all ship off. Only the free tier
 	// and the anonymous tier have defaults: viper deep-merges maps, so a
 	// default "pro" tier could never be removed by an operator's config.

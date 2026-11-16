@@ -37,6 +37,9 @@ api:
   # trusted_platform: ""      # "cloudflare" trusts CF-Connecting-IP from ANY
   #                           # peer — safe only when Cloudflare (e.g. a
   #                           # Tunnel) is the sole ingress. See docs/api-keys.md.
+  # intake_store_concurrency: 0   # pod-wide cap on POST /txs store writes in
+  #                               # flight. 0 = half of store.mongodb.max_pool_size
+  #                               # on MongoDB, else 32; keep it below the pool.
 
 # BSV Broadcaster does not create Kafka topics; the broker must already have them
 # (auto-create on first publish is typically disabled in production, and

@@ -74,7 +74,7 @@ func (s *Server) retentionExpiry(c *gin.Context) *time.Time {
 // retry repeats it (extending is idempotent), rather than acknowledging a
 // submission whose row would expire before the caller's retention.
 func (s *Server) extendOnResubmit(ctx context.Context, txid string, existing *models.TransactionStatus, inserted bool, until *time.Time) error {
-	if s.retention == nil || inserted || existing == nil || !extends(existing.ExpiresAt, until, time.Now()) {
+	if !s.needsExtend(existing, inserted, until) {
 		return nil
 	}
 	if err := s.retention.ExtendTransactionExpiry(ctx, txid, until); err != nil {
@@ -83,6 +83,12 @@ func (s *Server) extendOnResubmit(ctx context.Context, txid string, existing *mo
 		return err
 	}
 	return nil
+}
+
+// needsExtend reports whether a CAS result is a resubmit whose row must have
+// its retention extended to until (see extendOnResubmit).
+func (s *Server) needsExtend(existing *models.TransactionStatus, inserted bool, until *time.Time) bool {
+	return s.retention != nil && !inserted && existing != nil && extends(existing.ExpiresAt, until, time.Now())
 }
 
 // extends reports whether until is meaningfully longer retention than the
