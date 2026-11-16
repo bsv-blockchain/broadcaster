@@ -686,3 +686,35 @@ func TestIntakeStoreConcurrencyLimit(t *testing.T) {
 		})
 	}
 }
+
+// api.callback_store_concurrency defaults to a quarter of the MongoDB pool,
+// so a burst of merkle-service callbacks leaves /txs its share.
+func TestCallbackStoreConcurrencyLimit(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		backend string
+		pool    int
+		set     int
+		want    int
+	}{
+		{"explicit value wins", backendMongoDB, 32, 5, 5},
+		{"a quarter of the mongo pool", backendMongoDB, 32, 0, 8},
+		{"small mongo pool", backendMongoDB, 4, 0, 1},
+		{"pool of one still writes", backendMongoDB, 1, 0, 1},
+		{"driver default pool", backendMongoDB, 0, 0, 25},
+		{"other backends", "postgres", 0, 0, DefaultCallbackStoreConcurrency},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &Config{}
+			cfg.Store.Backend = tc.backend
+			cfg.Store.Mongo.MaxPoolSize = tc.pool
+			cfg.APIServer.CallbackStoreConcurrency = tc.set
+			if got := cfg.CallbackStoreConcurrencyLimit(); got != tc.want {
+				t.Errorf("CallbackStoreConcurrencyLimit() = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+// backendMongoDB is store.backend's MongoDB value.
+const backendMongoDB = "mongodb"

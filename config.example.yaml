@@ -40,6 +40,9 @@ api:
   # intake_store_concurrency: 0   # pod-wide cap on POST /txs store writes in
   #                               # flight. 0 = half of store.mongodb.max_pool_size
   #                               # on MongoDB, else 32; keep it below the pool.
+  # callback_store_concurrency: 0 # pod-wide cap on merkle-service callback
+  #                               # status writes. 0 = a quarter of
+  #                               # store.mongodb.max_pool_size on MongoDB, else 16.
 
 # BSV Broadcaster does not create Kafka topics; the broker must already have them
 # (auto-create on first publish is typically disabled in production, and

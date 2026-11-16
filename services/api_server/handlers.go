@@ -750,6 +750,39 @@ func (s *Server) handleSeenMultipleNodes(c *gin.Context, msg models.CallbackMess
 	return s.applySeenCallback(c, msg, logger, models.StatusSeenMultipleNodes, "SEEN_MULTIPLE_NODES")
 }
 
+// callbackBatchUpdate is BatchUpdateStatusReturning for a merkle-service
+// callback, bounded by the pod-wide callback slots. Every backend runs a
+// batch status update as store.BatchConcurrency per-row writes at a time,
+// and a burst of callbacks each doing that took the whole connection pool
+// on mainnet (2026-11-16: ten callbacks of 5-46 s at once, /txs and the
+// quota reservation queued behind them). The callback holds w slots, where
+// w is at most its row count, BatchConcurrency and the slot total, and
+// hands the store chunks of at most w rows, one after another, so it never
+// has more than w writes in flight.
+//
+// Results are in input order. On error the rows of the chunks already
+// written are returned with it, as BatchUpdateStatusReturning does; the
+// remaining rows are not attempted.
+func (s *Server) callbackBatchUpdate(ctx context.Context, statuses []*models.TransactionStatus) ([]store.StatusUpdate, error) {
+	if s.callbackSlots == nil || s.callbackSlotCount <= 0 {
+		return s.store.BatchUpdateStatusReturning(ctx, statuses)
+	}
+	w := min(len(statuses), store.BatchConcurrency(), s.callbackSlotCount)
+	if err := s.callbackSlots.Acquire(ctx, int64(w)); err != nil {
+		return nil, err
+	}
+	defer s.callbackSlots.Release(int64(w))
+	out := make([]store.StatusUpdate, 0, len(statuses))
+	for start := 0; start < len(statuses); start += w {
+		updates, err := s.store.BatchUpdateStatusReturning(ctx, statuses[start:min(start+w, len(statuses))])
+		out = append(out, updates...)
+		if err != nil {
+			return out, err
+		}
+	}
+	return out, nil
+}
+
 // applySeenCallback is the shared body of the two "seen" callback paths.
 // targetStatus is the status to transition each known txid to;
 // metricLabel is the type label used on the callback metrics.
@@ -806,7 +839,7 @@ func (s *Server) applySeenCallback(c *gin.Context, msg models.CallbackMessage, l
 		return nil
 	}
 
-	updates, err := s.store.BatchUpdateStatusReturning(ctx, statuses)
+	updates, err := s.callbackBatchUpdate(ctx, statuses)
 	if err != nil {
 		outcome = "error"
 		logger.Error(
