@@ -306,6 +306,24 @@ func TestValidateAccessControl(t *testing.T) {
 		{"anonymous max_batch exceeds units_per_minute", func(c *Config) {
 			c.RateLimit.Anonymous = TierConfig{UnitsPerMinute: 10, MaxBatch: 5}
 		}, "max_batch"},
+		{"anonymous burst_units fits the largest request", func(c *Config) {
+			c.RateLimit.Anonymous = TierConfig{UnitsPerMinute: 600, MaxInFlight: 5, MaxBatch: 1, BurstUnits: 11} // 1*10+1=11
+		}, ""},
+		{"anonymous burst_units too small for the largest request", func(c *Config) {
+			c.RateLimit.Anonymous = TierConfig{UnitsPerMinute: 600, MaxInFlight: 5, MaxBatch: 1, BurstUnits: 10} // 1*10+1=11 > 10
+		}, "burst_units (10) is too small"},
+		{"anonymous burst_units above units_per_minute", func(c *Config) {
+			c.RateLimit.Anonymous = TierConfig{UnitsPerMinute: 50, MaxInFlight: 5, MaxBatch: 1, BurstUnits: 51}
+		}, "exceeds units_per_minute"},
+		{"anonymous burst_units negative", func(c *Config) {
+			c.RateLimit.Anonymous = TierConfig{UnitsPerMinute: 50, MaxInFlight: 5, MaxBatch: 1, BurstUnits: -1}
+		}, "burst_units must be >= 0"},
+		{"anonymous burst_units on an unbounded tier", func(c *Config) {
+			c.RateLimit.Anonymous = TierConfig{UnitsPerMinute: 0, MaxInFlight: 5, MaxBatch: 1, BurstUnits: 20}
+		}, "bounded units_per_minute"},
+		{"burst_units on a keyed tier", func(c *Config) {
+			c.RateLimit.Tiers["enterprise"] = TierConfig{UnitsPerMinute: 600, BurstUnits: 20}
+		}, "only supported on ratelimit.anonymous"},
 		{"unbounded tier skips the payability check even with a huge max_batch", func(c *Config) {
 			c.RateLimit.Tiers["enterprise"] = TierConfig{UnitsPerMinute: 0, MaxBatch: 1_000_000}
 		}, ""},

@@ -93,6 +93,26 @@ func TestAnonymousAndUnknownTier(t *testing.T) {
 	require.Equal(t, `"free";q=25;w=60`, w.Header().Get("RateLimit-Policy"), "an unconfigured tier falls back to free")
 }
 
+// ratelimit.anonymous.burst_units caps how much an unkeyed caller spends at
+// once, and a request above the burst is unpayable (413), not retryable.
+func TestAnonymousBurstUnits(t *testing.T) {
+	cfg := testConfig()
+	cfg.Anonymous = config.TierConfig{UnitsPerMinute: 600, MaxInFlight: 5, MaxBatch: 1, BurstUnits: 20}
+	rl := New(cfg, newFakeQuota(), zap.NewNop(), WithClock(func() time.Time { return noon }))
+
+	tx := engine(rl, apikey.Principal{Tier: config.TierAnonymous, ClientIP: "1.2.3.4"}, 10, ok)
+	require.Equal(t, http.StatusNoContent, do(t, tx).Code)
+	require.Equal(t, http.StatusNoContent, do(t, tx).Code)
+	w := do(t, tx)
+	require.Equal(t, http.StatusTooManyRequests, w.Code, "two transactions of burst, not sixty")
+	require.Equal(t, "1", w.Header().Get("Retry-After"))
+
+	big := engine(rl, apikey.Principal{Tier: config.TierAnonymous, ClientIP: "5.6.7.8"}, 21, ok)
+	w = do(t, big)
+	require.Equal(t, http.StatusRequestEntityTooLarge, w.Code)
+	require.Contains(t, w.Body.String(), "burst of 20")
+}
+
 // TestAnonymousBucketSharedWithinIPv6Slash64 pins that an IPv6 client
 // rotating addresses within its own /64 must not get fresh anonymous quota
 // on every rotation. Principal.Subject() normalizes via

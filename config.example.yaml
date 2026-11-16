@@ -543,6 +543,8 @@ ratelimit:
     max_in_flight: 5
     max_batch: 1
     retention_days: 30  # 0 = keep forever; see docs/api-keys.md "Data retention per tier"
+    burst_units: 0      # 0 = one minute of burst (units_per_minute); lower it to cap
+                        # what a new client IP can spend at once
   # free is required whenever ratelimit.enabled: it's the fallback tier for
   # a key whose configured tier is later removed. Tier names must be
   # lowercase and match ^[a-z0-9][a-z0-9_-]*$. A bounded tier
