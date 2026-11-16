@@ -91,52 +91,203 @@ func (s *Store) GetOrInsertStatus(ctx context.Context, status *models.Transactio
 	return status, true, nil
 }
 
-// BatchGetOrInsertStatus implements store.Store via the shared bounded-
-// concurrency loop, like the Aerospike and Pebble backends. Duplicate txids
-// within one batch are collapsed first so the result is deterministic: the
-// first occurrence carries the insert outcome and every later occurrence
-// reports the row as existing (Postgres does the same).
+// NativeBatchGetOrInsert marks BatchGetOrInsertStatus as a native batch
+// write (store.NativeBatchInserter).
+func (*Store) NativeBatchGetOrInsert() {}
+
+// BatchGetOrInsertStatus implements store.Store natively: one unordered
+// InsertMany per chunk (batch_size rows, 8 MiB of raw transactions), then one
+// $in read for the rows that already existed. A batch therefore costs two
+// round trips, not one per row, which
+// matters because every write waits for a majority acknowledgement.
+//
+// Chunks run in order, and the first chunk that fails stops the rest, whose
+// rows are then not inserted. A nil row or empty txid fails the whole call
+// before anything is written.
+//
+// Rows are prepared exactly as GetOrInsertStatus prepares one (timestamp,
+// status and created_at defaults, written back into the caller's struct).
+// Duplicate txids within one batch are collapsed first so the result is
+// deterministic: the first occurrence carries the insert outcome and every
+// later occurrence reports the row as existing (Postgres does the same).
+// Existing rows are returned without the blob-backed merkle path and
+// orphaned proofs that GetStatus attaches.
+//
+// On error the results still report what is known: a row the server
+// accepted is Inserted, a duplicate whose row was read back carries
+// Existing, and a row whose outcome is unknown is the zero value. An
+// unordered InsertMany keeps going past a failed row, so inserted rows can
+// sit anywhere in the batch. A write-concern error leaves every row of its
+// chunk unknown: the primary may hold them, but they are not majority
+// committed.
 func (s *Store) BatchGetOrInsertStatus(ctx context.Context, statuses []*models.TransactionStatus) ([]store.BatchInsertResult, error) {
+	if len(statuses) == 0 {
+		return nil, nil
+	}
+	out := make([]store.BatchInsertResult, len(statuses))
 	firstIdx := make(map[string]int, len(statuses))
-	uniq := make([]*models.TransactionStatus, 0, len(statuses))
+	uniq := make([]int, 0, len(statuses))
 	for i, st := range statuses {
-		if st == nil {
-			continue
+		if st == nil || st.TxID == "" {
+			return out, errors.New("mongodb: batch get or insert status: nil row or empty txid")
 		}
 		if _, dup := firstIdx[st.TxID]; dup {
 			continue
 		}
 		firstIdx[st.TxID] = i
-		uniq = append(uniq, st)
+		uniq = append(uniq, i)
 	}
-	if len(uniq) == len(statuses) {
-		return store.BatchGetOrInsertStatusParallel(ctx, s, statuses)
+
+	now := time.Now()
+	var existingIDs []string
+	var err error
+	for _, chunk := range insertChunks(statuses, uniq, s.batchSize) {
+		var dups []string
+		dups, err = s.insertChunk(ctx, statuses, chunk, now, out)
+		existingIDs = append(existingIDs, dups...)
+		if err != nil {
+			break
+		}
 	}
-	uniqRes, err := store.BatchGetOrInsertStatusParallel(ctx, s, uniq)
-	if err != nil {
-		return nil, err
+	if readErr := s.fillExisting(ctx, firstIdx, existingIDs, out); err == nil {
+		err = readErr
 	}
-	byTx := make(map[string]store.BatchInsertResult, len(uniq))
-	for i, st := range uniq {
-		byTx[st.TxID] = uniqRes[i]
-	}
-	out := make([]store.BatchInsertResult, len(statuses))
+
 	for i, st := range statuses {
-		if st == nil {
-			continue
-		}
-		r := byTx[st.TxID]
 		if firstIdx[st.TxID] == i {
-			out[i] = r
 			continue
 		}
-		existing := r.Existing
-		if r.Inserted {
-			existing = statuses[firstIdx[st.TxID]]
+		first := out[firstIdx[st.TxID]]
+		switch {
+		case first.Inserted:
+			out[i] = store.BatchInsertResult{Existing: statuses[firstIdx[st.TxID]]}
+		case first.Existing != nil:
+			out[i] = store.BatchInsertResult{Existing: first.Existing}
 		}
-		out[i] = store.BatchInsertResult{Existing: existing, Inserted: false}
 	}
-	return out, nil
+	return out, err
+}
+
+// maxInsertChunkBytes caps the raw transaction bytes in one InsertMany, so a
+// chunk is a single server message. The driver splits a larger InsertMany
+// into ~48 MB messages sent one after another, and if a later one fails it
+// returns only that failure, dropping what the earlier, committed messages
+// reported: their rows would read as unknown and lose RECEIVED.
+const maxInsertChunkBytes = 8 << 20
+
+// insertChunks groups the rows at idx into InsertMany chunks of at most n
+// rows and maxInsertChunkBytes of raw transactions; a single larger row is a
+// chunk of its own.
+func insertChunks(statuses []*models.TransactionStatus, idx []int, n int) [][]int {
+	if n <= 0 {
+		n = defaultBatchSize
+	}
+	var out [][]int
+	start, size := 0, 0
+	for k, i := range idx {
+		rowSize := len(statuses[i].RawTx)
+		if k > start && (k-start >= n || size+rowSize > maxInsertChunkBytes) {
+			out = append(out, idx[start:k])
+			start, size = k, 0
+		}
+		size += rowSize
+	}
+	if start < len(idx) {
+		out = append(out, idx[start:])
+	}
+	return out
+}
+
+// duplicateKeyCode is the server's E11000 duplicate-key error: the row
+// already exists.
+const duplicateKeyCode = 11000
+
+// insertChunk inserts the rows at idx in one unordered InsertMany, marks the
+// ones the server accepted in out, and returns the txids that hit the unique
+// index (rows that already exist). Any other failure is returned, with the
+// rows it touched left unknown.
+func (s *Store) insertChunk(ctx context.Context, statuses []*models.TransactionStatus, idx []int, now time.Time, out []store.BatchInsertResult) ([]string, error) {
+	docs := make([]any, len(idx))
+	for k, i := range idx {
+		st := statuses[i]
+		if st.Timestamp.IsZero() {
+			st.Timestamp = now
+		}
+		if st.Status == "" {
+			st.Status = models.StatusReceived
+		}
+		st.CreatedAt = now
+		d := txDocFromStatus(st)
+		d.Version = 1
+		docs[k] = d
+	}
+
+	// query_timeout_ms, not op_timeout_ms: a chunk carries up to
+	// maxInsertChunkBytes and waits for a cross-region majority.
+	octx, cancel := s.queryCtx(ctx)
+	defer cancel()
+	_, err := s.tx.InsertMany(octx, docs, options.InsertMany().SetOrdered(false))
+	if err == nil {
+		for _, i := range idx {
+			out[i] = store.BatchInsertResult{Inserted: true}
+		}
+		return nil, nil
+	}
+
+	var bwe mongo.BulkWriteException
+	if !errors.As(err, &bwe) || bwe.WriteConcernError != nil {
+		// Transport error, timeout or write-concern failure: no row's outcome
+		// is known.
+		return nil, fmt.Errorf("insert %d txs: %w", len(idx), err)
+	}
+	failed := make(map[int]bool, len(bwe.WriteErrors))
+	var dups []string
+	var firstErr error
+	for _, we := range bwe.WriteErrors {
+		failed[we.Index] = true
+		if we.Code == duplicateKeyCode {
+			dups = append(dups, statuses[idx[we.Index]].TxID)
+			continue
+		}
+		if firstErr == nil {
+			firstErr = fmt.Errorf("insert tx %s: %w", statuses[idx[we.Index]].TxID, we)
+		}
+	}
+	for k, i := range idx {
+		if !failed[k] {
+			out[i] = store.BatchInsertResult{Inserted: true}
+		}
+	}
+	return dups, firstErr
+}
+
+// fillExisting reads the rows that already existed and sets them as each
+// first occurrence's Existing. A row that is gone again (deleted between the
+// insert and the read) stays unknown and is reported as an error.
+func (s *Store) fillExisting(ctx context.Context, firstIdx map[string]int, txids []string, out []store.BatchInsertResult) error {
+	for _, chunk := range chunks(txids, inChunk) {
+		octx, cancel := s.opCtx(ctx)
+		cur, err := s.tx.Find(octx, doc(kv(fID, doc(kv(opIn, chunk)))))
+		if err != nil {
+			cancel()
+			return fmt.Errorf("read existing txs: %w", err)
+		}
+		var docs []txDoc
+		err = cur.All(octx, &docs)
+		cancel()
+		if err != nil {
+			return fmt.Errorf("read existing txs: %w", err)
+		}
+		for _, d := range docs {
+			out[firstIdx[d.TxID]] = store.BatchInsertResult{Existing: d.toStatus()}
+		}
+	}
+	for _, txid := range txids {
+		if out[firstIdx[txid]].Existing == nil {
+			return fmt.Errorf("insert tx %s: lost the insert race but the row is gone", txid)
+		}
+	}
+	return nil
 }
 
 // --- partial updates ---

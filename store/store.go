@@ -232,6 +232,15 @@ func (pp PeerPolicy) SanitizePolicySizes() (PeerPolicy, int) {
 	return pp, dropped
 }
 
+// NativeBatchInserter marks a backend whose BatchGetOrInsertStatus writes a
+// batch in a few statements on one connection (Postgres, MongoDB) instead of
+// a bounded per-row loop over GetOrInsertStatus (Aerospike, Pebble). The
+// /txs handler uses it to decide how much of its pod-wide store budget a
+// batch takes: one slot for the whole call, or one per row in flight.
+type NativeBatchInserter interface {
+	NativeBatchGetOrInsert()
+}
+
 // BatchInsertResult is one entry in the result slice returned by
 // BatchGetOrInsertStatus. Inserted is true when the row was newly written by
 // this call; false when an existing row was found and Existing carries it.
@@ -271,9 +280,17 @@ type Store interface {
 	// reports whether statuses[i] was newly inserted, and result[i].Existing
 	// carries the existing row when !Inserted (it is nil for new inserts).
 	//
-	// Backends with native batch support (e.g. Postgres via the xmax trick)
-	// implement this as a single round-trip; backends without (Aerospike,
-	// Pebble) fall back to a bounded-concurrency loop over GetOrInsertStatus.
+	// Backends with native batch support (Postgres via the xmax trick,
+	// MongoDB via an unordered InsertMany) implement this in one or two round
+	// trips; backends without (Aerospike, Pebble) fall back to a
+	// bounded-concurrency loop over GetOrInsertStatus.
+	//
+	// On error the slice is either nil (no row's outcome is known, as when
+	// Postgres's single statement fails) or has one entry per input, where
+	// Inserted marks every row this call did insert and a zero value marks a
+	// row whose outcome is unknown. Callers that must know exactly which
+	// rows they inserted (the /txs handler publishes RECEIVED only for
+	// those, #391) rely on this.
 	BatchGetOrInsertStatus(ctx context.Context, statuses []*models.TransactionStatus) ([]BatchInsertResult, error)
 
 	// UpdateStatus updates an existing transaction status (used for P2P, blocks, etc.).

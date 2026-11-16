@@ -357,3 +357,43 @@ func pgBatchTxID(i int) string {
 	}
 	return "pg-batch-" + string(buf[:])
 }
+
+// A batch above one statement's bind-parameter limit (4369 rows) is split
+// into chunks: every row still resolves per position, including rows that
+// already existed and txids repeated across chunk boundaries.
+func TestBatchGetOrInsertStatus_LargerThanOneStatement(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	const n = 4500
+	var seed []*models.TransactionStatus
+	for i := 0; i < n; i += 500 {
+		seed = append(seed, &models.TransactionStatus{TxID: pgBatchTxID(i), Status: models.StatusSeenOnNetwork})
+	}
+	if _, err := s.BatchGetOrInsertStatus(ctx, seed); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	in := make([]*models.TransactionStatus, 0, n+2)
+	for i := 0; i < n; i++ {
+		in = append(in, &models.TransactionStatus{TxID: pgBatchTxID(n - 1 - i)}) // reverse txid order
+	}
+	in = append(in, &models.TransactionStatus{TxID: pgBatchTxID(1)}, &models.TransactionStatus{TxID: pgBatchTxID(500)})
+
+	results, err := s.BatchGetOrInsertStatus(ctx, in)
+	if err != nil {
+		t.Fatalf("BatchGetOrInsertStatus(%d rows): %v", len(in), err)
+	}
+	for k := 0; k < n; k++ {
+		i := n - 1 - k
+		existed := i%500 == 0
+		if r := results[k]; r.Inserted == existed || (existed && (r.Existing == nil || r.Existing.Status != models.StatusSeenOnNetwork)) {
+			t.Fatalf("results[%d] (%s) = %+v, existed=%v", k, in[k].TxID, r, existed)
+		}
+	}
+	for _, k := range []int{n, n + 1} {
+		if r := results[k]; r.Inserted || r.Existing == nil {
+			t.Errorf("repeat results[%d] (%s) = %+v, want Existing", k, in[k].TxID, r)
+		}
+	}
+}

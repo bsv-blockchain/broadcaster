@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -171,11 +172,57 @@ ON CONFLICT (txid) DO NOTHING`
 
 // columnsPerInsertRow is how many placeholders one row in the multi-row
 // INSERT VALUES list consumes. Matches the column list in the static SQL
-// fragment built by BatchGetOrInsertStatus.
+// fragment built by batchGetOrInsertChunk.
 const columnsPerInsertRow = 15
 
-// BatchGetOrInsertStatus is the multi-row form of GetOrInsertStatus. It uses
-// the "xmax = 0" trick: ON CONFLICT DO UPDATE SET txid = excluded.txid is a
+// NativeBatchGetOrInsert marks BatchGetOrInsertStatus as a native batch
+// write (store.NativeBatchInserter).
+func (*Store) NativeBatchGetOrInsert() {}
+
+// batchInsertRows bounds one multi-row INSERT: pgx's extended protocol
+// takes at most 65535 bind parameters, which is 4369 rows at
+// columnsPerInsertRow.
+const batchInsertRows = 1000
+
+// BatchGetOrInsertStatus is the multi-row form of GetOrInsertStatus: one
+// statement per batchInsertRows rows (batchGetOrInsertChunk). Each chunk's
+// rows are sent in txid order, so two concurrent batches that share txids
+// lock them in the same order instead of deadlocking.
+//
+// Chunks run in order, and the first that fails stops the rest. A chunk is
+// one statement, so it is all-or-nothing: on error the result has one entry
+// per input, with the earlier chunks' outcomes and zero values for the rest
+// (store.Store's partial-results contract).
+func (s *Store) BatchGetOrInsertStatus(ctx context.Context, statuses []*models.TransactionStatus) ([]store.BatchInsertResult, error) {
+	if len(statuses) == 0 {
+		return nil, nil
+	}
+	out := make([]store.BatchInsertResult, len(statuses))
+	for start := 0; start < len(statuses); start += batchInsertRows {
+		order := make([]int, min(batchInsertRows, len(statuses)-start))
+		for k := range order {
+			order[k] = start + k
+		}
+		// Stable, so a txid repeated in the chunk keeps its first occurrence
+		// first and that one carries the insert outcome.
+		slices.SortStableFunc(order, func(a, b int) int { return strings.Compare(statuses[a].TxID, statuses[b].TxID) })
+		chunk := make([]*models.TransactionStatus, len(order))
+		for k, i := range order {
+			chunk[k] = statuses[i]
+		}
+		res, err := s.batchGetOrInsertChunk(ctx, chunk)
+		if err != nil {
+			return out, err
+		}
+		for k, i := range order {
+			out[i] = res[k]
+		}
+	}
+	return out, nil
+}
+
+// batchGetOrInsertChunk runs one multi-row INSERT. It uses the "xmax = 0"
+// trick: ON CONFLICT DO UPDATE SET txid = excluded.txid is a
 // no-op write that nonetheless triggers RETURNING for the existing row, and
 // xmax is 0 for newly-inserted rows but non-zero for rows we re-touched. So
 // one round-trip gives us per-row inserted/existing flag plus the existing
@@ -184,11 +231,7 @@ const columnsPerInsertRow = 15
 // The single-row GetOrInsertStatus uses ON CONFLICT DO NOTHING + a fallback
 // SELECT, which is two round-trips when the row exists. For batches of 100+
 // txs the win from collapsing into one round-trip is large.
-func (s *Store) BatchGetOrInsertStatus(ctx context.Context, statuses []*models.TransactionStatus) ([]store.BatchInsertResult, error) {
-	if len(statuses) == 0 {
-		return nil, nil
-	}
-
+func (s *Store) batchGetOrInsertChunk(ctx context.Context, statuses []*models.TransactionStatus) ([]store.BatchInsertResult, error) {
 	// Normalise inputs the same way GetOrInsertStatus does — empty Status
 	// becomes RECEIVED, missing timestamps default to now, CreatedAt is set.
 	// Defaults are computed into local variables, never written back to the
