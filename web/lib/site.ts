@@ -1,13 +1,19 @@
-/** The public deployment, unless NEXT_PUBLIC_API_BASE_URL says otherwise at build time. */
-const defaultOrigin = (process.env.NEXT_PUBLIC_API_BASE_URL ?? "https://broadcast.whatsonchain.com").replace(/\/$/, "");
+/**
+ * The origin baked into prerendered text. Every operator serves this export
+ * from its own API server, so the default is a placeholder that the server
+ * replaces with the serving origin on every response (originPlaceholder in
+ * services/api_server/site.go; keep the two in step). Set
+ * NEXT_PUBLIC_API_BASE_URL at build time only to pin one fixed origin.
+ */
+const defaultOrigin = (process.env.NEXT_PUBLIC_API_BASE_URL ?? "https://broadcaster.invalid").replace(/\/$/, "");
 
 /** Facts about the site that appear in more than one place. */
 export const site = {
   name: "BSV Broadcaster",
   /**
-   * The public deployment's origin, for canonical URLs, the sitemap, robots.txt,
+   * The serving deployment's origin, for canonical URLs, the sitemap, robots.txt,
    * llms.txt and JSON-LD. The page is served by the API server itself, so this
-   * is also the API base URL. Override with NEXT_PUBLIC_API_BASE_URL at build time.
+   * is also the API base URL. See defaultOrigin above.
    */
   url: defaultOrigin,
   description:

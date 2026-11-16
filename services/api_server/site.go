@@ -1,13 +1,14 @@
 package api_server
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"mime"
 	"net/http"
 	"path"
+	"regexp"
 	"strings"
 	"time"
 
@@ -21,8 +22,22 @@ import (
 // Routes are registered per top-level entry of the export, not as a catch-all:
 // a file gets an exact route ("/llms.txt"; "docs.html" as "/docs"), a directory
 // a prefix route ("/_next/*filepath"). Unknown paths therefore still reach the
-// router's own 404, and an export entry that collides with an API route makes
-// gin panic at registration, which every test that builds the router catches.
+// router's own 404. The site is registered after the API, and an entry whose
+// route would share its first path segment with an API route ("tx/" beside
+// "/tx/:txid", a "health" file) is skipped and reported instead of registered:
+// gin would panic on the conflict, and no Go test sees the real export.
+
+// originPlaceholder is the origin the export is built with (defaultOrigin in
+// web/lib/site.ts; keep the two in step). Every operator serves the export
+// from its own API server, so each response replaces it with the origin the
+// client reached: canonical URLs, the sitemap, robots.txt, llms.txt and
+// JSON-LD then name the serving deployment, never a host baked in at build.
+const originPlaceholder = "https://broadcaster.invalid"
+
+// siteHostRE accepts a DNS name or IPv4 address, or a bracketed IPv6 address,
+// with an optional port. The host is written into HTML, JSON and JavaScript,
+// so anything else (quotes, angle brackets, spaces) leaves the placeholder.
+var siteHostRE = regexp.MustCompile(`^(?:[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?|\[[0-9A-Fa-f:.]+\])(?::[0-9]{1,5})?$`)
 
 // siteCSP is the Content-Security-Policy of every site response. Nothing is
 // loaded from another origin: scripts, styles and fonts are self-hosted, and
@@ -67,14 +82,16 @@ var siteExtTypes = map[string]string{
 // on r. Exported so cmd/docs-preview serves the page exactly as the API server
 // does, headers included.
 func RegisterSite(r gin.IRoutes, fsys fs.FS) error {
-	_, err := registerSite(r, fsys)
+	_, _, err := registerSite(r, fsys, nil)
 	return err
 }
 
 // registerSite registers the site and returns the route patterns it
-// registered, which the API server keeps out of traces and Warn logs.
-func registerSite(r gin.IRoutes, fsys fs.FS) ([]string, error) {
-	var routes []string
+// registered, which the API server keeps out of traces and Warn logs, and the
+// export entries it skipped because their route would collide with an API
+// route (one whose first path segment is in reserved).
+func registerSite(r gin.IRoutes, fsys fs.FS, reserved map[string]bool) ([]string, []string, error) {
+	var routes, skipped []string
 	handle := func(route string, h gin.HandlerFunc) {
 		handleGetHead(r, route, h)
 		routes = append(routes, route)
@@ -82,15 +99,15 @@ func registerSite(r gin.IRoutes, fsys fs.FS) ([]string, error) {
 
 	if _, err := fs.Stat(fsys, "index.html"); err != nil {
 		if !errors.Is(err, fs.ErrNotExist) {
-			return nil, fmt.Errorf("docs site: %w", err)
+			return nil, nil, fmt.Errorf("docs site: %w", err)
 		}
 		handle("/", serveFallbackDocs)
-		return routes, nil
+		return routes, nil, nil
 	}
 
 	entries, err := fs.ReadDir(fsys, ".")
 	if err != nil {
-		return nil, fmt.Errorf("docs site: %w", err)
+		return nil, nil, fmt.Errorf("docs site: %w", err)
 	}
 	site := &siteHandler{fsys: fsys}
 	for _, e := range entries {
@@ -98,6 +115,8 @@ func registerSite(r gin.IRoutes, fsys fs.FS) ([]string, error) {
 		switch {
 		case name == ".gitkeep":
 			continue
+		case reserved[strings.TrimSuffix(name, ".html")]:
+			skipped = append(skipped, name)
 		case e.IsDir():
 			handle("/"+name+"/*filepath", site.serveDir(name))
 		case name == "index.html":
@@ -110,7 +129,18 @@ func registerSite(r gin.IRoutes, fsys fs.FS) ([]string, error) {
 			handle("/"+name, site.serveFile(name))
 		}
 	}
-	return routes, nil
+	return routes, skipped, nil
+}
+
+// firstSegments returns the first path segment of every route, the names a
+// site entry must not take.
+func firstSegments(routes gin.RoutesInfo) map[string]bool {
+	segs := make(map[string]bool, len(routes))
+	for _, rt := range routes {
+		seg, _, _ := strings.Cut(strings.TrimPrefix(rt.Path, "/"), "/")
+		segs[seg] = true
+	}
+	return segs
 }
 
 func handleGetHead(r gin.IRoutes, route string, h gin.HandlerFunc) {
@@ -161,30 +191,39 @@ func (s *siteHandler) notFound(c *gin.Context) {
 }
 
 func (s *siteHandler) serve(c *gin.Context, name string, status int) {
-	f, err := s.fsys.Open(name)
+	data, err := fs.ReadFile(s.fsys, name)
 	if err != nil {
 		c.Status(http.StatusNotFound)
 		return
 	}
-	defer func() { _ = f.Close() }()
+	if origin, ok := siteOrigin(c.Request); ok {
+		data = bytes.ReplaceAll(data, []byte(originPlaceholder), []byte(origin))
+	}
 
 	setSiteHeaders(c, name)
 	if status != http.StatusOK {
 		c.Status(status)
 		if c.Request.Method != http.MethodHead {
-			_, _ = io.Copy(c.Writer, f)
+			_, _ = c.Writer.Write(data)
 		}
 		return
 	}
-	if rs, ok := f.(io.ReadSeeker); ok {
-		// Zero modtime: embedded files have none, so no Last-Modified.
-		http.ServeContent(c.Writer, c.Request, name, time.Time{}, rs)
-		return
+	// Zero modtime: embedded files have none, so no Last-Modified.
+	http.ServeContent(c.Writer, c.Request, name, time.Time{}, bytes.NewReader(data))
+}
+
+// siteOrigin is the origin the client reached, for originPlaceholder: the
+// scheme from isHTTPS, the host from the Host header. false when the Host is
+// not a plain host[:port], so a malformed one is never written into a page.
+func siteOrigin(r *http.Request) (string, bool) {
+	if !siteHostRE.MatchString(r.Host) {
+		return "", false
 	}
-	c.Status(http.StatusOK)
-	if c.Request.Method != http.MethodHead {
-		_, _ = io.Copy(c.Writer, f)
+	scheme := "http"
+	if isHTTPS(r) {
+		scheme = "https"
 	}
+	return scheme + "://" + r.Host, true
 }
 
 // setSiteHeaders sets the security headers, content type and caching of a

@@ -51,9 +51,11 @@ these are the rules.
 - Every operator serves this page from its own API server. Anything a reader
   copies (base URL, curl examples) uses `useApiBaseUrl()` or `<ApiBaseUrl />`
   from `components/api-base-url.tsx`, never a hard-coded host.
-- `site.url` / `site.apiBaseUrl` come from `NEXT_PUBLIC_API_BASE_URL`, default
-  `https://broadcast.whatsonchain.com`, and are only for prerendered text
-  (canonical URLs, `llms*.txt`, sitemap, JSON-LD).
+- `site.url` / `site.apiBaseUrl` default to the placeholder
+  `https://broadcaster.invalid`, which the API server rewrites to the serving
+  origin (`services/api_server/site.go`). They are only for prerendered text
+  (canonical URLs, `llms*.txt`, sitemap, JSON-LD). Never hard-code a real
+  operator's host; `NEXT_PUBLIC_API_BASE_URL` pins one only when set at build time.
 - Live checks fetch the same origin (`/health`), never another host.
 
 ## CSP

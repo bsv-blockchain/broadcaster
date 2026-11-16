@@ -22,7 +22,7 @@ export const faq: { id: string; question: string; answer: string }[] = [
   {
     id: "submit-a-transaction",
     question: "How do I submit a transaction?",
-    answer: `Send it to \`POST /tx\`, or a **batch** to \`POST /txs\`, on the API server (${site.apiBaseUrl} for the public deployment, or your operator's own host). The body can be **raw bytes** (\`application/octet-stream\`, the most efficient), **hex** (\`text/plain\`) or a **JSON envelope**. Policy validation runs before the \`202\` response, which carries the txid and the status \`RECEIVED\`.`,
+    answer: `Send it to \`POST /tx\`, or a **batch** to \`POST /txs\`, on the API server serving this page (${site.apiBaseUrl}). The body can be **raw bytes** (\`application/octet-stream\`, the most efficient), **hex** (\`text/plain\`) or a **JSON envelope**. Policy validation runs before the \`202\` response, which carries the txid and the status \`RECEIVED\`.`,
   },
   {
     id: "track-status",

@@ -80,8 +80,10 @@ The site must stay exportable as plain files. In practice:
   their own API server. Text a reader copies (base URL, curl examples) uses
   `useApiBaseUrl()` / `<ApiBaseUrl />` from `components/api-base-url.tsx`,
   which is `window.location.origin` after hydration.
-  `NEXT_PUBLIC_API_BASE_URL` (default `https://broadcast.whatsonchain.com`) is
-  only for prerendered text: canonical URLs, `llms*.txt`, the sitemap, JSON-LD.
+  Prerendered text (canonical URLs, `llms*.txt`, the sitemap, JSON-LD) carries
+  the placeholder origin `https://broadcaster.invalid`, which the API server
+  replaces with the serving origin on every response. Set
+  `NEXT_PUBLIC_API_BASE_URL` at build time only to pin one fixed origin.
 - **Fonts and images must be redistributable** (see "Licensing rule" below).
   The faces are Geist, Geist Mono and Outfit, all SIL OFL 1.1, loaded with
   `next/font/google`, which downloads them at build time and self-hosts them.

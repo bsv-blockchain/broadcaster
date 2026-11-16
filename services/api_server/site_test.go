@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 	"testing/fstest"
 
@@ -190,12 +191,62 @@ func TestSiteFallsBackWithoutExport(t *testing.T) {
 	assert.Equal(t, http.StatusNotFound, get(router, "/llms.txt").Code)
 }
 
-// An export entry that collides with an API route must fail loudly at
-// registration, not shadow the route.
-func TestSiteCollisionWithAPIRoutePanics(t *testing.T) {
+// An export entry whose route would collide with an API route is skipped and
+// reported, not registered: gin would panic on the conflict and crash-loop
+// the api-server at startup. The API route keeps working.
+func TestSiteCollisionWithAPIRouteIsSkipped(t *testing.T) {
 	site := exportFS()
 	site["health"] = &fstest.MapFile{Data: []byte("shadow")}
-	assert.Panics(t, func() { siteRouter(t, site) })
+	site["policy.html"] = &fstest.MapFile{Data: []byte("<!doctype html><title>shadow</title>")}
+	site["tx/index.txt"] = &fstest.MapFile{Data: []byte("shadow")}
+
+	gin.SetMode(gin.TestMode)
+	core, logs := observer.New(zapcore.ErrorLevel)
+	srv := &Server{
+		cfg:    &config.Config{Telemetry: config.TelemetryConfig{ServiceName: "site-test"}},
+		logger: zap.New(core),
+		site:   site,
+	}
+	var router *gin.Engine
+	require.NotPanics(t, func() { router = srv.newRouter() })
+
+	entries := logs.FilterMessage("docs site entries collide with API routes; not served").All()
+	require.Len(t, entries, 1)
+	assert.ElementsMatch(t, []any{"health", "policy.html", "tx"}, entries[0].ContextMap()["entries"])
+
+	// The API keeps the paths: /policy is its own handler, not the export's page.
+	assert.NotContains(t, get(router, "/health").Body.String(), "shadow")
+	assert.NotContains(t, get(router, "/policy").Body.String(), "shadow")
+	// The rest of the export is still served.
+	assert.Equal(t, http.StatusOK, get(router, "/docs").Code)
+}
+
+// The export is built with originPlaceholder; every response names the origin
+// the client reached instead, so each operator's canonical URLs, sitemap and
+// llms.txt point at itself.
+func TestSiteRewritesPlaceholderOrigin(t *testing.T) {
+	site := exportFS()
+	site["index.html"] = &fstest.MapFile{Data: []byte(`<link rel="canonical" href="` + originPlaceholder + `/">`)}
+	site["sitemap.xml"] = &fstest.MapFile{Data: []byte(`<loc>` + originPlaceholder + `/docs</loc>`)}
+	site["404.html"] = &fstest.MapFile{Data: []byte(`<a href="` + originPlaceholder + `/">home</a>`)}
+	router := siteRouter(t, site)
+
+	host := func(h string) func(*http.Request) { return func(r *http.Request) { r.Host = h } }
+	https := func(r *http.Request) { r.Header.Set("X-Forwarded-Proto", "https") }
+
+	w := get(router, "/", host("broadcast.example.org"), https)
+	assert.Equal(t, `<link rel="canonical" href="https://broadcast.example.org/">`, w.Body.String())
+	assert.Equal(t, strconv.Itoa(w.Body.Len()), w.Header().Get("Content-Length"))
+
+	assert.Equal(t, `<loc>http://localhost:8080/docs</loc>`, get(router, "/sitemap.xml", host("localhost:8080")).Body.String())
+	assert.Equal(t, `<loc>http://[::1]:8080/docs</loc>`, get(router, "/sitemap.xml", host("[::1]:8080")).Body.String())
+
+	nf := get(router, "/docs/nope", host("op.example"))
+	assert.Equal(t, http.StatusNotFound, nf.Code)
+	assert.Equal(t, `<a href="http://op.example/">home</a>`, nf.Body.String())
+
+	// A Host that is not a plain host[:port] is never written into a page.
+	assert.Contains(t, get(router, "/", host(`x"><script>`)).Body.String(), originPlaceholder)
 }
 
 // The real embedded export (or its placeholder) must register cleanly.

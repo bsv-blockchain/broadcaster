@@ -282,21 +282,6 @@ var routeDocs = []RouteDoc{
 }
 
 func (s *Server) registerRoutes(r *gin.Engine) {
-	// The docs site: "/", "/docs" and their assets (site.go). Not guarded, so
-	// page views are neither rate limited nor counted as API usage, and
-	// recorded in siteRoutes so they stay out of traces (newRouter) and their
-	// 404s out of Warn logs (requestLogger).
-	routes, err := registerSite(r, s.siteFS())
-	if err != nil {
-		s.logger.Error("docs site unreadable; serving the built-in docs page", zap.Error(err))
-		handleGetHead(r, "/", serveFallbackDocs)
-		routes = []string{"/"}
-	}
-	s.siteRoutes = make(map[string]bool, len(routes))
-	for _, route := range routes {
-		s.siteRoutes[route] = true
-	}
-
 	r.GET("/health", s.handleHealth)
 	r.GET("/ready", s.handleReady)
 	// Prometheus scrape endpoint. Mounted on the API server (in addition to
@@ -326,6 +311,26 @@ func (s *Server) registerRoutes(r *gin.Engine) {
 	// path clients 404'd on; /v1/policy is the alias used by the ARC spec.
 	r.GET("/policy", s.guarded("v1/policy", read, s.handlePolicy)...)
 	r.GET("/v1/policy", s.guarded("v1/policy", read, s.handlePolicy)...)
+
+	// The docs site: "/", "/docs" and their assets (site.go). Registered
+	// last, so an export entry that would collide with an API route is
+	// skipped rather than panicking the router. Not guarded, so page views
+	// are neither rate limited nor counted as API usage, and recorded in
+	// siteRoutes so they stay out of traces (newRouter) and their 404s out
+	// of Warn logs (requestLogger).
+	routes, skipped, err := registerSite(r, s.siteFS(), firstSegments(r.Routes()))
+	if err != nil {
+		s.logger.Error("docs site unreadable; serving the built-in docs page", zap.Error(err))
+		handleGetHead(r, "/", serveFallbackDocs)
+		routes = []string{"/"}
+	}
+	if len(skipped) > 0 {
+		s.logger.Error("docs site entries collide with API routes; not served", zap.Strings("entries", skipped))
+	}
+	s.siteRoutes = make(map[string]bool, len(routes))
+	for _, route := range routes {
+		s.siteRoutes[route] = true
+	}
 }
 
 // siteFS is the docs site export the server serves: the embedded one unless a
