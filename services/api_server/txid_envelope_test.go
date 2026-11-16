@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 
 	"github.com/bsv-blockchain/broadcaster/kafka"
@@ -65,8 +66,11 @@ func TestSubmit_PropagationEnvelopeIsTxidOnly(t *testing.T) {
 	} {
 		t.Run(tc.path, func(t *testing.T) {
 			ms := &mockStore{}
+			var mu sync.Mutex
 			var stored [][]byte
 			ms.getOrInsertFn = func(in *models.TransactionStatus) (*models.TransactionStatus, bool, error) {
+				mu.Lock()
+				defer mu.Unlock()
 				stored = append(stored, in.RawTx)
 				return in, true, nil
 			}

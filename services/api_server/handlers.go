@@ -1,17 +1,18 @@
 package api_server
 
 import (
-	"cmp"
 	"context"
 	"crypto/rand"
 	"crypto/subtle"
 	_ "embed"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"html/template"
 	"io"
 	"maps"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
@@ -71,15 +72,32 @@ const jsonKeyError = "error"
 // row may have lost raw_tx (ClearRetryState) or hold the rejected bytes, and
 // a stranded RECEIVED row may hold bytes an older intake stored untrimmed.
 // The retry's parsed bytes replace them all, as the pre-#329 message did.
-// Callers answer a failure with 503; nothing is published yet.
+// Callers answer a failure with 503; nothing is published yet. The writes
+// run concurrently (see intakeFanOut), so a /txs retry of many rows does not
+// pay one store round trip per row.
 func (s *Server) restoreRawTxs(ctx context.Context, raws map[string][]byte) error {
-	for txid, raw := range raws {
-		if err := s.store.SetRawTx(ctx, txid, raw); err != nil {
-			s.logger.Error("restoring raw tx before republish", logfields.TxID(txid), zap.Error(err))
+	txids := slices.Collect(maps.Keys(raws))
+	return s.intakeFanOut(ctx, len(txids), func(i int) error {
+		if err := s.store.SetRawTx(ctx, txids[i], raws[txids[i]]); err != nil {
+			s.logger.Error("restoring raw tx before republish", logfields.TxID(txids[i]), zap.Error(err))
 			return err
 		}
-	}
-	return nil
+		return nil
+	})
+}
+
+// extendExpiries extends the retention of every txid's row to until, as
+// extendOnResubmit does for one, concurrently (see intakeFanOut). Callers
+// answer a failure with 503 so the client's retry repeats the extends.
+func (s *Server) extendExpiries(ctx context.Context, txids []string, until *time.Time) error {
+	return s.intakeFanOut(ctx, len(txids), func(i int) error {
+		if err := s.retention.ExtendTransactionExpiry(ctx, txids[i], until); err != nil {
+			metrics.RetentionExtendFailuresTotal.Inc()
+			s.logger.Error("could not extend transaction retention", logfields.TxID(txids[i]), zap.Error(err))
+			return err
+		}
+		return nil
+	})
 }
 
 // shedBatch answers a /txs batch that failed on the store after part of it
@@ -94,6 +112,190 @@ func (s *Server) shedBatch(c *gin.Context, inserted []string, receivedAt time.Ti
 	}
 	s.publishReceived(ctx, inserted, bulkReceivedAt(receivedAt, len(inserted)), opts)
 	respondStoreUnavailable(c)
+}
+
+// intakeFanOut runs fn(i) for i in [0, n) the way a /txs batch writes to the
+// store: store.BatchConcurrency calls at a time for this request, each
+// holding a pod-wide intake slot, and no new call once one has failed or the
+// request is gone (store.ForEach). A batch therefore costs about one store
+// round trip per BatchConcurrency rows rather than one per row (on Atlas a
+// write waits for a cross-region majority, ~150-200 ms), an outage costs one
+// failed round trip rather than one per row, and concurrent batches cannot
+// together take more of the store's connection pool than
+// api.intake_store_concurrency.
+func (s *Server) intakeFanOut(ctx context.Context, n int, fn func(i int) error) error {
+	return store.ForEach(ctx, n, store.BatchConcurrency(), func(i int) error {
+		return s.withIntakeSlot(ctx, func() error { return fn(i) })
+	})
+}
+
+// withIntakeSlot runs fn holding one of the pod-wide intake slots.
+func (s *Server) withIntakeSlot(ctx context.Context, fn func() error) error {
+	if s.intakeSlots == nil {
+		return fn()
+	}
+	if err := s.intakeSlots.Acquire(ctx, 1); err != nil {
+		return err
+	}
+	defer s.intakeSlots.Release(1)
+	return fn()
+}
+
+// intakeCAS is the store as the /txs dedup CAS sees it, so the batch can run
+// through store.BatchGetOrInsertStatusParallel: each row holds an intake slot
+// for its CAS, and is stamped when its CAS actually starts. Stamping the
+// whole batch up front would make it one equal-timestamp run at a
+// millisecond-precision store (catchup must drain such a run whole), and a
+// row queued behind the concurrency limit would commit well after the time
+// it carries, landing behind a catchup cursor that had already passed it.
+// Stamped at dispatch, a tie is at most one wave of concurrent rows, and a
+// row's commit trails its timestamp by its own round trip, as for /tx.
+//
+// store.Store.BatchGetOrInsertStatus is not used: it does neither, and on
+// error some backends drop the per-row results, while the handler must know
+// exactly which rows it inserted, since only the inserter publishes RECEIVED
+// (#391), including when it sheds.
+type intakeCAS struct {
+	store.Store
+
+	srv *Server
+}
+
+func (c intakeCAS) GetOrInsertStatus(ctx context.Context, row *models.TransactionStatus) (existing *models.TransactionStatus, inserted bool, err error) {
+	err = c.srv.withIntakeSlot(ctx, func() error {
+		row.Timestamp = time.Now()
+		var casErr error
+		existing, inserted, casErr = c.Store.GetOrInsertStatus(ctx, row)
+		return casErr
+	})
+	return existing, inserted, err
+}
+
+// dedupRows runs the /txs dedup CAS for every unique submission, then
+// extends the retention of each resubmitted row that needs it, and returns
+// the rows with their CAS results by index. Rows CAS concurrently and stop at
+// the first failure, like intakeFanOut, so on error the inserted rows can sit
+// anywhere in the batch; insertedTxIDs finds them for the shed. An error
+// means nothing may be published: a row whose state is unknown cannot get a
+// txid-only message (#329), and a failed extend is repeated by the retry.
+func (s *Server) dedupRows(ctx context.Context, unique []parsedItem, keyByTxid map[string]string, expiresAt *time.Time) ([]*models.TransactionStatus, []store.BatchInsertResult, error) {
+	rows := make([]*models.TransactionStatus, len(unique))
+	for i, p := range unique {
+		rows[i] = &models.TransactionStatus{
+			TxID:   p.txid,
+			Status: models.StatusReceived,
+			// Timestamp is set as the row's CAS starts (intakeCAS).
+			// Carry the raw bytes on the row so the propagation
+			// reaper can rebroadcast stuck txs without re-fetching.
+			RawTx:        p.raw,
+			PartitionKey: keyByTxid[p.txid],
+			ExpiresAt:    expiresAt,
+		}
+	}
+	cas, err := store.BatchGetOrInsertStatusParallel(ctx, intakeCAS{Store: s.store, srv: s}, rows)
+	if err == nil {
+		for i, r := range cas {
+			if !r.Inserted && r.Existing == nil {
+				err = fmt.Errorf("dedup CAS for %s returned neither an insert nor the existing row", rows[i].TxID)
+				break
+			}
+		}
+	}
+	if err != nil {
+		s.logger.Error("dedup CAS failed", zap.Int("count", len(rows)), zap.Error(err))
+		return rows, cas, err
+	}
+	var toExtend []string
+	for i, r := range cas {
+		if s.needsExtend(r.Existing, r.Inserted, expiresAt) {
+			toExtend = append(toExtend, rows[i].TxID)
+		}
+	}
+	return rows, cas, s.extendExpiries(ctx, toExtend, expiresAt)
+}
+
+// casTally is how a /txs batch's CAS results sort out: what to publish, which
+// of those are republished CAS losers (with the status that selected them),
+// and the counts the response and metrics report.
+type casTally struct {
+	toPublish                             []parsedItem
+	republished                           map[string]models.Status
+	duplicates, newSubmits, retryRejected int
+}
+
+// tallyCAS sorts the CAS results of a /txs batch (dedupRows): inserted rows
+// publish, REJECTED and stranded RECEIVED rows republish, and every other
+// existing row is an idempotent duplicate.
+func (s *Server) tallyCAS(ctx context.Context, unique []parsedItem, cas []store.BatchInsertResult, opts submitOptions) casTally {
+	t := casTally{toPublish: make([]parsedItem, 0, len(unique)), republished: make(map[string]models.Status)}
+	for i, p := range unique {
+		existing := cas[i].Existing
+		switch {
+		case cas[i].Inserted:
+			t.newSubmits++
+			t.toPublish = append(t.toPublish, p)
+		case shouldRepublishExisting(existing.Status):
+			// REJECTED resubmit and stranded RECEIVED (Kafka send failed
+			// after insert) both re-enter toPublish. Mirrors
+			// handleSubmitTransaction, raw_tx restore included (the
+			// handler runs restoreRawTxs once the batch is sorted).
+			// Seen/accepted rows stay duplicates.
+			if existing.Status == models.StatusRejected {
+				t.retryRejected++
+			}
+			t.toPublish = append(t.toPublish, p)
+			t.republished[p.txid] = existing.Status
+		default:
+			t.duplicates++
+			// Idempotent re-submit at a non-REJECTED status: register
+			// the txid with the in-process TxTracker using the
+			// persisted status so bump-builder's tracked-only filtering
+			// recognizes it. Mirrors the single-submit dedup branch.
+			if s.txTracker != nil {
+				s.txTracker.Add(p.txid, existing.Status)
+			}
+			s.recordSubmission(ctx, p.txid, opts)
+		}
+	}
+	return t
+}
+
+// insertedTxIDs returns the txids of the rows this request's CAS inserted, in
+// submission order, and the earliest of their timestamps — the inputs
+// publishReceived and shedBatch need. Rows are stamped as their CAS starts,
+// so submission order and timestamp order can differ within a wave; the
+// minimum keeps a bulk event's id below every row (bulkReceivedAt).
+func insertedTxIDs(rows []*models.TransactionStatus, cas []store.BatchInsertResult) ([]string, time.Time) {
+	ids := make([]string, 0, len(rows))
+	var receivedAt time.Time
+	for i, r := range cas {
+		if !r.Inserted {
+			continue
+		}
+		ids = append(ids, rows[i].TxID)
+		if receivedAt.IsZero() || rows[i].Timestamp.Before(receivedAt) {
+			receivedAt = rows[i].Timestamp
+		}
+	}
+	return ids, receivedAt
+}
+
+// uniqueByTxid returns parsed with every repeat of an earlier txid dropped,
+// and how many were dropped. A txid repeated in one body is CASed once: run
+// concurrently, either copy could win the insert, and the loser would take
+// the republish path, rewriting raw_tx on the row this request just wrote and
+// publishing the tx twice.
+func uniqueByTxid(parsed []parsedItem) ([]parsedItem, int) {
+	seen := make(map[string]struct{}, len(parsed))
+	out := make([]parsedItem, 0, len(parsed))
+	for _, p := range parsed {
+		if _, dup := seen[p.txid]; dup {
+			continue
+		}
+		seen[p.txid] = struct{}{}
+		out = append(out, p)
+	}
+	return out, len(parsed) - len(out)
 }
 
 // respondStoreUnavailable answers a submission whose store write failed or
@@ -1491,78 +1693,34 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 	// Phase 3: dedup CAS per tx. Duplicates are skipped from the
 	// publish but counted in the response so the caller can reconcile.
 	// A dedup error fails the batch with 503 — matches single-tx.
-	toPublish := make([]parsedItem, 0, len(parsed))
+	var toPublish []parsedItem
 	// republished collects CAS losers re-entering toPublish, with the status
 	// that selected them; their stored keys win over this request's choice
 	// (adoptStoredFamilyKeys).
-	republished := make(map[string]models.Status)
+	var republished map[string]models.Status
 	// receivedTxIDs is the subset of toPublish whose row this request's CAS
 	// inserted: only the first attempt publishes RECEIVED, since any other
 	// attempt can run after an earlier attempt's verdict was published (see
 	// handleSubmitTransaction).
-	receivedTxIDs := make([]string, 0, len(parsed))
-	duplicates := 0
-	newSubmits, retryRejected := 0, 0
-	var receivedAt time.Time // the first inserted row's timestamp
+	var receivedTxIDs []string
+	var duplicates, newSubmits, retryRejected int
+	var receivedAt time.Time // the earliest inserted row's timestamp
 	if s.store != nil {
 		ctx := c.Request.Context()
-		for _, p := range parsed {
-			row := &models.TransactionStatus{
-				TxID:      p.txid,
-				Status:    models.StatusReceived,
-				Timestamp: time.Now(),
-				// Carry the raw bytes on the row so the propagation
-				// reaper can rebroadcast stuck txs without re-fetching.
-				RawTx:        p.raw,
-				PartitionKey: keyByTxid[p.txid],
-				ExpiresAt:    opts.ExpiresAt,
-			}
-			existing, inserted, dedupErr := s.store.GetOrInsertStatus(ctx, row)
-			switch {
-			case dedupErr != nil || (!inserted && existing == nil):
-				// Row state unknown: a txid-only message (#329) cannot be
-				// published for it. Fail the whole batch before anything
-				// reaches Kafka; rows already inserted are RECEIVED, which
-				// the retry republishes (shouldRepublishExisting).
-				s.logger.Error("dedup CAS failed", logfields.TxID(p.txid), zap.Error(dedupErr))
-				s.shedBatch(c, receivedTxIDs, receivedAt, opts)
-				return
-			case s.extendOnResubmit(ctx, p.txid, existing, inserted, opts.ExpiresAt) != nil:
-				// Nothing reached Kafka yet; the retry repeats the extend.
-				s.shedBatch(c, receivedTxIDs, receivedAt, opts)
-				return
-			case !inserted && shouldRepublishExisting(existing.Status):
-				// REJECTED resubmit and stranded RECEIVED (Kafka send failed
-				// after insert) both re-enter toPublish. Mirrors
-				// handleSubmitTransaction, raw_tx restore included (below).
-				// Seen/accepted rows stay duplicates.
-				if existing.Status == models.StatusRejected {
-					retryRejected++
-				}
-				toPublish = append(toPublish, p)
-				republished[p.txid] = existing.Status
-			case !inserted:
-				duplicates++
-				// Idempotent re-submit at a non-REJECTED status: register
-				// the txid with the in-process TxTracker using the
-				// persisted status so bump-builder's tracked-only filtering
-				// recognizes it. Mirrors the single-submit dedup branch.
-				if s.txTracker != nil {
-					s.txTracker.Add(p.txid, existing.Status)
-				}
-				s.recordSubmission(ctx, p.txid, opts)
-			default:
-				newSubmits++
-				toPublish = append(toPublish, p)
-				// Each row keeps its own timestamp, so a large batch is not one
-				// equal-timestamp run for catchup to drain; the event is
-				// stamped just below the earliest (bulkReceivedAt), so a
-				// Last-Event-ID reconnect mid-burst replays the rest instead
-				// of skipping them.
-				receivedAt = cmp.Or(receivedAt, row.Timestamp)
-				receivedTxIDs = append(receivedTxIDs, p.txid)
-			}
+		// A txid repeated in the body is CASed and published once; the
+		// repeats count as duplicates.
+		unique, repeats := uniqueByTxid(parsed)
+		rows, cas, err := s.dedupRows(ctx, unique, keyByTxid, opts.ExpiresAt)
+		receivedTxIDs, receivedAt = insertedTxIDs(rows, cas)
+		if err != nil {
+			// Nothing reached Kafka; rows already inserted are RECEIVED,
+			// which the retry republishes (shouldRepublishExisting).
+			s.shedBatch(c, receivedTxIDs, receivedAt, opts)
+			return
 		}
+		t := s.tallyCAS(ctx, unique, cas, opts)
+		toPublish, republished = t.toPublish, t.republished
+		duplicates, newSubmits, retryRejected = repeats+t.duplicates, t.newSubmits, t.retryRejected
 	} else {
 		toPublish = parsed
 		newSubmits = len(parsed)

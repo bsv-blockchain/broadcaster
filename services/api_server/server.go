@@ -12,6 +12,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin"
 	"go.uber.org/zap"
+	"golang.org/x/sync/semaphore"
 
 	"github.com/bsv-blockchain/broadcaster/config"
 	"github.com/bsv-blockchain/broadcaster/events"
@@ -72,7 +73,11 @@ type Server struct {
 	// letting teranode bounce them with a generic error (issue #245).
 	// Nil-safe: nil (no chain source configured, or disabled) skips the gate.
 	finality *finality.Checker
-	server   *http.Server
+	// intakeSlots bounds POST /txs store writes in flight across the pod
+	// (api.intake_store_concurrency; see withIntakeSlot). Nil, as in tests
+	// built from a struct literal, leaves them unbounded.
+	intakeSlots *semaphore.Weighted
+	server      *http.Server
 	// site is the docs site's static export; nil means the one embedded in
 	// the binary (web.FS). Tests inject their own.
 	site fs.FS
@@ -140,6 +145,7 @@ func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, publi
 		producer:       producer,
 		publisher:      publisher,
 		store:          st,
+		intakeSlots:    semaphore.NewWeighted(int64(cfg.IntakeStoreConcurrencyLimit())),
 		txTracker:      tracker,
 		teranode:       tc,
 		merkleClient:   mc,

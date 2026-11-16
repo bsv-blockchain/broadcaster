@@ -79,6 +79,8 @@ type mockStore struct {
 	// used directly. Default behavior (nil hook) is the legacy "always
 	// fresh insert" stub: (nil, false, nil).
 	getOrInsertFn func(status *models.TransactionStatus) (*models.TransactionStatus, bool, error)
+	// /txs CASes its rows concurrently, so the hook runs on several
+	// goroutines at once: it must guard any state it records into.
 	// tipHeight is served by GetActiveTipBlockHeight (the /health
 	// blockHeight source); tipCalls counts reads so tests can assert the
 	// handler's TTL cache actually coalesces probes.
