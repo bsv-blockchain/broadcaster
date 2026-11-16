@@ -232,6 +232,15 @@ func (pp PeerPolicy) SanitizePolicySizes() (PeerPolicy, int) {
 	return pp, dropped
 }
 
+// NativeBatchInserter marks a backend whose BatchGetOrInsertStatus writes a
+// batch in a few statements on one connection (Postgres, MongoDB) instead of
+// a bounded per-row loop over GetOrInsertStatus (Aerospike, Pebble). The
+// /txs handler uses it to decide how much of its pod-wide store budget a
+// batch takes: one slot for the whole call, or one per row in flight.
+type NativeBatchInserter interface {
+	NativeBatchGetOrInsert()
+}
+
 // BatchInsertResult is one entry in the result slice returned by
 // BatchGetOrInsertStatus. Inserted is true when the row was newly written by
 // this call; false when an existing row was found and Existing carries it.

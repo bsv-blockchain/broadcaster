@@ -91,10 +91,19 @@ func (s *Store) GetOrInsertStatus(ctx context.Context, status *models.Transactio
 	return status, true, nil
 }
 
+// NativeBatchGetOrInsert marks BatchGetOrInsertStatus as a native batch
+// write (store.NativeBatchInserter).
+func (*Store) NativeBatchGetOrInsert() {}
+
 // BatchGetOrInsertStatus implements store.Store natively: one unordered
-// InsertMany per batch_size rows, then one $in read for the rows that already
-// existed. A batch therefore costs two round trips, not one per row, which
+// InsertMany per chunk (batch_size rows, 8 MiB of raw transactions), then one
+// $in read for the rows that already existed. A batch therefore costs two
+// round trips, not one per row, which
 // matters because every write waits for a majority acknowledgement.
+//
+// Chunks run in order, and the first chunk that fails stops the rest, whose
+// rows are then not inserted. A nil row or empty txid fails the whole call
+// before anything is written.
 //
 // Rows are prepared exactly as GetOrInsertStatus prepares one (timestamp,
 // status and created_at defaults, written back into the caller's struct).
@@ -119,11 +128,8 @@ func (s *Store) BatchGetOrInsertStatus(ctx context.Context, statuses []*models.T
 	firstIdx := make(map[string]int, len(statuses))
 	uniq := make([]int, 0, len(statuses))
 	for i, st := range statuses {
-		if st == nil {
-			continue
-		}
-		if st.TxID == "" {
-			return out, errors.New("mongodb: batch get or insert status: empty txid")
+		if st == nil || st.TxID == "" {
+			return out, errors.New("mongodb: batch get or insert status: nil row or empty txid")
 		}
 		if _, dup := firstIdx[st.TxID]; dup {
 			continue
@@ -135,7 +141,7 @@ func (s *Store) BatchGetOrInsertStatus(ctx context.Context, statuses []*models.T
 	now := time.Now()
 	var existingIDs []string
 	var err error
-	for _, chunk := range chunkInts(uniq, s.batchSize) {
+	for _, chunk := range insertChunks(statuses, uniq, s.batchSize) {
 		var dups []string
 		dups, err = s.insertChunk(ctx, statuses, chunk, now, out)
 		existingIDs = append(existingIDs, dups...)
@@ -148,7 +154,7 @@ func (s *Store) BatchGetOrInsertStatus(ctx context.Context, statuses []*models.T
 	}
 
 	for i, st := range statuses {
-		if st == nil || firstIdx[st.TxID] == i {
+		if firstIdx[st.TxID] == i {
 			continue
 		}
 		first := out[firstIdx[st.TxID]]
@@ -160,6 +166,36 @@ func (s *Store) BatchGetOrInsertStatus(ctx context.Context, statuses []*models.T
 		}
 	}
 	return out, err
+}
+
+// maxInsertChunkBytes caps the raw transaction bytes in one InsertMany, so a
+// chunk is a single server message. The driver splits a larger InsertMany
+// into ~48 MB messages sent one after another, and if a later one fails it
+// returns only that failure, dropping what the earlier, committed messages
+// reported: their rows would read as unknown and lose RECEIVED.
+const maxInsertChunkBytes = 8 << 20
+
+// insertChunks groups the rows at idx into InsertMany chunks of at most n
+// rows and maxInsertChunkBytes of raw transactions; a single larger row is a
+// chunk of its own.
+func insertChunks(statuses []*models.TransactionStatus, idx []int, n int) [][]int {
+	if n <= 0 {
+		n = defaultBatchSize
+	}
+	var out [][]int
+	start, size := 0, 0
+	for k, i := range idx {
+		rowSize := len(statuses[i].RawTx)
+		if k > start && (k-start >= n || size+rowSize > maxInsertChunkBytes) {
+			out = append(out, idx[start:k])
+			start, size = k, 0
+		}
+		size += rowSize
+	}
+	if start < len(idx) {
+		out = append(out, idx[start:])
+	}
+	return out
 }
 
 // duplicateKeyCode is the server's E11000 duplicate-key error: the row
@@ -186,7 +222,9 @@ func (s *Store) insertChunk(ctx context.Context, statuses []*models.TransactionS
 		docs[k] = d
 	}
 
-	octx, cancel := s.opCtx(ctx)
+	// query_timeout_ms, not op_timeout_ms: a chunk carries up to
+	// maxInsertChunkBytes and waits for a cross-region majority.
+	octx, cancel := s.queryCtx(ctx)
 	defer cancel()
 	_, err := s.tx.InsertMany(octx, docs, options.InsertMany().SetOrdered(false))
 	if err == nil {

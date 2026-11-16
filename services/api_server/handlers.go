@@ -150,12 +150,33 @@ func (s *Server) withIntakeSlot(ctx context.Context, fn func() error) error {
 	return fn()
 }
 
-// dedupRows runs the /txs dedup CAS for every unique submission as one
-// store.BatchGetOrInsertStatus call, then extends the retention of each
-// resubmitted row that needs it, and returns the rows with their CAS results
-// by index. On MongoDB the batch is one unordered InsertMany plus one read
+// intakeCAS is the store as the /txs dedup CAS sees it on a backend without
+// a native batch insert: each row's CAS holds its own intake slot, so
+// concurrent batches cannot take more of the pool than
+// api.intake_store_concurrency.
+type intakeCAS struct {
+	store.Store
+
+	srv *Server
+}
+
+func (c intakeCAS) GetOrInsertStatus(ctx context.Context, row *models.TransactionStatus) (existing *models.TransactionStatus, inserted bool, err error) {
+	err = c.srv.withIntakeSlot(ctx, func() error {
+		var casErr error
+		existing, inserted, casErr = c.Store.GetOrInsertStatus(ctx, row)
+		return casErr
+	})
+	return existing, inserted, err
+}
+
+// dedupRows runs the /txs dedup CAS for every unique submission, then extends
+// the retention of each resubmitted row that needs it, and returns the rows
+// with their CAS results by index. On a backend with a native batch insert
+// (store.NativeBatchInserter) the CAS is one BatchGetOrInsertStatus call
+// holding one intake slot: on MongoDB one unordered InsertMany plus one read
 // for the rows that existed, so a 100-tx batch costs two round trips rather
-// than one per BatchConcurrency rows; the call holds one intake slot.
+// than one per BatchConcurrency rows. Elsewhere the rows CAS
+// BatchConcurrency at a time, each holding a slot (intakeCAS).
 //
 // On error the inserted rows can sit anywhere in the batch (the store
 // reports them per row); insertedTxIDs finds them for the shed. An error
@@ -182,11 +203,18 @@ func (s *Server) dedupRows(ctx context.Context, unique []parsedItem, keyByTxid m
 		}
 	}
 	var cas []store.BatchInsertResult
-	err := s.withIntakeSlot(ctx, func() error {
-		var casErr error
-		cas, casErr = s.store.BatchGetOrInsertStatus(ctx, rows)
-		return casErr
-	})
+	var err error
+	if _, native := s.store.(store.NativeBatchInserter); native {
+		err = s.withIntakeSlot(ctx, func() error {
+			var casErr error
+			cas, casErr = s.store.BatchGetOrInsertStatus(ctx, rows)
+			return casErr
+		})
+	} else {
+		// A per-row loop opens a connection per row in flight, so each row
+		// takes its own slot.
+		cas, err = store.BatchGetOrInsertStatusParallel(ctx, intakeCAS{Store: s.store, srv: s}, rows)
+	}
 	if len(cas) != len(rows) {
 		// nil on error: no row's outcome is known (store.Store contract).
 		if err == nil {

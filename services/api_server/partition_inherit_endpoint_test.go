@@ -67,12 +67,6 @@ func (s *keyedMemStore) storedKey(t *testing.T, txid string) string {
 	return r.PartitionKey
 }
 
-// BatchGetOrInsertStatus runs this store's GetOrInsertStatus per row; the
-// embedded mockStore's would bypass the override.
-func (s *keyedMemStore) BatchGetOrInsertStatus(ctx context.Context, statuses []*models.TransactionStatus) ([]store.BatchInsertResult, error) {
-	return store.BatchGetOrInsertStatusParallel(ctx, s, statuses)
-}
-
 func (s *keyedMemStore) GetOrInsertStatus(_ context.Context, in *models.TransactionStatus) (*models.TransactionStatus, bool, error) {
 	s.mu.Lock()
 	hook, after := s.beforeCAS[in.TxID], s.afterCAS[in.TxID]

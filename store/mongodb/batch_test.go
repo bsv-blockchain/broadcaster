@@ -399,3 +399,30 @@ func TestBatchGetOrInsertStatus_WriteErrorKeepsOtherRows(t *testing.T) {
 		}
 	}
 }
+
+// insertChunks keeps each InsertMany to one server message: at most n rows
+// and maxInsertChunkBytes of raw transactions, with an oversized row alone.
+func TestInsertChunks_BoundedByRowsAndBytes(t *testing.T) {
+	row := func(size int) *models.TransactionStatus {
+		return &models.TransactionStatus{RawTx: make(models.HexBytes, size)}
+	}
+	half := maxInsertChunkBytes / 2
+	statuses := []*models.TransactionStatus{
+		row(half), row(half), // exactly the byte cap
+		row(1),                         // one byte over: next chunk
+		row(maxInsertChunkBytes + 1),   // oversized: alone
+		row(1), row(1), row(1), row(1), // split by the row cap
+	}
+	idx := make([]int, len(statuses))
+	for i := range idx {
+		idx[i] = i
+	}
+	got := make([][]int, 0, len(statuses))
+	for _, c := range insertChunks(statuses, idx, 3) {
+		got = append(got, append([]int(nil), c...))
+	}
+	want := [][]int{{0, 1}, {2}, {3}, {4, 5, 6}, {7}}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("insertChunks = %v, want %v", got, want)
+	}
+}

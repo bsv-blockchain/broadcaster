@@ -19,7 +19,6 @@ import (
 	"github.com/bsv-blockchain/broadcaster/kafka"
 	"github.com/bsv-blockchain/broadcaster/models"
 	"github.com/bsv-blockchain/broadcaster/services/apikey"
-	"github.com/bsv-blockchain/broadcaster/store"
 	"github.com/bsv-blockchain/broadcaster/validator"
 )
 
@@ -52,12 +51,6 @@ func (r *retentionStore) ensuredCalls() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.ensured
-}
-
-// BatchGetOrInsertStatus runs this store's GetOrInsertStatus per row; the
-// embedded mockStore's would bypass the override.
-func (r *retentionStore) BatchGetOrInsertStatus(ctx context.Context, statuses []*models.TransactionStatus) ([]store.BatchInsertResult, error) {
-	return store.BatchGetOrInsertStatusParallel(ctx, r, statuses)
 }
 
 func (r *retentionStore) GetOrInsertStatus(_ context.Context, st *models.TransactionStatus) (*models.TransactionStatus, bool, error) {

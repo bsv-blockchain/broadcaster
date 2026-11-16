@@ -82,8 +82,10 @@ type mockStore struct {
 	getOrInsertFn func(status *models.TransactionStatus) (*models.TransactionStatus, bool, error)
 	// /txs CASes its rows concurrently, so the hook runs on several
 	// goroutines at once: it must guard any state it records into.
-	// batchCASCalls counts BatchGetOrInsertStatus calls.
+	// batchCASCalls counts BatchGetOrInsertStatus calls; batchCASFn, when
+	// set, answers them.
 	batchCASCalls atomic.Int32
+	batchCASFn    func([]*models.TransactionStatus) ([]store.BatchInsertResult, error)
 	// tipHeight is served by GetActiveTipBlockHeight (the /health
 	// blockHeight source); tipCalls counts reads so tests can assert the
 	// handler's TTL cache actually coalesces probes.
@@ -129,13 +131,24 @@ func (m *mockStore) SetRawTx(_ context.Context, txid string, rawTx []byte) error
 	return nil
 }
 
-// BatchGetOrInsertStatus counts calls and runs GetOrInsertStatus per row
-// through the shared parallel helper, so getOrInsertFn drives batch results
-// the way it drives single ones: per-row outcomes, partial results on error.
+// BatchGetOrInsertStatus counts calls and answers from batchCASFn when set,
+// else runs GetOrInsertStatus per row through the shared parallel helper, so
+// getOrInsertFn drives batch results the way it drives single ones. The
+// handler calls it only on a native-batch store (nativeBatchStore).
 func (m *mockStore) BatchGetOrInsertStatus(ctx context.Context, statuses []*models.TransactionStatus) ([]store.BatchInsertResult, error) {
 	m.batchCASCalls.Add(1)
+	if m.batchCASFn != nil {
+		return m.batchCASFn(statuses)
+	}
 	return store.BatchGetOrInsertStatusParallel(ctx, m, statuses)
 }
+
+// nativeBatchStore is a mockStore that reports a native batch insert
+// (store.NativeBatchInserter), as Postgres and MongoDB do, so /txs dedups
+// through one BatchGetOrInsertStatus call.
+type nativeBatchStore struct{ *mockStore }
+
+func (nativeBatchStore) NativeBatchGetOrInsert() {}
 
 func (m *mockStore) BatchUpdateStatus(context.Context, []*models.TransactionStatus) error {
 	return nil

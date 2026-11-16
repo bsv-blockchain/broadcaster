@@ -667,7 +667,7 @@ func TestHandleSubmitTransactions_EarlyCASFailure_PublishesReceivedForLaterInser
 func TestHandleSubmitTransactions_OneBatchCASPerRequest(t *testing.T) {
 	rawA, rawB, _, _ := twoDistinctTxs(t)
 	ms := &mockStore{}
-	_, _, router := newReceivedServer(ms)
+	_, _, router := newReceivedServerWith(ms, func(s *Server) { s.store = nativeBatchStore{ms} })
 	if w := submit(t, router, "/txs", append(append([]byte(nil), rawA...), rawB...)); w.Code >= 300 {
 		t.Fatalf("status = %d; body=%s", w.Code, w.Body.String())
 	}
@@ -676,9 +676,9 @@ func TestHandleSubmitTransactions_OneBatchCASPerRequest(t *testing.T) {
 	}
 }
 
-// The batch CAS holds a pod-wide intake slot: with every slot taken, the
-// request waits instead of opening another store connection, and gives up
-// with 503 when the client does.
+// On a native-batch store the batch CAS holds a pod-wide intake slot: with
+// every slot taken, the request waits instead of opening another store
+// connection, and gives up with 503 when the client does.
 func TestHandleSubmitTransactions_BatchCASWaitsForIntakeSlot(t *testing.T) {
 	rawA, rawB, _, _ := twoDistinctTxs(t)
 	ms := &mockStore{}
@@ -686,7 +686,10 @@ func TestHandleSubmitTransactions_BatchCASWaitsForIntakeSlot(t *testing.T) {
 	if !slots.TryAcquire(1) {
 		t.Fatal("could not take the only slot")
 	}
-	_, _, router := newReceivedServerWith(ms, func(s *Server) { s.intakeSlots = slots })
+	_, _, router := newReceivedServerWith(ms, func(s *Server) {
+		s.store = nativeBatchStore{ms}
+		s.intakeSlots = slots
+	})
 	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
 	defer cancel()
 	req := httptest.NewRequestWithContext(ctx, http.MethodPost, "/txs", bytes.NewReader(append(append([]byte(nil), rawA...), rawB...)))
@@ -794,5 +797,81 @@ func TestHandleSubmitTransactions_ShedAfterClientCancel_PublishesReceived(t *tes
 	}
 	if len(pub.publishes) != 1 || pub.publishes[0].TxID != txidA || pub.publishes[0].Status != models.StatusReceived {
 		t.Errorf("publishes = %+v, want one RECEIVED for the inserted %s", pub.publishes, txidA)
+	}
+}
+
+// On a store without a native batch insert the rows CAS in parallel, and
+// every row holds its own intake slot, so concurrent batches share the
+// pod-wide bound however many rows each runs at once.
+func TestHandleSubmitTransactions_PerRowCASBoundedPodWide(t *testing.T) {
+	prev := store.BatchConcurrency()
+	store.SetBatchConcurrency(4)
+	t.Cleanup(func() { store.SetBatchConcurrency(prev) })
+
+	rawA, rawB, _, _ := twoDistinctTxs(t)
+	var mu sync.Mutex
+	inFlight, maxInFlight := 0, 0
+	ms := &mockStore{getOrInsertFn: func(in *models.TransactionStatus) (*models.TransactionStatus, bool, error) {
+		mu.Lock()
+		inFlight++
+		maxInFlight = max(maxInFlight, inFlight)
+		mu.Unlock()
+		time.Sleep(5 * time.Millisecond) // long enough for an unbounded sibling to overlap
+		mu.Lock()
+		inFlight--
+		mu.Unlock()
+		return in, true, nil
+	}}
+	_, _, router := newReceivedServerWith(ms, func(s *Server) { s.intakeSlots = semaphore.NewWeighted(1) })
+	if w := submit(t, router, "/txs", append(append([]byte(nil), rawA...), rawB...)); w.Code >= 300 {
+		t.Fatalf("status = %d; body=%s", w.Code, w.Body.String())
+	}
+	if maxInFlight != 1 {
+		t.Errorf("max concurrent CAS calls = %d, want 1 (the pod-wide slots)", maxInFlight)
+	}
+}
+
+// A native batch that fails with no per-row results (Postgres's single
+// statement) knows of no inserted row: 503, nothing published.
+func TestHandleSubmitTransactions_NativeBatchErrorWithoutResults(t *testing.T) {
+	rawA, rawB, _, _ := twoDistinctTxs(t)
+	ms := &mockStore{batchCASFn: func([]*models.TransactionStatus) ([]store.BatchInsertResult, error) {
+		return nil, errors.New("statement failed")
+	}}
+	pub, broker, router := newReceivedServerWith(ms, func(s *Server) { s.store = nativeBatchStore{ms} })
+	w := submit(t, router, "/txs", append(append([]byte(nil), rawA...), rawB...))
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503; body=%s", w.Code, w.Body.String())
+	}
+	if n := len(pub.publishes) + len(pub.bulkPublishes) + len(broker.Sends) + broker.BatchCalls; n != 0 {
+		t.Errorf("published %d events/messages for a batch with no known insert", n)
+	}
+}
+
+// A native batch that fails after inserting some rows reports them per row;
+// the shed publishes RECEIVED for exactly those and nothing reaches Kafka.
+func TestHandleSubmitTransactions_NativeBatchPartialError(t *testing.T) {
+	rawA, rawB, txidA, _ := twoDistinctTxs(t)
+	ms := &mockStore{batchCASFn: func(rows []*models.TransactionStatus) ([]store.BatchInsertResult, error) {
+		out := make([]store.BatchInsertResult, len(rows))
+		for i, r := range rows {
+			if r.TxID == txidA {
+				out[i] = store.BatchInsertResult{Inserted: true}
+			}
+		}
+		return out, errors.New("second row's write failed")
+	}}
+	pub, broker, router := newReceivedServerWith(ms, func(s *Server) { s.store = nativeBatchStore{ms} })
+	w := submit(t, router, "/txs", append(append([]byte(nil), rawA...), rawB...))
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503; body=%s", w.Code, w.Body.String())
+	}
+	if n := len(broker.Sends) + broker.BatchCalls; n != 0 {
+		t.Errorf("shed batch queued propagation: %d", n)
+	}
+	if len(pub.publishes) != 1 || pub.publishes[0].TxID != txidA || len(pub.bulkPublishes) != 0 {
+		t.Errorf("publishes = %+v bulk = %+v, want one RECEIVED for %s", pub.publishes, pub.bulkPublishes, txidA)
 	}
 }
