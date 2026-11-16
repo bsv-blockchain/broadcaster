@@ -404,6 +404,21 @@ type TierConfig struct {
 	// (the default) keeps them forever. Only stores that implement retention
 	// (MongoDB) enforce it; see docs/api-keys.md.
 	RetentionDays int `mapstructure:"retention_days"`
+	// BurstUnits caps the per-IP token bucket that enforces
+	// ratelimit.anonymous: how many units an unkeyed caller can spend at
+	// once before it is held to the refill rate. Zero (the default) keeps
+	// one minute of burst, units_per_minute. Only valid on
+	// ratelimit.anonymous: keyed tiers share a per-minute window instead.
+	BurstUnits int64 `mapstructure:"burst_units"`
+}
+
+// Burst is the bucket capacity for a tier enforced by a token bucket:
+// BurstUnits when set, otherwise one minute of units.
+func (t TierConfig) Burst() int64 {
+	if t.BurstUnits > 0 {
+		return t.BurstUnits
+	}
+	return t.UnitsPerMinute
 }
 
 // Retention is RetentionDays as a duration; zero means keep forever.
@@ -1656,6 +1671,9 @@ func setDefaults() {
 	// data on upgrade. Declared so BSV_BROADCASTER_RATELIMIT_*_RETENTION_DAYS
 	// overrides bind.
 	viper.SetDefault("ratelimit.anonymous.retention_days", 0)
+	// 0 keeps one minute of burst. Declared so
+	// BSV_BROADCASTER_RATELIMIT_ANONYMOUS_BURST_UNITS binds.
+	viper.SetDefault("ratelimit.anonymous.burst_units", 0)
 	viper.SetDefault("ratelimit.tiers.free.units_per_minute", 50)
 	viper.SetDefault("ratelimit.tiers.free.max_in_flight", 5)
 	viper.SetDefault("ratelimit.tiers.free.max_batch", 1)
@@ -2388,9 +2406,15 @@ func validateAccessControl(cfg *Config) error {
 	if err := check(TierAnonymous, rl.Anonymous); err != nil {
 		return err
 	}
+	if err := checkAnonymousBurst(rl.Anonymous, rl.Costs); err != nil {
+		return err
+	}
 	for name, t := range rl.Tiers {
 		if !tierNameRe.MatchString(name) {
 			return fmt.Errorf("ratelimit tier name %q is invalid: must match %s", name, tierNameRe.String())
+		}
+		if t.BurstUnits != 0 {
+			return fmt.Errorf("ratelimit tier %q: burst_units is only supported on ratelimit.anonymous", name)
 		}
 		if err := check(name, t); err != nil {
 			return err
@@ -2404,6 +2428,29 @@ func validateAccessControl(cfg *Config) error {
 // value, so anything outside this set risks breaking header syntax or
 // exploding label cardinality.
 var tierNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]*$`)
+
+// checkAnonymousBurst bounds ratelimit.anonymous.burst_units: at most one
+// minute of units (a larger bucket would let a caller beat its own rate),
+// and large enough for the costliest request the tier allows, or that
+// request could never succeed.
+func checkAnonymousBurst(t TierConfig, costs RateLimitCosts) error {
+	if t.BurstUnits == 0 {
+		return nil
+	}
+	if t.BurstUnits < 0 {
+		return fmt.Errorf("ratelimit.anonymous.burst_units must be >= 0, got %d", t.BurstUnits)
+	}
+	if t.UnitsPerMinute <= 0 {
+		return fmt.Errorf("ratelimit.anonymous.burst_units needs a bounded units_per_minute")
+	}
+	if t.BurstUnits > t.UnitsPerMinute {
+		return fmt.Errorf("ratelimit.anonymous.burst_units (%d) exceeds units_per_minute (%d)", t.BurstUnits, t.UnitsPerMinute)
+	}
+	if err := checkTierPayable(TierAnonymous, TierConfig{UnitsPerMinute: t.BurstUnits, MaxBatch: t.MaxBatch}, costs); err != nil {
+		return fmt.Errorf("ratelimit.anonymous.burst_units (%d) is too small: %w", t.BurstUnits, err)
+	}
+	return nil
+}
 
 // checkTierPayable rejects a bounded tier whose configured batch (or even a
 // single /tx, or a single read) could never fit in its own per-minute budget — a batch that

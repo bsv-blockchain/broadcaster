@@ -42,6 +42,15 @@ fixed window, a keyed caller can burst up to roughly 2× its per-minute limit
 across a minute boundary, and a small amount of leased-but-unspent quota can
 go undelivered if a replica goes idle mid-window.
 
+An anonymous bucket holds one minute of units by default, and a new client
+IP starts with a full bucket, so it can spend a whole minute's quota at once
+before being held to the refill rate. Set `ratelimit.anonymous.burst_units`
+to cap that: with `units_per_minute: 600` and `burst_units: 20`, an unkeyed
+caller sends at most two transactions back to back, then one a second. It
+must be no larger than `units_per_minute` and must cover the anonymous
+tier's largest request (`max_batch × submit_tx + read`). A request costing
+more than the burst gets `413`. Keyed tiers do not accept `burst_units`.
+
 A request that reaches a quota decision (allowed or denied by quota) carries
 `RateLimit-Policy` / `RateLimit` (draft-ietf-httpapi-ratelimit-headers-11)
 and `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset`
@@ -136,6 +145,8 @@ logs.
   `units_per_minute`, and `max_batch × costs.submit_tx + costs.read` must
   too (checked at config load; a tier that could never pay for its own
   batch cap fails startup, not the first request).
+- `burst_units` (anonymous only) caps the anonymous bucket; `0` keeps one
+  minute of burst. See the quota description above.
 - `retention_days` is how long the transaction and submission rows a
   tier's callers write are kept; see [Data retention per tier](#data-retention-per-tier).
 - Revocations and tier changes take effect within `key_cache_ttl_ms`
