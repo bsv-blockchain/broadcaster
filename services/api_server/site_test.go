@@ -3,9 +3,11 @@ package api_server
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"testing"
 	"testing/fstest"
 
@@ -305,4 +307,96 @@ func TestSiteAsset404LogsAtDebug(t *testing.T) {
 	}
 	assert.Equal(t, zapcore.DebugLevel, levels["/_next/static/chunks/missing.js"])
 	assert.Equal(t, zapcore.WarnLevel, levels["/nope"])
+}
+
+// flightRows parses a Flight payload as React's client does and returns each
+// row's ID and body, failing the test when a length-prefixed row overruns.
+func flightRows(t *testing.T, payload string) map[string]string {
+	t.Helper()
+	rows := map[string]string{}
+	for i := 0; i < len(payload); {
+		colon := strings.IndexByte(payload[i:], ':')
+		require.GreaterOrEqual(t, colon, 0, "row header at %d", i)
+		id, tag := payload[i:i+colon], i+colon+1
+		if isFlightLengthTag(payload[tag]) {
+			comma := tag + strings.IndexByte(payload[tag:], ',')
+			n, err := strconv.ParseUint(payload[tag+1:comma], 16, 31)
+			require.NoError(t, err)
+			require.LessOrEqual(t, comma+1+int(n), len(payload), "row %s overruns", id)
+			rows[id], i = payload[comma+1:comma+1+int(n)], comma+1+int(n)
+			continue
+		}
+		end := strings.IndexByte(payload[tag:], '\n')
+		require.GreaterOrEqual(t, end, 0, "row %s unterminated", id)
+		rows[id], i = payload[tag:tag+end], tag+end+1
+	}
+	return rows
+}
+
+// Text rows in the RSC payloads are length-prefixed: rewriting the origin in
+// one must rewrite its length, or the client loses every row after it and
+// throws "Connection closed" (React #412) on load.
+func TestSiteRewritesOriginInFlightTextRows(t *testing.T) {
+	text := `{"@id":"` + originPlaceholder + `/#org","name":"Ünïcode ✓","url":"` + originPlaceholder + `/"}` + "\nsecond line"
+	rsc := ":HL[\"/_next/static/chunks/app.css\",\"style\"]\n" +
+		"0:[\"$\",\"link\",null,{\"href\":\"" + originPlaceholder + "/\"}]\n" +
+		"3d:T" + strconv.FormatInt(int64(len(text)), 16) + "," + text +
+		"21:[\"$\",\"script\",null,{\"dangerouslySetInnerHTML\":{\"__html\":\"$3d\"}}]\n" +
+		"3e:A4,\x00\x01\x02\x03" +
+		"3f:null\n"
+	want := func(origin string) map[string]string {
+		return map[string]string{
+			"":   `HL["/_next/static/chunks/app.css","style"]`,
+			"0":  `["$","link",null,{"href":"` + origin + `/"}]`,
+			"3d": strings.ReplaceAll(text, originPlaceholder, origin),
+			"21": `["$","script",null,{"dangerouslySetInnerHTML":{"__html":"$3d"}}]`,
+			"3e": "\x00\x01\x02\x03",
+			"3f": "null",
+		}
+	}
+	require.Equal(t, want(originPlaceholder), flightRows(t, rsc))
+
+	// The payload split over two push scripts, mid text row.
+	push := func(s string) string {
+		b, err := json.Marshal(s)
+		require.NoError(t, err)
+		return `<script>self.__next_f.push([1,` + string(b) + `])</script>`
+	}
+	split := strings.Index(rsc, "Ünïcode")
+	html := `<link rel="canonical" href="` + originPlaceholder + `/"><script>(self.__next_f=self.__next_f||[]).push([0])</script>` +
+		push(rsc[:split]) + `<p>` + originPlaceholder + `</p>` + push(rsc[split:]) + `</body>`
+
+	site := exportFS()
+	site["index.txt"] = &fstest.MapFile{Data: []byte(rsc)}
+	site["index.html"] = &fstest.MapFile{Data: []byte(html)}
+	router := siteRouter(t, site)
+
+	for _, h := range []string{"localhost:8080", "broadcast.whatsonchain.com", "a-much-longer-host-name.example.org:8443"} {
+		host := func(r *http.Request) { r.Host = h }
+		origin := "http://" + h
+
+		assert.Equal(t, want(origin), flightRows(t, get(router, "/index.txt", host).Body.String()), h)
+
+		body := get(router, "/", host).Body.String()
+		assert.NotContains(t, body, originPlaceholder, h)
+		assert.Contains(t, body, `<link rel="canonical" href="`+origin+`/">`, h)
+		assert.Contains(t, body, `<p>`+origin+`</p>`, h)
+		var payload strings.Builder
+		for _, m := range nextFlightPushRE.FindAllStringSubmatch(body, -1) {
+			var args []json.RawMessage
+			require.NoError(t, json.Unmarshal([]byte(m[1]), &args))
+			if string(args[0]) != "1" {
+				continue
+			}
+			var s string
+			require.NoError(t, json.Unmarshal(args[1], &s))
+			payload.WriteString(s)
+		}
+		assert.Equal(t, want(origin), flightRows(t, payload.String()), h)
+	}
+
+	// Plain-text .txt files are not Flight payloads and are still rewritten.
+	site["llms.txt"] = &fstest.MapFile{Data: []byte("# Broadcaster\n\n" + originPlaceholder + "/docs\n")}
+	assert.Equal(t, "# Broadcaster\n\nhttp://op.example/docs\n",
+		get(siteRouter(t, site), "/llms.txt", func(r *http.Request) { r.Host = "op.example" }).Body.String())
 }
