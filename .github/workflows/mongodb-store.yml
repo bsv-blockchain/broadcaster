@@ -45,12 +45,18 @@ concurrency:
 
 jobs:
   mongodb-store:
-    name: mongodb-store
+    name: mongodb-store (mongo ${{ matrix.mongo }})
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # 7 runs the per-row status-update fallback; 8 (Atlas runs 8.0) runs
+        # the native client-bulkWrite path in BatchUpdateStatusReturning.
+        mongo: ["7", "8"]
     services:
       mongo:
-        image: mongo:7
+        image: mongo:${{ matrix.mongo }}
         ports:
           - 27017:27017
         options: >-

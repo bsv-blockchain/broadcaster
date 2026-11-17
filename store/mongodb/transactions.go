@@ -426,12 +426,6 @@ func (s *Store) BatchUpdateStatus(ctx context.Context, statuses []*models.Transa
 	return nil
 }
 
-// BatchUpdateStatusReturning implements store.Store over the fused
-// UpdateStatusReturning, so each row costs one round trip, not two.
-func (s *Store) BatchUpdateStatusReturning(ctx context.Context, statuses []*models.TransactionStatus) ([]store.StatusUpdate, error) {
-	return store.BatchUpdateStatusReturningParallel(ctx, s, statuses)
-}
-
 // --- reads ---
 
 // GetStatus implements store.Store. A missing row is (nil, nil), the

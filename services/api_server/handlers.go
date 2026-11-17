@@ -763,8 +763,20 @@ func (s *Server) handleSeenMultipleNodes(c *gin.Context, msg models.CallbackMess
 // Results are in input order. On error the rows of the chunks already
 // written are returned with it, as BatchUpdateStatusReturning does; the
 // remaining rows are not attempted.
+//
+// A store with a native batch status update (store.NativeBatchStatusUpdater)
+// gets the whole batch in one call holding one slot: it writes the batch in
+// two round trips on one connection at a time, so chunking it would only add
+// round trips.
 func (s *Server) callbackBatchUpdate(ctx context.Context, statuses []*models.TransactionStatus) ([]store.StatusUpdate, error) {
 	if s.callbackSlots == nil || s.callbackSlotCount <= 0 {
+		return s.store.BatchUpdateStatusReturning(ctx, statuses)
+	}
+	if _, native := s.store.(store.NativeBatchStatusUpdater); native {
+		if err := s.callbackSlots.Acquire(ctx, 1); err != nil {
+			return nil, err
+		}
+		defer s.callbackSlots.Release(1)
 		return s.store.BatchUpdateStatusReturning(ctx, statuses)
 	}
 	w := min(len(statuses), store.BatchConcurrency(), s.callbackSlotCount)

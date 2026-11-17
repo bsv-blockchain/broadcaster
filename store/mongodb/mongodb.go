@@ -155,6 +155,16 @@ type Store struct {
 	// tokenReplayLimit is maxTokenReplayScan, a field so tests can lower it.
 	tokenReplayLimit int64
 
+	// bulkWriteSupport caches whether the server has client-level bulkWrite
+	// (MongoDB 8.0+): bulkWriteUnknown until the first
+	// BatchUpdateStatusReturning asks. See clientBulkWriteSupported.
+	bulkWriteSupport int32
+
+	// afterStatusRead runs in a native BatchUpdateStatusReturning between the
+	// read and the bulk update. Nil in production; a test sets it to write a
+	// row in that window, which only a concurrent writer can otherwise do.
+	afterStatusRead func()
+
 	// rewritePasses is blockRewritePasses, a field for the same reason: the
 	// drain's boundary behaviour is only reachable in a test that can make
 	// the last allowed pass the one that retires the final row.

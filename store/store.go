@@ -241,6 +241,16 @@ type NativeBatchInserter interface {
 	NativeBatchGetOrInsert()
 }
 
+// NativeBatchStatusUpdater marks a backend whose BatchUpdateStatusReturning
+// writes a batch in a few round trips on one connection at a time (MongoDB
+// 8.0+: a read and a client bulkWrite) instead of a bounded per-row loop.
+// The callback handler uses it the way the /txs handler uses
+// NativeBatchInserter: one slot of its pod-wide store budget for the whole
+// call, or one per row in flight.
+type NativeBatchStatusUpdater interface {
+	NativeBatchStatusUpdate()
+}
+
 // BatchInsertResult is one entry in the result slice returned by
 // BatchGetOrInsertStatus. Inserted is true when the row was newly written by
 // this call; false when an existing row was found and Existing carries it.
