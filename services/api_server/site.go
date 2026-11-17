@@ -202,7 +202,7 @@ func (s *siteHandler) serve(c *gin.Context, name string, status int) {
 		return
 	}
 	if origin, ok := siteOrigin(c.Request); ok {
-		data = bytes.ReplaceAll(data, []byte(originPlaceholder), []byte(origin))
+		data = rewriteOrigin(name, data, origin)
 	}
 
 	setSiteHeaders(c, name)
