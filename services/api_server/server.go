@@ -77,7 +77,15 @@ type Server struct {
 	// (api.intake_store_concurrency; see withIntakeSlot). Nil, as in tests
 	// built from a struct literal, leaves them unbounded.
 	intakeSlots *semaphore.Weighted
-	server      *http.Server
+
+	// callbackSlots bounds merkle-service callback status writes in flight
+	// across the pod (api.callback_store_concurrency, held as
+	// callbackSlotCount; see callbackBatchUpdate). Nil leaves them
+	// unbounded.
+	callbackSlots     *semaphore.Weighted
+	callbackSlotCount int
+
+	server *http.Server
 	// site is the docs site's static export; nil means the one embedded in
 	// the binary (web.FS). Tests inject their own.
 	site fs.FS
@@ -139,7 +147,7 @@ func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, publi
 	// sample, which undercounted submissions after every rollout.
 	metrics.PreRegisterTxSubmissions()
 	metrics.PreRegisterStatusTransitions(models.StatusSeenOnNetwork, models.StatusSeenMultipleNodes)
-	return &Server{
+	srv := &Server{
 		cfg:            cfg,
 		logger:         logger.Named("api-server"),
 		producer:       producer,
@@ -154,6 +162,9 @@ func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, publi
 		submissionCh:   make(chan submissionRecord, submissionRecorderBuffer),
 		submissionStop: make(chan struct{}),
 	}
+	srv.callbackSlotCount = cfg.CallbackStoreConcurrencyLimit()
+	srv.callbackSlots = semaphore.NewWeighted(int64(srv.callbackSlotCount))
+	return srv
 }
 
 func (s *Server) Name() string { return "api-server" }

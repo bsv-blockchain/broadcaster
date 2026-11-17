@@ -216,6 +216,36 @@ type API struct {
 	// on MongoDB (half the driver's default pool of 100 when that is unset),
 	// else DefaultIntakeStoreConcurrency.
 	IntakeStoreConcurrency int `mapstructure:"intake_store_concurrency"`
+	// CallbackStoreConcurrency caps the status writes merkle-service
+	// callbacks keep in flight across the whole pod. A burst of SEEN
+	// callbacks otherwise runs store.batch_concurrency writes per callback
+	// with no shared bound, takes every pool connection, and stalls /txs and
+	// the quota reservation behind it. 0 (the default) derives it: a quarter
+	// of store.mongodb.max_pool_size on MongoDB, else
+	// DefaultCallbackStoreConcurrency.
+	CallbackStoreConcurrency int `mapstructure:"callback_store_concurrency"`
+}
+
+// DefaultCallbackStoreConcurrency is the callback write cap on backends whose
+// pool api.callback_store_concurrency cannot derive from.
+const DefaultCallbackStoreConcurrency = 16
+
+// CallbackStoreConcurrencyLimit resolves api.callback_store_concurrency (see
+// API.CallbackStoreConcurrency). A quarter of the pool leaves half for /txs
+// (IntakeStoreConcurrencyLimit) and a quarter for reads, the quota
+// reservation and the submission recorder.
+func (c *Config) CallbackStoreConcurrencyLimit() int {
+	if c.APIServer.CallbackStoreConcurrency > 0 {
+		return c.APIServer.CallbackStoreConcurrency
+	}
+	if c.Store.Backend != "mongodb" {
+		return DefaultCallbackStoreConcurrency
+	}
+	pool := c.Store.Mongo.MaxPoolSize
+	if pool <= 0 {
+		pool = mongoDriverDefaultPool
+	}
+	return max(1, pool/4)
 }
 
 // DefaultIntakeStoreConcurrency is the intake write cap on backends whose
@@ -1663,6 +1693,7 @@ func setDefaults() {
 	viper.SetDefault("api.trusted_platform", "")
 	viper.SetDefault("api.trusted_proxies", []string{})
 	viper.SetDefault("api.intake_store_concurrency", 0)
+	viper.SetDefault("api.callback_store_concurrency", 0)
 	// API keys, admin and rate limiting all ship off. Only the free tier
 	// and the anonymous tier have defaults: viper deep-merges maps, so a
 	// default "pro" tier could never be removed by an operator's config.
