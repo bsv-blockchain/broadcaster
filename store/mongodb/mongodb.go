@@ -119,14 +119,16 @@ type Store struct {
 	ownsClient bool
 	db         *mongo.Database
 
-	tx       *mongo.Collection
-	subs     *mongo.Collection
-	blocks   *mongo.Collection
-	leases   *mongo.Collection
-	datahubs *mongo.Collection
-	peers    *mongo.Collection
-	apiKeys  *mongo.Collection
-	apiQuota *mongo.Collection
+	tx *mongo.Collection
+	// txPrimary is tx pinned to the primary read preference.
+	txPrimary *mongo.Collection
+	subs      *mongo.Collection
+	blocks    *mongo.Collection
+	leases    *mongo.Collection
+	datahubs  *mongo.Collection
+	peers     *mongo.Collection
+	apiKeys   *mongo.Collection
+	apiQuota  *mongo.Collection
 	// bumps / stumps are the GridFS buckets with the manifest collections
 	// that point at the current file; see blobs.go.
 	bumps  blobBucket
@@ -279,16 +281,19 @@ func connect(ctx context.Context, cfg config.Mongo, logger *zap.Logger, uriKey s
 func newWithClient(client *mongo.Client, database string, cfg config.Mongo) *Store {
 	db := client.Database(database)
 	return &Store{
-		client:   client,
-		db:       db,
-		tx:       db.Collection(collTransactions),
-		subs:     db.Collection(collSubmissions),
-		blocks:   db.Collection(collBlockProcessing),
-		leases:   db.Collection(collLeases),
-		datahubs: db.Collection(collDatahubEndpoints),
-		peers:    db.Collection(collPeerPolicies),
-		apiKeys:  db.Collection(collAPIKeys),
-		apiQuota: db.Collection(collAPIQuota),
+		client: client,
+		db:     db,
+		tx:     db.Collection(collTransactions),
+		// BatchUpdateStatusReturning's read must see the primary; see
+		// statusBatch.read.
+		txPrimary: db.Collection(collTransactions, options.Collection().SetReadPreference(readpref.Primary())),
+		subs:      db.Collection(collSubmissions),
+		blocks:    db.Collection(collBlockProcessing),
+		leases:    db.Collection(collLeases),
+		datahubs:  db.Collection(collDatahubEndpoints),
+		peers:     db.Collection(collPeerPolicies),
+		apiKeys:   db.Collection(collAPIKeys),
+		apiQuota:  db.Collection(collAPIQuota),
 		bumps: blobBucket{
 			bucket:    db.GridFSBucket(options.GridFSBucket().SetName(bucketBumps).SetChunkSizeBytes(gridfsChunkSize)),
 			manifests: db.Collection(collBumpManifests),

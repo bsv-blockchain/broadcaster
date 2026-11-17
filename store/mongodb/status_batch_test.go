@@ -4,6 +4,7 @@ package mongodb
 
 import (
 	"context"
+	"os"
 	"testing"
 	"time"
 
@@ -14,11 +15,17 @@ import (
 
 // requireNativeStatusBatch skips unless the server has client bulkWrite, so
 // these tests exercise the native path rather than the per-row fallback.
+// CI's MongoDB 8 leg sets BSV_BROADCASTER_MONGODB_EXPECT_NATIVE, which turns
+// the skip into a failure: a broken probe must not pass as "no native path".
 func requireNativeStatusBatch(t *testing.T, s *Store) {
 	t.Helper()
-	if !s.clientBulkWriteSupported(context.Background()) {
-		t.Skip("server has no client-level bulkWrite (MongoDB < 8.0); the per-row fallback runs instead")
+	if s.clientBulkWriteSupported(context.Background()) {
+		return
 	}
+	if os.Getenv("BSV_BROADCASTER_MONGODB_EXPECT_NATIVE") != "" {
+		t.Fatal("BSV_BROADCASTER_MONGODB_EXPECT_NATIVE is set but the server reports no client-level bulkWrite")
+	}
+	t.Skip("server has no client-level bulkWrite (MongoDB < 8.0); the per-row fallback runs instead")
 }
 
 func seedRowStatus(t *testing.T, s *Store, txid string, status models.Status) {
@@ -200,5 +207,61 @@ func TestExtendTransactionExpiry_BumpsVersion(t *testing.T) {
 	}
 	if _, after := currentStatus(t, s, "nb-ret"); after != before+1 {
 		t.Errorf("version %d -> %d, want one bump", before, after)
+	}
+}
+
+// A server that advertises wire version 25 but refuses bulkWrite (an 8.0
+// binary still at feature compatibility version 7.0) must not fail every
+// batch: the refused command wrote nothing, so the batch runs per row and the
+// store stops trying the native path. Forced here against a server without
+// bulkWrite, which refuses the command the same way.
+func TestBatchUpdateStatusReturning_RefusedBulkWriteFallsBack(t *testing.T) {
+	s := newTestStore(t)
+	if s.clientBulkWriteSupported(context.Background()) {
+		t.Skip("server runs client bulkWrite; this test needs one that refuses it (MongoDB < 8.0)")
+	}
+	ctx := context.Background()
+	seedRowStatus(t, s, "nb-refused", models.StatusAcceptedByNetwork)
+	s.bulkWriteSupport = bulkWriteSupported
+
+	res, err := s.BatchUpdateStatusReturning(ctx, []*models.TransactionStatus{{TxID: "nb-refused", Status: models.StatusSeenOnNetwork}})
+	if err != nil {
+		t.Fatalf("BatchUpdateStatusReturning: %v", err)
+	}
+	if r := res[0]; r.Prev == nil || r.Prev.Status != models.StatusAcceptedByNetwork {
+		t.Errorf("result = %+v, want applied over ACCEPTED_BY_NETWORK", r)
+	}
+	if s.bulkWriteSupport != bulkWriteUnsupported {
+		t.Errorf("bulkWriteSupport = %d, want unsupported after a refusal", s.bulkWriteSupport)
+	}
+}
+
+// A repeated txid whose first occurrence loses a race still applies in
+// input order: the first occurrence over the intervening write, the second
+// over the first.
+func TestBatchUpdateStatusReturning_Native_ContendedRepeatInOrder(t *testing.T) {
+	s := newTestStore(t)
+	requireNativeStatusBatch(t, s)
+	ctx := context.Background()
+
+	seedRowStatus(t, s, "nb-crep", models.StatusSentToNetwork)
+	s.afterStatusRead = func() {
+		s.afterStatusRead = nil
+		if err := s.UpdateStatus(ctx, &models.TransactionStatus{TxID: "nb-crep", Status: models.StatusAcceptedByNetwork}); err != nil {
+			t.Errorf("intervening write: %v", err)
+		}
+	}
+	res, err := s.BatchUpdateStatusReturning(ctx, []*models.TransactionStatus{
+		{TxID: "nb-crep", Status: models.StatusSeenOnNetwork},
+		{TxID: "nb-crep", Status: models.StatusSeenMultipleNodes},
+	})
+	if err != nil {
+		t.Fatalf("BatchUpdateStatusReturning: %v", err)
+	}
+	if r := res[0]; r.Prev == nil || r.Prev.Status != models.StatusAcceptedByNetwork {
+		t.Errorf("first occurrence = %+v, want applied over the intervening ACCEPTED_BY_NETWORK", r)
+	}
+	if r := res[1]; r.Prev == nil || r.Prev.Status != models.StatusSeenOnNetwork {
+		t.Errorf("second occurrence = %+v, want applied over the first's SEEN_ON_NETWORK", r)
 	}
 }

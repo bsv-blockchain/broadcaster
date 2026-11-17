@@ -772,7 +772,7 @@ func (s *Server) callbackBatchUpdate(ctx context.Context, statuses []*models.Tra
 	if s.callbackSlots == nil || s.callbackSlotCount <= 0 {
 		return s.store.BatchUpdateStatusReturning(ctx, statuses)
 	}
-	if _, native := s.store.(store.NativeBatchStatusUpdater); native {
+	if nb, ok := s.store.(store.NativeBatchStatusUpdater); ok && nb.NativeBatchStatusUpdate(ctx) {
 		if err := s.callbackSlots.Acquire(ctx, 1); err != nil {
 			return nil, err
 		}
