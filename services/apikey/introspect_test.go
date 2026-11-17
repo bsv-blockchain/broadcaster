@@ -132,7 +132,8 @@ func TestIntrospectorFailures(t *testing.T) {
 
 // TestIntrospectorBacksOffAfterFailures pins that a failing provider is not
 // called again until its backoff passes, so an outage or a bad token cannot
-// turn every uncached request into an outbound call.
+// turn every uncached request into an outbound call. A throttle or provider
+// error with no long Retry-After is retried once first (calls = 2).
 func TestIntrospectorBacksOffAfterFailures(t *testing.T) {
 	for name, tc := range map[string]struct {
 		status     int
@@ -140,20 +141,22 @@ func TestIntrospectorBacksOffAfterFailures(t *testing.T) {
 		token      string
 		body       string
 		backoff    time.Duration
+		calls      int32 // provider calls the first lookup makes
 	}{
-		"429 with Retry-After":        {http.StatusTooManyRequests, "7", testServiceToken, ``, 7 * time.Second},
-		"429 Retry-After capped":      {http.StatusTooManyRequests, "3600", testServiceToken, ``, backoffMax},
-		"429 Retry-After overflow":    {http.StatusTooManyRequests, "9999999999", testServiceToken, ``, backoffMax},
-		"429 Retry-After as a date":   {http.StatusTooManyRequests, "Fri, 30 Oct 2026 12:00:09 GMT", testServiceToken, ``, 9 * time.Second},
-		"429 Retry-After in the past": {http.StatusTooManyRequests, "Fri, 30 Oct 2026 11:00:00 GMT", testServiceToken, ``, backoffThrottled},
-		"429 without header":          {http.StatusTooManyRequests, "", testServiceToken, ``, backoffThrottled},
-		"503":                         {http.StatusServiceUnavailable, "", testServiceToken, ``, backoffTransient},
-		"rejected token":              {http.StatusOK, "", "wrong", ``, backoffMisconfigured},
-		"404 (wrong url)":             {http.StatusNotFound, "", testServiceToken, ``, backoffMisconfigured},
-		"undecodable answer":          {http.StatusOK, "", testServiceToken, `nope`, backoffTransient},
-		"valid without key_id":        {http.StatusOK, "", testServiceToken, `{"valid":true,"tier":"gold"}`, 0},
-		"expiry not RFC 3339":         {http.StatusOK, "", testServiceToken, `{"valid":true,"key_id":"k","expires_at":"2027-01-31"}`, 0},
-		"invalid key":                 {http.StatusOK, "", testServiceToken, `{"valid":false}`, 0},
+		"429 with Retry-After":        {http.StatusTooManyRequests, "7", testServiceToken, ``, 7 * time.Second, 1},
+		"429 Retry-After capped":      {http.StatusTooManyRequests, "3600", testServiceToken, ``, backoffMax, 1},
+		"429 Retry-After overflow":    {http.StatusTooManyRequests, "9999999999", testServiceToken, ``, backoffMax, 1},
+		"429 Retry-After as a date":   {http.StatusTooManyRequests, "Fri, 30 Oct 2026 12:00:09 GMT", testServiceToken, ``, 9 * time.Second, 1},
+		"429 Retry-After in the past": {http.StatusTooManyRequests, "Fri, 30 Oct 2026 11:00:00 GMT", testServiceToken, ``, backoffThrottled, 1},
+		"429 Retry-After of 1s":       {http.StatusTooManyRequests, "1", testServiceToken, ``, time.Second, 2},
+		"429 without header":          {http.StatusTooManyRequests, "", testServiceToken, ``, backoffThrottled, 2},
+		"503":                         {http.StatusServiceUnavailable, "", testServiceToken, ``, backoffTransient, 2},
+		"rejected token":              {http.StatusOK, "", "wrong", ``, backoffMisconfigured, 1},
+		"404 (wrong url)":             {http.StatusNotFound, "", testServiceToken, ``, backoffMisconfigured, 1},
+		"undecodable answer":          {http.StatusOK, "", testServiceToken, `nope`, backoffTransient, 1},
+		"valid without key_id":        {http.StatusOK, "", testServiceToken, `{"valid":true,"tier":"gold"}`, 0, 1},
+		"expiry not RFC 3339":         {http.StatusOK, "", testServiceToken, `{"valid":true,"key_id":"k","expires_at":"2027-01-31"}`, 0, 1},
+		"invalid key":                 {http.StatusOK, "", testServiceToken, `{"valid":false}`, 0, 1},
 	} {
 		t.Run(name, func(t *testing.T) {
 			var calls atomic.Int32
@@ -173,27 +176,37 @@ func TestIntrospectorBacksOffAfterFailures(t *testing.T) {
 			in := introspectorFor(srv, tc.token)
 			clk := &fakeClock{t: time.Date(2026, 10, 30, 12, 0, 0, 0, time.UTC)}
 			in.now = clk.now
+			in.sleep = func(_ context.Context, d time.Duration) error { clk.advance(d); return nil }
 
 			_, err := in.GetAPIKeyByHash(context.Background(), Hash("x"))
 			require.Error(t, err)
-			require.EqualValues(t, 1, calls.Load())
+			require.Equal(t, tc.calls, calls.Load())
 
 			_, err = in.GetAPIKeyByHash(context.Background(), Hash("y"))
-			require.Error(t, err)
 			if tc.backoff == 0 {
-				require.EqualValues(t, 2, calls.Load(), "no backoff: the next key is looked up")
+				require.Error(t, err)
+				require.Equal(t, tc.calls+1, calls.Load(), "no backoff: the next key is looked up")
+				return
+			}
+			if tc.backoff <= introspectRetryWait {
+				// A backoff this short is waited out, not failed.
+				require.Equal(t, tc.calls+tc.calls, calls.Load(), "a short backoff is waited out")
 				return
 			}
 			require.ErrorIs(t, err, errIntrospectionBackoff)
 			require.NotErrorIs(t, err, store.ErrAPIKeyNotFound, "backing off is unavailable, never unknown")
-			require.EqualValues(t, 1, calls.Load(), "backing off: the provider is not called")
+			require.Equal(t, tc.calls, calls.Load(), "backing off: the provider is not called")
 
-			clk.advance(tc.backoff - time.Millisecond)
+			// Until the last introspectRetryWait of the backoff, lookups fail
+			// fast; within it they wait the rest out and call again.
+			clk.advance(tc.backoff - introspectRetryWait - time.Millisecond)
 			_, err = in.GetAPIKeyByHash(context.Background(), Hash("y"))
 			require.ErrorIs(t, err, errIntrospectionBackoff)
+			require.Equal(t, tc.calls, calls.Load(), "still backing off")
 			clk.advance(time.Millisecond)
 			_, _ = in.GetAPIKeyByHash(context.Background(), Hash("y"))
-			require.EqualValues(t, 2, calls.Load(), "called again once the backoff has passed")
+			// The fresh lookup fails the same way, so it retries too.
+			require.Equal(t, tc.calls+tc.calls, calls.Load(), "called again once the backoff has passed")
 		})
 	}
 }
@@ -373,4 +386,57 @@ func TestIntrospectorQueuedCallHonoursContext(t *testing.T) {
 	defer cancel()
 	_, err := in.GetAPIKeyByHash(ctx, Hash("x"))
 	require.ErrorIs(t, err, context.DeadlineExceeded)
+}
+
+// A provider that throttles one call and answers the next costs the lookup
+// one short wait, not a failure: WoC answered 2 of 22 introspections with 429
+// on 2026-11-17, and each was a 503 for the client.
+func TestIntrospectorRetriesOnceAfterThrottle(t *testing.T) {
+	for name, status := range map[string]int{"429": http.StatusTooManyRequests, "503": http.StatusServiceUnavailable} {
+		t.Run(name, func(t *testing.T) {
+			var calls atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				if calls.Add(1) == 1 {
+					w.WriteHeader(status)
+					return
+				}
+				_, _ = w.Write([]byte(`{"valid":true,"key_id":"k","tier":"gold"}`))
+			}))
+			t.Cleanup(srv.Close)
+			in := introspectorFor(srv, testServiceToken)
+			clk := &fakeClock{t: time.Date(2026, 10, 30, 12, 0, 0, 0, time.UTC)}
+			in.now = clk.now
+			var slept time.Duration
+			in.sleep = func(_ context.Context, d time.Duration) error { slept += d; clk.advance(d); return nil }
+
+			k, err := in.GetAPIKeyByHash(context.Background(), Hash("x"))
+			require.NoError(t, err)
+			require.Equal(t, testProvider+":k", k.ID)
+			require.EqualValues(t, 2, calls.Load(), "one retry")
+			require.Equal(t, introspectRetryWait, slept)
+
+			// Recovered: the next lookup goes straight to the provider.
+			_, err = in.GetAPIKeyByHash(context.Background(), Hash("y"))
+			require.NoError(t, err)
+			require.EqualValues(t, 3, calls.Load())
+		})
+	}
+}
+
+// A lookup whose context ends while it waits for its retry fails with the
+// context's error, without calling the provider again.
+func TestIntrospectorRetryHonoursContext(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	t.Cleanup(srv.Close)
+	in := introspectorFor(srv, testServiceToken)
+	ctx, cancel := context.WithCancel(context.Background())
+	in.sleep = func(ctx context.Context, d time.Duration) error { cancel(); return sleepCtx(ctx, d) }
+
+	_, err := in.GetAPIKeyByHash(ctx, Hash("x"))
+	require.ErrorIs(t, err, context.Canceled)
+	require.EqualValues(t, 1, calls.Load())
 }
