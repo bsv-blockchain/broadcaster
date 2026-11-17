@@ -112,3 +112,74 @@ func TestSeenCallback_WaitsForCallbackSlots(t *testing.T) {
 		t.Errorf("store calls = %d, want 0 while no slot is free", n)
 	}
 }
+
+// nativeStatusStore is a mockStore that reports a native batch status update
+// (store.NativeBatchStatusUpdater), as MongoDB 8.0+ does.
+type nativeStatusStore struct {
+	*mockStore
+
+	fallback bool // reports the per-row fallback, as MongoDB < 8.0 does
+}
+
+func (n nativeStatusStore) NativeBatchStatusUpdate(context.Context) bool { return !n.fallback }
+
+// On a native-batch store a callback writes its whole batch in one store
+// call holding a single slot: chunking it would only add round trips.
+func TestSeenCallback_NativeStoreGetsWholeBatch(t *testing.T) {
+	ms := &mockStore{}
+	srv, pub, router := callbackSlotServer(ms, 3)
+	srv.store = nativeStatusStore{mockStore: ms}
+	if w := seenCallback(t.Context(), t, router, 10); w.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", w.Code, w.Body.String())
+	}
+	if n := len(ms.batchUpdateReturningCalls); n != 1 || len(ms.batchUpdateReturningCalls[0]) != 10 {
+		t.Errorf("store calls = %d, want one call with all 10 rows", n)
+	}
+	pub.mu.Lock()
+	defer pub.mu.Unlock()
+	if len(pub.bulkPublishes) != 1 || len(pub.bulkPublishes[0].TxIDs) != 10 {
+		t.Errorf("bulk publishes = %+v, want one covering all 10 txids", pub.bulkPublishes)
+	}
+}
+
+// The single native call still needs a slot: with none free it waits, and
+// fails retriably when its request ends.
+func TestSeenCallback_NativeStoreWaitsForSlot(t *testing.T) {
+	ms := &mockStore{}
+	srv, _, router := callbackSlotServer(ms, 1)
+	srv.store = nativeStatusStore{mockStore: ms}
+	if !srv.callbackSlots.TryAcquire(1) {
+		t.Fatal("could not take the slot")
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+	if w := seenCallback(ctx, t, router, 5); w.Code < 500 {
+		t.Fatalf("status = %d, want a retriable 5xx", w.Code)
+	}
+	if n := len(ms.batchUpdateReturningCalls); n != 0 {
+		t.Errorf("store calls = %d, want 0 while no slot is free", n)
+	}
+}
+
+// A native-capable store that will run its per-row fallback this time (an
+// older server) is bounded like any per-row store: the callback writes in
+// chunks of its slot share.
+func TestSeenCallback_NativeStoreOnFallbackStaysChunked(t *testing.T) {
+	prev := store.BatchConcurrency()
+	store.SetBatchConcurrency(8)
+	t.Cleanup(func() { store.SetBatchConcurrency(prev) })
+
+	ms := &mockStore{}
+	srv, _, router := callbackSlotServer(ms, 3)
+	srv.store = nativeStatusStore{mockStore: ms, fallback: true}
+	if w := seenCallback(t.Context(), t, router, 10); w.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", w.Code, w.Body.String())
+	}
+	sizes := make([]int, 0, len(ms.batchUpdateReturningCalls))
+	for _, call := range ms.batchUpdateReturningCalls {
+		sizes = append(sizes, len(call))
+	}
+	if fmt.Sprint(sizes) != "[3 3 3 1]" {
+		t.Errorf("store call sizes = %v, want [3 3 3 1]", sizes)
+	}
+}

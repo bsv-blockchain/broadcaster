@@ -34,11 +34,11 @@ func (s *Store) ExtendTransactionExpiry(ctx context.Context, txid string, until 
 	var update bson.D
 	if until == nil {
 		filter = append(filter, bson.E{Key: fExpiresAt, Value: bson.D{{Key: opExists, Value: true}}})
-		update = bson.D{{Key: opUnset, Value: bson.D{{Key: fExpiresAt, Value: ""}}}}
+		update = bson.D{{Key: opUnset, Value: bson.D{{Key: fExpiresAt, Value: ""}}}, incVersion()}
 	} else {
 		t := msTrunc(*until)
 		filter = append(filter, bson.E{Key: fExpiresAt, Value: bson.D{{Key: opLt, Value: t}}})
-		update = bson.D{{Key: opSet, Value: bson.D{{Key: fExpiresAt, Value: t}}}}
+		update = bson.D{{Key: opSet, Value: bson.D{{Key: fExpiresAt, Value: t}}}, incVersion()}
 	}
 	octx, cancel := s.opCtx(ctx)
 	defer cancel()

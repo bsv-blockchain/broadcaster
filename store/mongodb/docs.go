@@ -141,14 +141,15 @@ const (
 // index predicates in this package correct. Writers that need to clear a
 // field use $unset, never $set to zero.
 //
-// Version is a write counter, not a CAS token: 1 at insert and bumped by
-// every write, but never filtered on. The block-scoped rewrites
-// (SetMinedByTxIDs, SetStatusByBlockHash) instead carry their guards in the
-// update filter itself — the status lattice as a $nin, "still anchored to
-// this block" — and apply them one findAndModify per row, so a concurrent
-// UpdateStatus is refused by the guard rather than by a version compare. The
-// counter stays because it makes a row's write history cheap to read in the
-// shell and leaves room for a future guard.
+// Version is 1 at insert and bumped by every write to the row. Every writer
+// must bump it: BatchUpdateStatusReturning reads a batch of rows, then
+// updates each one only if it is still at the version it was read at, and
+// reports the row as read as the pre-image. A write that left version alone
+// would slip between the two unseen and make that pre-image stale. The
+// block-scoped rewrites (SetMinedByTxIDs, SetStatusByBlockHash) do not
+// compare versions: they carry their guards in the update filter itself — the
+// status lattice as a $nin, "still anchored to this block" — and apply them
+// one findAndModify per row.
 type txDoc struct {
 	TxID               string              `bson:"_id"`
 	Status             string              `bson:"status"`

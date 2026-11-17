@@ -48,10 +48,10 @@ var (
 	projRetry       = doc(kv(fRawTx, 1), kv(fRetryCount, 1), kv(fNextRetryAt, 1), kv(fRetryReason, 1))
 )
 
-// incVersion is the $inc clause every transactions write carries. The
-// counter is not used as a CAS token by this package any more, but every
-// write still bumps it so an operator (or a future guard) can tell rewrites
-// apart cheaply.
+// incVersion is the $inc clause every transactions write carries.
+// BatchUpdateStatusReturning guards its updates on the version a row was read
+// at, so a write that skipped the bump could slip between its read and its
+// update unseen (see txDoc.Version).
 func incVersion() bson.E { return kv(opInc, doc(kv(fVersion, 1))) }
 
 // --- inserts ---
@@ -424,12 +424,6 @@ func (s *Store) BatchUpdateStatus(ctx context.Context, statuses []*models.Transa
 		}
 	}
 	return nil
-}
-
-// BatchUpdateStatusReturning implements store.Store over the fused
-// UpdateStatusReturning, so each row costs one round trip, not two.
-func (s *Store) BatchUpdateStatusReturning(ctx context.Context, statuses []*models.TransactionStatus) ([]store.StatusUpdate, error) {
-	return store.BatchUpdateStatusReturningParallel(ctx, s, statuses)
 }
 
 // --- reads ---
