@@ -1624,3 +1624,194 @@ func TestLookupRawTxs_CorruptRowReadsAbsent(t *testing.T) {
 		t.Errorf("good row = %+v", row)
 	}
 }
+
+func assertStatusesSinceTxIDs(t *testing.T, s *Store, since time.Time, want []string) {
+	t.Helper()
+	ctx := context.Background()
+	t.Run("GetStatusesSince", func(t *testing.T) {
+		rows, err := s.GetStatusesSince(ctx, since)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := make([]string, 0, len(rows))
+		for _, row := range rows {
+			got = append(got, row.TxID)
+		}
+		if !slices.Equal(got, want) {
+			t.Fatalf("txids = %v, want %v", got, want)
+		}
+	})
+	t.Run("IterateStatusesSince", func(t *testing.T) {
+		var got []string
+		if err := s.IterateStatusesSince(ctx, since, func(st *models.TransactionStatus) error {
+			got = append(got, st.TxID)
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Equal(got, want) {
+			t.Fatalf("txids = %v, want %v", got, want)
+		}
+	})
+}
+
+func TestStatusesSince_BoundsAndOrder(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	base := time.Unix(1_700_000_000, 0)
+	for _, row := range []struct {
+		txid string
+		at   time.Time
+	}{
+		{"later", base.Add(time.Hour)},
+		{"at-b", base},
+		{"old", base.Add(-time.Nanosecond)},
+		{"after", base.Add(time.Nanosecond)},
+		{"at-a", base},
+	} {
+		if _, _, err := s.GetOrInsertStatus(ctx, &models.TransactionStatus{
+			TxID: row.txid, Status: models.StatusReceived, Timestamp: row.at,
+		}); err != nil {
+			t.Fatalf("insert %s: %v", row.txid, err)
+		}
+	}
+
+	for _, tc := range []struct {
+		name  string
+		since time.Time
+		want  []string
+	}{
+		{"at", base, []string{"at-a", "at-b", "after", "later"}},
+		{"after", base.Add(time.Nanosecond), []string{"after", "later"}},
+		{"before", base.Add(-time.Nanosecond), []string{"old", "at-a", "at-b", "after", "later"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assertStatusesSinceTxIDs(t, s, tc.since, tc.want)
+		})
+	}
+}
+
+func TestStatusesSince_ZeroAndPreEpochSince(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	base := time.Unix(1_700_000_000, 0)
+	for _, row := range []struct {
+		txid string
+		at   time.Time
+	}{
+		{"neg-old", time.Unix(0, -10)},
+		{"neg-new", time.Unix(0, -5)},
+		{"pos", base},
+	} {
+		if _, _, err := s.GetOrInsertStatus(ctx, &models.TransactionStatus{
+			TxID: row.txid, Status: models.StatusReceived, Timestamp: row.at,
+		}); err != nil {
+			t.Fatalf("insert %s: %v", row.txid, err)
+		}
+	}
+
+	// Keys cast timestamps to uint64: positive times sort before negative ones,
+	// while the negative timestamps retain their order relative to each other.
+	for _, tc := range []struct {
+		name  string
+		since time.Time
+		want  []string
+	}{
+		{"zero", time.Time{}, []string{"pos", "neg-old", "neg-new"}},
+		{"pre-epoch", time.Unix(0, -5), []string{"pos", "neg-new"}},
+		{"epoch", time.Unix(0, 0), []string{"pos"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assertStatusesSinceTxIDs(t, s, tc.since, tc.want)
+		})
+	}
+}
+
+func TestStatusesSince_RowCheckGuardsStaleIndexKey(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	base := time.Unix(1_700_000_000, 0)
+	if _, _, err := s.GetOrInsertStatus(ctx, &models.TransactionStatus{
+		TxID: "stale", Status: models.StatusReceived, Timestamp: base.Add(-48 * time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.Set(idxTxUpdatedKey(base.UnixNano(), "stale"), nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	assertStatusesSinceTxIDs(t, s, base.Add(-24*time.Hour), nil)
+}
+
+// An update that moves an old row into the window must drop its old index key,
+// so the seeked scan returns the row exactly once.
+func TestStatusesSince_UpdateMovesRowIntoWindow(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	base := time.Unix(1_700_000_000, 0)
+	if _, _, err := s.GetOrInsertStatus(ctx, &models.TransactionStatus{
+		TxID: "moved", Status: models.StatusReceived, Timestamp: base.Add(-48 * time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateStatus(ctx, &models.TransactionStatus{
+		TxID: "moved", Status: models.StatusSeenOnNetwork, Timestamp: base,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	assertStatusesSinceTxIDs(t, s, base.Add(-24*time.Hour), []string{"moved"})
+	assertStatusesSinceTxIDs(t, s, time.Time{}, []string{"moved"})
+}
+
+// seedSinceBenchRows writes oldRows rows 48h before base (outside a 24h window)
+// and 10 rows at base, each carrying a 1 KiB RawTx.
+func seedSinceBenchRows(b *testing.B, s *Store, base time.Time, oldRows int) {
+	b.Helper()
+	rawTx := make([]byte, 1024)
+	for i := 0; i < oldRows+10; i++ {
+		at := base.Add(-48*time.Hour + time.Duration(i)*time.Nanosecond)
+		if i >= oldRows {
+			at = base.Add(time.Duration(i-oldRows) * time.Nanosecond)
+		}
+		if _, _, err := s.GetOrInsertStatus(context.Background(), &models.TransactionStatus{
+			TxID: fmt.Sprintf("tx-%05d", i), Status: models.StatusReceived,
+			Timestamp: at, RawTx: rawTx,
+		}); err != nil {
+			b.Fatalf("insert %d: %v", i, err)
+		}
+	}
+}
+
+func BenchmarkIterateStatusesSince_OldHistory(b *testing.B) {
+	for _, oldRows := range []int{1_000, 10_000} {
+		b.Run(fmt.Sprintf("old=%d", oldRows), func(b *testing.B) {
+			s, err := New(config.Pebble{
+				Path:                  b.TempDir(),
+				MemTableSizeMB:        4,
+				L0CompactionThreshold: 2,
+				SyncWrites:            false,
+			})
+			if err != nil {
+				b.Fatalf("open pebble: %v", err)
+			}
+			b.Cleanup(func() { _ = s.Close() })
+			ctx := context.Background()
+			base := time.Unix(1_700_000_000, 0)
+			seedSinceBenchRows(b, s, base, oldRows)
+			since := base.Add(-24 * time.Hour)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				count := 0
+				if err := s.IterateStatusesSince(ctx, since, func(*models.TransactionStatus) error {
+					count++
+					return nil
+				}); err != nil {
+					b.Fatal(err)
+				}
+				if count != 10 {
+					b.Fatalf("rows = %d, want 10", count)
+				}
+			}
+		})
+	}
+}
