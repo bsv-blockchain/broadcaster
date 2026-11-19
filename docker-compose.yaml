@@ -175,7 +175,7 @@ services:
   # RFC1918 and merkle-service's SSRF guard would otherwise reject it. BSV Broadcaster
   # forwards callback_url + callback_token per tx registration.
   merkle-service:
-    image: ${MERKLE_IMAGE:-ghcr.io/bsv-blockchain/merkle-service@sha256:f0576e2038c984d0ca6d585c7c0d073efd2deca6cd9cbf09e95cf51a7e2667d5}
+    image: ${MERKLE_IMAGE:-ghcr.io/bsv-blockchain/merkle-service@sha256:5a71fb5f97e716952b4ed453e38bcde7fd12356297ae503f8e8fd8338b92cdcd}
     environment:
       MODE: all-in-one
       LOG_LEVEL: info
