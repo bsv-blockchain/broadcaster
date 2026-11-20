@@ -177,7 +177,7 @@ Kubernetes manifests for each service live in [`deploy/`](./deploy/):
 - `api-server.yaml`, `tx-validator.yaml`, `propagation.yaml`, `bump-builder.yaml`, `p2p-client.yaml` — one Deployment per service
 - `aerospike.yaml`, `kafka.yaml`, `namespace.yaml` — supporting infra
 
-BSV Broadcaster workload images are `ghcr.io/bsv-blockchain/broadcaster:GIT_SHA`. Replace `GIT_SHA` with the commit SHA published by the build workflow before applying, for example `sed -i "s/GIT_SHA/$(git rev-parse HEAD)/" deploy/*.yaml`.
+BSV Broadcaster workload images default to a published release tag (`ghcr.io/bsv-blockchain/broadcaster:v0.21.7`), so `kubectl apply -f deploy/` works as shipped. To pin a different build, replace the tag with another release tag or with a full commit SHA. The build workflow publishes a SHA tag only for commits on `main` and for `v*` tags, after CI passes; any other commit has no image.
 
 In horizontally-scaled deployments, set `kafka.min_partitions` to at least the replica count of the largest consumer so misconfigured topics surface at startup rather than under live traffic.
 

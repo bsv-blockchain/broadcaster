@@ -3,14 +3,25 @@ package deploy
 import (
 	"io/fs"
 	"os"
+	"regexp"
 	"strings"
 	"testing"
 )
 
 // BSV Broadcaster workload manifests must use the env names Viper actually
-// binds (store.aerospike.* → BSV_BROADCASTER_STORE_AEROSPIKE_*) and the image
-// the build workflow publishes (ghcr.io/bsv-blockchain/broadcaster:<git sha>),
-// not a mutable :latest tag or a foreign GHCR namespace. Issues #92 and #93.
+// binds (store.aerospike.* → BSV_BROADCASTER_STORE_AEROSPIKE_*) and an image
+// tag the build workflow publishes (ghcr.io/bsv-blockchain/broadcaster with a
+// vX.Y.Z release tag or a 40-character commit SHA), so a plain
+// `kubectl apply -f deploy/` pulls. A placeholder tag, the mutable :latest
+// tag, and a foreign GHCR namespace are rejected. Issues #92 and #93.
+var (
+	// workloadImageTag captures the tag of each broadcaster image line.
+	workloadImageTag = regexp.MustCompile(`(?m)^\s*image:\s*ghcr\.io/bsv-blockchain/broadcaster:(\S+)\s*$`)
+	// publishedImageTag matches the immutable tags .github/workflows/build.yml
+	// pushes: a vX.Y.Z release tag or the full commit SHA.
+	publishedImageTag = regexp.MustCompile(`^(v\d+\.\d+\.\d+|[0-9a-f]{40})$`)
+)
+
 func TestBroadcasterWorkloadManifests(t *testing.T) {
 	// DirFS + fs.ReadFile keeps the path inside this package directory.
 	// os.ReadFile on a glob result trips gosec G304 even though the names
@@ -45,11 +56,14 @@ func TestBroadcasterWorkloadManifests(t *testing.T) {
 			!strings.Contains(text, "name: BSV_BROADCASTER_STORE_AEROSPIKE_NAMESPACE") {
 			t.Errorf("%s is missing BSV_BROADCASTER_STORE_AEROSPIKE_HOSTS or BSV_BROADCASTER_STORE_AEROSPIKE_NAMESPACE", name)
 		}
-		if !strings.Contains(text, "image: ghcr.io/bsv-blockchain/broadcaster:") {
+		tags := workloadImageTag.FindAllStringSubmatch(text, -1)
+		if len(tags) == 0 {
 			t.Errorf("%s image is not ghcr.io/bsv-blockchain/broadcaster:<tag>", name)
 		}
-		if strings.Contains(text, "image: ghcr.io/bsv-blockchain/broadcaster:latest") {
-			t.Errorf("%s pins the mutable :latest tag; use the git SHA published by the build workflow", name)
+		for _, m := range tags {
+			if !publishedImageTag.MatchString(m[1]) {
+				t.Errorf("%s image tag %q is not a vX.Y.Z release tag or a 40-character commit SHA; the build workflow publishes no such immutable tag", name, m[1])
+			}
 		}
 	}
 	if workloads < 8 {

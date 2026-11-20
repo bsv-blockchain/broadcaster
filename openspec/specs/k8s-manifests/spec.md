@@ -12,11 +12,11 @@ The project SHALL provide a Kubernetes Deployment manifest for each service mode
 - **THEN** the container SHALL run with args `["--mode", "<service-mode>"]` matching the deployment's service
 
 ### Requirement: Container image specification
-BSV Broadcaster workload Deployments SHALL use the container image `ghcr.io/bsv-blockchain/broadcaster` pinned to the git SHA published by `.github/workflows/build.yml`. The mutable `:latest` tag and the foreign `ghcr.io/galt-tr/arcade-refactor` namespace SHALL NOT be used.
+BSV Broadcaster workload Deployments SHALL use the container image `ghcr.io/bsv-blockchain/broadcaster` with an immutable tag published by `.github/workflows/build.yml`: a `vX.Y.Z` release tag by default, so the manifests apply as shipped. Operators MAY replace it with the full git SHA of a published commit. The mutable `:latest` tag, a placeholder tag, and the foreign `ghcr.io/galt-tr/arcade-refactor` namespace SHALL NOT be used.
 
 #### Scenario: Image reference
 - **WHEN** any BSV Broadcaster workload Deployment manifest is inspected
-- **THEN** the container image SHALL be `ghcr.io/bsv-blockchain/broadcaster:<git sha>` (the manifests ship a `GIT_SHA` placeholder for operators to replace)
+- **THEN** the container image SHALL be `ghcr.io/bsv-blockchain/broadcaster:<tag>`, where `<tag>` is a `vX.Y.Z` release tag or a 40-character git SHA that the build workflow published
 
 ### Requirement: Replica count
 All Deployments SHALL specify exactly 1 replica.

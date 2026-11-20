@@ -26,9 +26,10 @@ spec:
     spec:
       containers:
         - name: bsv-broadcaster
-          # Pin to the git SHA published by .github/workflows/build.yml
-          # (ghcr.io/bsv-blockchain/broadcaster:<sha>). The :latest tag moves.
-          image: ghcr.io/bsv-blockchain/broadcaster:GIT_SHA
+          # Release tag published by .github/workflows/build.yml, so a plain
+          # apply pulls. The :latest tag moves. To pin a commit, use its SHA tag
+          # (main and v* commits only).
+          image: ghcr.io/bsv-blockchain/broadcaster:v0.21.7
           args: ["--mode", "bump-builder"]
           ports:
             - containerPort: 8081
