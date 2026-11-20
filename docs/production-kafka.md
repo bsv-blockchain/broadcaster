@@ -1,11 +1,13 @@
 # Production Kafka topics
 
-BSV Broadcaster does **not** create Kafka topics itself — it relies on broker-side
-auto-creation on first publish, which is typically disabled in production
-clusters. One topic also has a hard correctness constraint (`bsv-broadcaster.propagation`
-must have **at least `propagation.partitions`**) that BSV Broadcaster enforces at startup
-with a fail-closed check. This guide lists every topic an operator needs to
-pre-create, with partition, replication, and retention guidance.
+BSV Broadcaster does **not** create Kafka topics itself. Production clusters
+typically disable auto-creation, and the startup checks fail closed instead of
+letting the broker default decide the width. `bsv-broadcaster.propagation` must
+have **at least `propagation.partitions`**. When `kafka.min_partitions` is
+greater than 1, `bsv-broadcaster.block_processed` and `bsv-broadcaster.tx_status`
+must already exist with at least that many partitions. This guide lists every
+topic an operator needs to pre-create, with partition, replication, and
+retention guidance. Names below use the default `kafka.topic_prefix`.
 
 This guide assumes a production deployment with `kafka.backend: sarama` pointed
 at an external Kafka cluster. Standalone profiles (`kafka.backend: memory`)
@@ -261,17 +263,25 @@ multiple deployments share a Kafka cluster.
 
 ## What BSV Broadcaster checks at startup
 
-- `kafka.CheckMinPartitions(bsv-broadcaster.propagation, propagation.partitions)` — **hard fail** if
+- `kafka.CheckMinPartitions(<prefix>.propagation, propagation.partitions)` — **hard fail** if
   the topic is missing or has fewer partitions than `propagation.partitions`.
-- `kafka.CheckPartitions(...)` — soft warning path used when
-  `kafka.min_partitions > 1`. Existing topics with fewer partitions cause a
-  startup error; missing topics only log a warning ("will be auto-created
-  on first publish").
+- `kafka.CheckPartitions(<prefix>.block_processed, <prefix>.tx_status)` — when
+  `kafka.min_partitions > 1`, a missing topic or one with fewer partitions is a
+  **hard fail**. The metadata probe sets Sarama `AllowAutoTopicCreation` to
+  false, so the check does not create the topic on a broker that would
+  otherwise auto-create it at the default width. Values of 0 or 1 skip this
+  check (standalone / single replica). The in-memory broker never reports a
+  topic as missing; unknown topics there report their configured width
+  (default 1) and fail the floor when it is greater than 1.
 
-This means a forgotten `bsv-broadcaster.propagation` will fail loudly, but a
-forgotten `bsv-broadcaster.block_processed` will silently auto-create with the
-broker's default partition count on first publish. If your broker has
-`auto.create.topics.enable=false` (recommended for production), forgotten
-topics will instead surface as produce errors at first traffic. Either way,
-pre-creating every topic in the table above is the only way to be sure
-partition counts match your deployment.
+`<prefix>` is `kafka.topic_prefix` (default `bsv-broadcaster`). A forgotten
+propagation, block_processed, or tx_status topic fails startup when its check
+runs. `min_partitions` of 0 or 1 does not inspect block_processed or tx_status,
+so a forgotten fan-out topic can still auto-create on first publish in a
+single-replica deployment. If the broker has `auto.create.topics.enable=false`
+(recommended for production), that surfaces as a produce error at first
+traffic. Pre-create every topic in the table above so partition counts match
+the deployment. `min_partitions` is one floor for both fan-out topics: set it
+to the larger of the bump-builder replica count and the SSE/webhook fan-out,
+and create both topics at least that wide. Propagation uses
+`propagation.partitions` instead, and the DLQs stay at one partition.

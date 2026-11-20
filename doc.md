@@ -120,7 +120,7 @@ Notable knobs:
 | `mode`                                   | Service to run: `all`, `api-server`, `tx-validator`, `propagation`, `bump-builder`, `p2p-client`         |
 | `network`                                | `mainnet` / `testnet` / `teratestnet`. Drives p2p topics and chaintracks bootstrap peers.                |
 | `storage_path`                           | Shared on-disk root for Pebble, chaintracks headers, libp2p key cache.                                   |
-| `kafka.min_partitions`                   | Fail-fast guard. Set to the largest consumer's replica count in K8s; leave 0/1 standalone.               |
+| `kafka.min_partitions`                   | When > 1, startup fails if `block_processed` or `tx_status` is missing or narrower. Leave 0/1 standalone. |
 | `propagation.endpoint_health.*`          | Circuit-breaker thresholds and probe cadence for the datahub fleet.                                      |
 | `bump_builder.grace_window_ms`           | Delay after `BLOCK_PROCESSED` before reading STUMPs, so late merkle-service retries can land first.      |
 | `tx_validator.parallelism`               | Concurrent in-flight validations per flush window; defaults to `runtime.NumCPU()`.                       |
@@ -177,7 +177,7 @@ Kubernetes manifests for each service live in [`deploy/`](./deploy/):
 - `api-server.yaml`, `tx-validator.yaml`, `propagation.yaml`, `bump-builder.yaml`, `p2p-client.yaml` — one Deployment per service
 - `aerospike.yaml`, `kafka.yaml`, `namespace.yaml` — supporting infra
 
-In horizontally-scaled deployments, set `kafka.min_partitions` to at least the replica count of the largest consumer so misconfigured topics surface at startup rather than under live traffic.
+In horizontally-scaled deployments, set `kafka.min_partitions` to at least the replica count of the largest bump-builder or SSE/webhook consumer. Startup then fails if `block_processed` or `tx_status` is missing or has fewer partitions. Leave it at 0 or 1 for standalone and single-replica deployments. `propagation` is checked separately via `propagation.partitions`.
 
 ## Repository layout
 
