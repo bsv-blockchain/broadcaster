@@ -51,13 +51,15 @@ const batchSpanMaxLinks = 128
 
 type propagationMsg struct {
 	TXID string `json:"txid"`
-	// RawTx is the serialized transaction as raw bytes. encoding/json encodes
-	// []byte as base64 — still smaller than hex (4/3 expansion vs 2x) and
-	// avoids the per-hop hex encode/decode the pipeline used to do.
-	RawTx []byte `json:"raw_tx"`
-	// InputTXIDs lists the txids this tx spends from. Populated at intake
-	// so the propagator can decide eligibility without re-parsing the raw
-	// bytes. Empty means coinbase or no in-flight parents.
+	// RawTx is the serialized transaction. Intake no longer publishes it
+	// (#329): the Kafka message carries the txid only and hydrate loads the
+	// bytes from the store row. The json tag stays so a message from a
+	// pre-#329 producer, which carries raw_tx inline (base64), still decodes
+	// and skips the store read.
+	RawTx []byte `json:"raw_tx,omitempty"`
+	// InputTXIDs lists the txids this tx spends from, for the dispatcher's
+	// dep-aware admission. hydrate derives it from RawTx; pre-#329 messages
+	// carry it inline. Empty means coinbase or no parents.
 	InputTXIDs []string `json:"input_txids,omitempty"`
 	// spanCtx is the trace context extracted from the Kafka producer's
 	// message headers at decode/admit time (see runDispatcher and
@@ -795,12 +797,14 @@ func cascadeReason(status models.Status, ancestor string) string {
 // parentTxIDsOf returns msg's parent txids: InputTXIDs when the intake
 // envelope populated them, else parsed from the raw bytes (reaper
 // rebroadcast rows carry no InputTXIDs). Unparseable bytes yield nil —
-// the caller then just requeues/parks, which is always safe.
+// the caller then just requeues/parks, which is always safe. Parsed as a
+// stream, as intake parses it: the stored bytes are the request body, and an
+// exact-length parse would read trailing bytes after the tx as no parents.
 func parentTxIDsOf(msg propagationMsg) []string {
 	if len(msg.InputTXIDs) > 0 {
 		return msg.InputTXIDs
 	}
-	tx, err := sdkTx.NewTransactionFromBytes(msg.RawTx)
+	tx, _, err := sdkTx.NewTransactionFromStream(msg.RawTx)
 	if err != nil || tx == nil {
 		return nil
 	}
@@ -1319,9 +1323,17 @@ func (p *Propagator) handleMessage(ctx context.Context, msg *kafka.Message) erro
 		return fmt.Errorf("unmarshaling propagation message: %w", err)
 	}
 
-	if len(propMsg.RawTx) == 0 {
-		return fmt.Errorf("propagation message has empty raw_tx")
+	// Same hydration as the claim path (hydrateClaim), inline: this runs on
+	// the caller's goroutine, not the dispatcher's.
+	one := []propagationMsg{propMsg}
+	drops, err := p.hydrate(ctx, one, nil)
+	if err != nil {
+		return fmt.Errorf("loading raw tx for %s: %w", propMsg.TXID, err)
 	}
+	if drops[0] != "" {
+		return fmt.Errorf("propagation message for %q not propagatable: %s", propMsg.TXID, drops[0])
+	}
+	propMsg = one[0]
 
 	// See runDispatcher's claim branch for the production decode path; this
 	// mirrors it so the two decode sites behave identically — including the
@@ -1704,7 +1716,7 @@ const outpointOwnerAmbiguous = -1
 func buildSubmittedOutpointIndex(batch []propagationMsg) map[string]int {
 	owners := make(map[string]int, len(batch))
 	for i, msg := range batch {
-		tx, err := sdkTx.NewTransactionFromBytes(msg.RawTx)
+		tx, _, err := sdkTx.NewTransactionFromStream(msg.RawTx)
 		if err != nil || tx == nil {
 			continue
 		}

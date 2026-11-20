@@ -1,0 +1,800 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+@custom-variant dark (&:is(.dark *));
+
+/*
+ * Design tokens and shared styles copied from bsvblockchain.org
+ * (BSVBlockchain-org/app/globals.css) so this site carries the same fonts,
+ * palette and light/dark themes. Edit there first, then copy across.
+ */
+/*
+ * BSV Blockchain design tokens.
+ *
+ * Source palette (converted once, here; hex never appears in app code):
+ *   Blue       #003FFF  oklch(0.51  0.28  264)   primary action
+ *   Cyan       #00E6FF  oklch(0.86  0.135 208)   highlight, gradients, data
+ *   Navy       #1B1EA9  oklch(0.33  0.19  268)   depth, dark surfaces
+ *   Soft Black #2D2D31  oklch(0.27  0.004 286)   ink
+ *   Cotton     #F4F2F0  oklch(0.963 0.0035 84)   page foundation
+ *   Gold       #FFAF00  oklch(0.8   0.17  75)    badges, verified accents
+ *
+ * The palette matches bsvassociation.org and the Vela wallet prototype, so a
+ * component moved between the three carries its colour with it.
+ */
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+
+  --font-sans: var(--font-body);
+  --font-mono: var(--font-mono-face);
+  --font-display: var(--font-display-face);
+
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+
+  /* brand */
+  --color-brand-blue: var(--brand-blue);
+  --color-brand-cyan: var(--brand-cyan);
+  --color-brand-navy: var(--brand-navy);
+  --color-brand-gold: var(--brand-gold);
+  --color-brand-gold-ink: var(--brand-gold-ink);
+
+  /* surfaces */
+  --color-surface: var(--surface);
+  --color-surface-raised: var(--surface-raised);
+  --color-ink: var(--ink);
+  --color-ink-muted: var(--ink-muted);
+
+  /* semantic */
+  --color-success: var(--success);
+
+  /* Shared with the BSV Faucet (bsvblockchainDOTcomSLASHfaucet app/globals.css), the same product
+     family: status tints, the always-dark code terminal, and sRGB primary tints. */
+  --color-pos: var(--success);
+  --color-pos-bg: var(--pos-bg);
+  --color-neg: var(--destructive);
+  --color-neg-bg: var(--neg-bg);
+  --color-code-bg: var(--code-bg);
+  --color-code-fg: var(--code-fg);
+  --color-code-dim: var(--code-dim);
+  --color-info-bg: var(--info-bg);
+  --color-info-bd: var(--info-bd);
+  --color-primary-edge: var(--primary-edge);
+  --color-warning: var(--warning);
+
+  /* evidence categories — Proven / In pilot / Roadmap */
+  --color-proven: var(--proven);
+  --color-pilot: var(--pilot);
+  --color-roadmap: var(--roadmap);
+
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 16px;
+  --radius-xl: 24px;
+  --radius-2xl: 32px;
+
+  /* DESIGN.md spacing scale */
+  --spacing-gutter: 24px;
+  --spacing-section: 96px;
+
+  --breakpoint-xs: 420px;
+}
+
+:root {
+  /* brand constants — identical in both themes */
+  --brand-blue: oklch(0.51 0.28 264);
+  --brand-cyan: oklch(0.86 0.135 208);
+  --brand-navy: oklch(0.33 0.19 268);
+  --brand-gold: oklch(0.8 0.17 75);
+  --brand-gold-ink: oklch(0.56 0.125 70); /* gold legible as text on light */
+
+  /* light theme — Cotton page, Soft Black ink */
+  --background: oklch(0.963 0.0035 84);
+  --foreground: oklch(0.27 0.004 286);
+  --ink: oklch(0.27 0.004 286);
+  --ink-muted: oklch(0.5 0.008 286);
+
+  --surface: oklch(0.94 0.004 84); /* inset panels, tracks */
+  --surface-raised: oklch(1 0 0); /* cards lift off Cotton */
+
+  /* Code panels follow the theme. Light: an inset Cotton panel with ink text and
+     bsvblockchain.org's light code palette (numbers teal rather than orange, as on the
+     BSV Faucet). Dark: the faucet's deep navy terminal, set in .dark below. */
+  --code-bg: var(--surface);
+  --code-bd: var(--border);
+  --code-fg: var(--ink);
+  --code-dim: var(--ink-muted);
+  --code-hover: oklch(0.27 0.004 286 / 6%);
+  --code-furniture: oklch(0.27 0.004 286 / 18%);
+  --code-keyword: oklch(0.48 0.16 268);
+  --code-type: oklch(0.5 0.1 232);
+  --code-string: oklch(0.48 0.11 155);
+  --code-number: oklch(0.5 0.1 185);
+  --code-meta: oklch(0.52 0.12 328);
+
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.27 0.004 286);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.27 0.004 286);
+
+  --primary: oklch(0.51 0.28 264);
+  --primary-foreground: oklch(0.99 0 0);
+  --primary-hover: oklch(0.45 0.26 264);
+
+  --secondary: oklch(0.928 0.004 84);
+  --secondary-foreground: oklch(0.28 0.004 286);
+  --muted: oklch(0.934 0.004 84);
+  --muted-foreground: oklch(0.5 0.008 286);
+  --accent: oklch(0.928 0.004 84);
+  --accent-foreground: oklch(0.28 0.004 286);
+
+  --destructive: oklch(0.577 0.215 27);
+  --success: oklch(0.52 0.11 158);
+  --warning: oklch(0.62 0.14 62);
+
+  --proven: oklch(0.52 0.11 158);
+  --pilot: oklch(0.56 0.125 70);
+  --roadmap: oklch(0.5 0.008 286);
+
+  --border: oklch(0.902 0.005 84);
+  --input: oklch(0.902 0.005 84);
+  --ring: oklch(0.51 0.28 264);
+
+  --radius: 10px;
+
+  /* Primary tints from the in-gamut sRGB blue (#003FFF). --primary itself sits just past sRGB's
+     blue limit, and a translucent mix of it is drawn with a yellow fringe on borders in Chrome. */
+  --primary-rgb: 0 63 255;
+  --info-bg: rgb(var(--primary-rgb) / 0.1);
+  --info-bd: rgb(var(--primary-rgb) / 0.22);
+  --primary-edge: rgb(var(--primary-rgb) / 0.45);
+
+  /* status tints */
+  --pos-bg: color-mix(in oklch, var(--success) 10%, transparent);
+  --neg-bg: color-mix(in oklch, var(--destructive) 9%, transparent);
+}
+
+/* Dark is a remap toward Navy, never an inversion, never pure black. */
+.dark {
+  --brand-gold-ink: oklch(0.8 0.17 75);
+
+  --background: oklch(0.17 0.028 272);
+  --foreground: oklch(0.955 0.004 84);
+  --ink: oklch(0.955 0.004 84);
+  --ink-muted: oklch(0.7 0.014 272);
+
+  --surface: oklch(0.215 0.032 270);
+  --surface-raised: oklch(0.245 0.036 270);
+
+
+  --card: oklch(0.215 0.032 270);
+  --card-foreground: oklch(0.955 0.004 84);
+  --popover: oklch(0.245 0.036 270);
+  --popover-foreground: oklch(0.955 0.004 84);
+
+  --primary: oklch(0.64 0.215 262);
+  --primary-foreground: oklch(0.99 0 0);
+  --primary-hover: oklch(0.7 0.19 258);
+
+  --secondary: oklch(0.275 0.034 270);
+  --secondary-foreground: oklch(0.955 0.004 84);
+  --muted: oklch(0.265 0.032 270);
+  --muted-foreground: oklch(0.7 0.014 272);
+  --accent: oklch(0.275 0.034 270);
+  --accent-foreground: oklch(0.955 0.004 84);
+
+  --destructive: oklch(0.68 0.19 25);
+  --success: oklch(0.72 0.14 158);
+  --warning: oklch(0.8 0.17 75);
+
+  --proven: oklch(0.72 0.14 158);
+  --pilot: oklch(0.8 0.17 75);
+  --roadmap: oklch(0.7 0.014 272);
+
+  --border: oklch(1 0 0 / 11%);
+  --input: oklch(1 0 0 / 15%);
+  --ring: oklch(0.64 0.215 262);
+
+  --primary-rgb: 61 128 255; /* the dark primary, clamped to sRGB */
+
+  /* The BSV Faucet's terminal: deep navy, white hairline, lifted syntax hues. */
+  --code-bg: oklch(0.19 0.03 270);
+  --code-bd: oklch(1 0 0 / 10%);
+  --code-fg: oklch(1 0 0 / 82%);
+  --code-dim: oklch(1 0 0 / 45%);
+  --code-hover: oklch(1 0 0 / 10%);
+  --code-furniture: oklch(1 0 0 / 20%);
+  --code-keyword: oklch(0.76 0.13 272);
+  --code-type: oklch(0.79 0.09 218);
+  --code-string: oklch(0.79 0.12 155);
+  --code-number: oklch(0.8 0.1 185);
+  --code-meta: oklch(0.78 0.11 328);
+  --pos-bg: color-mix(in oklch, var(--success) 13%, transparent);
+  --neg-bg: color-mix(in oklch, var(--destructive) 13%, transparent);
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  html {
+    -webkit-text-size-adjust: 100%;
+    scroll-behavior: smooth;
+  }
+
+  body {
+    @apply bg-background text-foreground font-sans antialiased;
+    font-synthesis-weight: none;
+  }
+
+  /* The display face carries every display level; body copy stays on the body face. */
+  h1,
+  h2,
+  h3 {
+    font-family: var(--font-display);
+    font-weight: 600;
+    letter-spacing: -0.02em;
+    text-wrap: balance;
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--ring);
+    outline-offset: 2px;
+  }
+
+  ::selection {
+    background: color-mix(in oklch, var(--brand-cyan) 55%, transparent);
+    color: var(--ink);
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    html {
+      scroll-behavior: auto;
+    }
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
+}
+
+/* ── Type ramp (DESIGN.md) ────────────────────────────────────
+   Display levels are fluid; body and label levels are fixed at
+   every viewport, because reading size is chosen for legibility,
+   not for filling space. */
+
+@utility display-xl {
+  font-family: var(--font-display);
+  font-size: clamp(2.5rem, 1.4rem + 4.6vw, 5rem);
+  font-weight: 600;
+  line-height: 1.02;
+  letter-spacing: -0.032em;
+  text-wrap: balance;
+}
+
+@utility display-lg {
+  font-family: var(--font-display);
+  font-size: clamp(2rem, 1.3rem + 2.9vw, 3.5rem);
+  font-weight: 600;
+  line-height: 1.06;
+  letter-spacing: -0.028em;
+  text-wrap: balance;
+}
+
+@utility headline-lg {
+  font-family: var(--font-display);
+  font-size: clamp(1.75rem, 1.35rem + 1.6vw, 2.5rem);
+  font-weight: 600;
+  line-height: 1.12;
+  letter-spacing: -0.022em;
+  text-wrap: balance;
+}
+
+@utility headline-md {
+  font-family: var(--font-display);
+  font-size: clamp(1.25rem, 1.06rem + 0.75vw, 1.625rem);
+  font-weight: 600;
+  line-height: 1.22;
+  letter-spacing: -0.014em;
+  text-wrap: balance;
+}
+
+@utility headline-sm {
+  font-size: 1.125rem;
+  font-weight: 600;
+  line-height: 1.35;
+  text-wrap: balance;
+}
+
+@utility body-lg {
+  font-size: 1.125rem;
+  line-height: 1.62;
+  text-wrap: pretty;
+}
+
+@utility body-md {
+  font-size: 1rem;
+  line-height: 1.6;
+  text-wrap: pretty;
+}
+
+@utility label-sm {
+  font-size: 0.75rem;
+  font-weight: 500;
+  line-height: 1.2;
+  letter-spacing: 0.06em;
+}
+
+/* tabular figures for every number that a reader might compare */
+@utility tnum {
+  font-variant-numeric: tabular-nums lining-nums;
+}
+
+@utility no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+  &::-webkit-scrollbar {
+    display: none;
+  }
+}
+
+/* Elevation: two levels only (DESIGN.md). Dark mode uses lighter
+   surface tones instead of shadow. */
+@utility shadow-raised {
+  box-shadow:
+    0 1px 3px rgb(0 0 0 / 0.06),
+    0 4px 12px rgb(0 0 0 / 0.05);
+}
+
+@utility shadow-overlay {
+  box-shadow: 0 8px 30px rgb(0 0 0 / 0.12);
+}
+
+/* The page container: one width, one gutter, everywhere. */
+@utility container-page {
+  width: 100%;
+  max-width: 1240px;
+  margin-inline: auto;
+  padding-inline: 1rem;
+  @media (width >= 48rem) {
+    padding-inline: 1.5rem;
+  }
+}
+
+/* Section rhythm halves on mobile so whitespace and type shrink together. */
+@utility section-y {
+  padding-block: 3rem;
+  @media (width >= 48rem) {
+    padding-block: 6rem;
+  }
+}
+
+/* Hairline rule used to separate data rows without a heavy border. */
+@utility rule {
+  border-block-end: 1px solid var(--border);
+}
+
+/* ── Buttons ──────────────────────────────────────────────────
+   Layered rather than flat: a vertical gradient for form, an inset
+   top sheen, and a soft shadow beneath. On top of that sits a
+   highlight that follows the pointer.
+
+   The highlight lives on a pseudo-element that is fully transparent
+   at rest, so a page of these costs nothing until one is touched;
+   only the pseudo-element repaints while a pointer is over it. Its
+   position comes from --pointer-x / --pointer-y, set by a single
+   delegated listener (see components/pointer-glow.tsx), which is
+   also why this works under a finger: pointer events cover touch,
+   and a tap positions the highlight where the tap landed.
+
+   This is the one place the transform-and-opacity rule is bent. It
+   is bent knowingly: the repaint is scoped to a 44px-tall element,
+   rAF-throttled, and switched off entirely under reduced motion. */
+.btn-surface {
+  position: relative;
+  isolation: isolate;
+  transition:
+    box-shadow 200ms var(--ease-out, cubic-bezier(0.16, 1, 0.3, 1)),
+    filter 200ms var(--ease-out, cubic-bezier(0.16, 1, 0.3, 1)),
+    transform 150ms var(--ease-out, cubic-bezier(0.16, 1, 0.3, 1));
+}
+
+.btn-surface::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  z-index: -1;
+  opacity: 0;
+  transition: opacity 220ms cubic-bezier(0.16, 1, 0.3, 1);
+  background: radial-gradient(
+    7rem circle at var(--pointer-x, 50%) var(--pointer-y, 50%),
+    var(--btn-glow, rgb(255 255 255 / 0.3)) 0%,
+    transparent 68%
+  );
+}
+
+/* A finger has no hover, so the highlight arrives on press instead. */
+.btn-surface:hover::before,
+.btn-surface:focus-visible::before,
+.btn-surface:active::before {
+  opacity: 1;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .btn-surface::before {
+    display: none;
+  }
+}
+
+/* Cards get the same pointer highlight, dialled well down. A button is a
+   target and can afford to announce itself; a card is a surface a reader is
+   scanning, so the effect has to be felt rather than noticed. It only appears
+   on hover, so a touch device never gets a highlight stuck on a card the
+   reader merely scrolled past. */
+.card-surface {
+  position: relative;
+  isolation: isolate;
+}
+
+.card-surface::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  z-index: 0;
+  opacity: 0;
+  transition: opacity 260ms cubic-bezier(0.16, 1, 0.3, 1);
+  background:
+    radial-gradient(
+      16rem circle at var(--pointer-x, 50%) var(--pointer-y, 50%),
+      color-mix(in oklch, var(--primary) 7%, transparent) 0%,
+      transparent 62%
+    ),
+    radial-gradient(
+      22rem circle at var(--pointer-x, 50%) var(--pointer-y, 50%),
+      color-mix(in oklch, var(--card-glow-accent, var(--brand-cyan)) 5%, transparent) 0%,
+      transparent 70%
+    );
+}
+
+/* Content has to sit above the wash, or the wash sits on top of the text. */
+.card-surface > * {
+  position: relative;
+  z-index: 1;
+}
+
+@media (hover: hover) {
+  .card-surface:hover::before {
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .card-surface::before {
+    display: none;
+  }
+}
+
+/* Primary: brand blue with depth toward navy at the base. */
+.btn-primary-surface {
+  background-image: linear-gradient(
+    180deg,
+    color-mix(in oklch, var(--primary), white 15%) 0%,
+    var(--primary) 46%,
+    color-mix(in oklch, var(--primary), var(--brand-navy) 48%) 100%
+  );
+  box-shadow:
+    inset 0 1px 0 rgb(255 255 255 / 0.26),
+    inset 0 -1px 1px rgb(10 14 80 / 0.28),
+    0 1px 2px rgb(10 14 60 / 0.16),
+    0 8px 20px -10px color-mix(in oklch, var(--brand-navy) 55%, transparent);
+}
+
+.btn-primary-surface:hover:not(:disabled) {
+  filter: brightness(1.06) saturate(1.02);
+  box-shadow:
+    inset 0 1px 0 rgb(255 255 255 / 0.34),
+    inset 0 -1px 1px rgb(10 14 80 / 0.28),
+    0 1px 2px rgb(10 14 60 / 0.18),
+    0 12px 26px -10px color-mix(in oklch, var(--brand-navy) 65%, transparent);
+}
+
+/* Secondary: paper with a hairline, lifting slightly on approach. */
+.btn-secondary-surface {
+  --btn-glow: color-mix(in oklch, var(--primary) 14%, transparent);
+  background-image: linear-gradient(
+    180deg,
+    var(--surface-raised) 0%,
+    color-mix(in oklch, var(--surface-raised), var(--ink) 5%) 100%
+  );
+  box-shadow:
+    inset 0 1px 0 rgb(255 255 255 / 0.7),
+    0 1px 2px rgb(20 24 40 / 0.06),
+    0 6px 16px -10px rgb(20 24 40 / 0.16);
+}
+
+.dark .btn-secondary-surface {
+  box-shadow:
+    inset 0 1px 0 rgb(255 255 255 / 0.09),
+    0 1px 2px rgb(0 0 0 / 0.3),
+    0 6px 16px -10px rgb(0 0 0 / 0.5);
+}
+
+.btn-secondary-surface:hover:not(:disabled) {
+  box-shadow:
+    inset 0 1px 0 rgb(255 255 255 / 0.8),
+    0 1px 2px rgb(20 24 40 / 0.08),
+    0 10px 22px -10px rgb(20 24 40 / 0.22);
+}
+
+/* On Navy or imagery, where the page palette inverts. */
+.btn-on-dark-surface {
+  --btn-glow: color-mix(in oklch, var(--brand-cyan) 30%, transparent);
+  background-image: linear-gradient(
+    180deg,
+    #ffffff 0%,
+    color-mix(in oklch, white, var(--brand-navy) 7%) 100%
+  );
+  box-shadow:
+    inset 0 -1px 1px rgb(10 14 80 / 0.12),
+    0 2px 4px rgb(0 0 0 / 0.16),
+    0 10px 24px -12px rgb(0 0 0 / 0.4);
+}
+
+.btn-on-dark-surface:hover:not(:disabled) {
+  box-shadow:
+    inset 0 -1px 1px rgb(10 14 80 / 0.12),
+    0 2px 4px rgb(0 0 0 / 0.2),
+    0 14px 30px -12px rgb(0 0 0 / 0.5);
+}
+
+/* ---------------------------------------------------------------------------
+ * The wordmark's two halves.
+ *
+ * "BSV" is #1B1EA9 and "BLOCKCHAIN" is #003FFF in the official artwork, which
+ * are this site's navy and blue to three decimal places. Naming them here
+ * rather than hardcoding the hex means the mark can invert on a dark panel by
+ * setting two properties, and the /dpp scope — which remaps --primary to ink
+ * so the only saturated colour on the page is the visitor's own — takes the
+ * logo with it instead of leaving one blue island behind.
+ * ------------------------------------------------------------------------ */
+.logo-tint {
+  --logo-bsv: var(--brand-navy);
+  --logo-blockchain: var(--brand-blue);
+}
+
+/* Navy on navy is unreadable, so on a dark surface both halves go to the
+   surrounding text colour and the lockup reads as one piece. */
+.dark .logo-tint,
+.on-dark .logo-tint {
+  --logo-bsv: currentColor;
+  --logo-blockchain: currentColor;
+}
+
+.logo-cube {
+  --cube-size: 1.75rem;
+  display: inline-block;
+  width: var(--cube-size);
+  height: var(--cube-size);
+  perspective: 8rem;
+}
+
+.logo-cube-box {
+  position: relative;
+  display: block;
+  width: 100%;
+  height: 100%;
+  transform-style: preserve-3d;
+}
+
+.logo-cube-face {
+  position: absolute;
+  inset: 0;
+  border-radius: 2px;
+  background-image: url("/images/bsv-mark.svg");
+  background-size: cover;
+  backface-visibility: hidden;
+}
+
+.logo-cube-front {
+  transform: translateZ(calc(var(--cube-size) / 2));
+}
+/* Flipped on X, not on Y, which is what a cube is usually built with. The turn
+   is an X turn, and a Y-flipped back face arrives at the halfway point upside
+   down — four letters standing on their heads for a fifth of a second is
+   exactly the sort of thing a reader notices without being able to say why. */
+.logo-cube-back {
+  transform: rotateX(180deg) translateZ(calc(var(--cube-size) / 2));
+}
+.logo-cube-right {
+  transform: rotateY(90deg) translateZ(calc(var(--cube-size) / 2));
+  filter: brightness(0.86);
+}
+.logo-cube-left {
+  transform: rotateY(-90deg) translateZ(calc(var(--cube-size) / 2));
+  filter: brightness(0.86);
+}
+.logo-cube-top {
+  transform: rotateX(90deg) translateZ(calc(var(--cube-size) / 2));
+  filter: brightness(1.18);
+}
+.logo-cube-bottom {
+  transform: rotateX(-90deg) translateZ(calc(var(--cube-size) / 2));
+  filter: brightness(0.72);
+}
+
+@keyframes logo-cube-turn {
+  from {
+    transform: rotateX(0deg);
+  }
+  to {
+    transform: rotateX(-360deg);
+  }
+}
+
+/* The logo is always inside its home link, in the header and in the footer,
+   so the turn is keyed on that rather than on the cube itself: hovering the
+   wordmark should turn the block too. */
+@media (hover: hover) {
+  a:hover .logo-cube-box,
+  a:focus-visible .logo-cube-box {
+    animation: logo-cube-turn 900ms cubic-bezier(0.33, 0, 0.15, 1);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  a:hover .logo-cube-box,
+  a:focus-visible .logo-cube-box {
+    animation: none;
+  }
+}
+
+/* ---------------------------------------------------------------------------
+   Hero glow
+
+   The blue wash behind a text-only page header. Geometry and blur live here
+   rather than in `components/hero-glow.tsx` because the whole point is that it
+   is not a shape: the blur radius and the mask are what turn a raymarched orb
+   into weather, and they are the numbers most likely to be tuned.
+
+   It begins 4rem above its section, which is the header's height, so the
+   colour is behind the nav rather than starting under it. It ends 8rem below,
+   so it passes behind the top of the stat cards instead of stopping on a line.
+
+   It is the full width of the header rather than a cloud in the right-hand
+   gutter. A shape occupying a third of a section is an object sitting in the
+   corner of it; a field crossing the whole width, weighted right and falling
+   off long before it reaches the first character of the headline, is lighting.
+   The way to keep that subtle is area, not opacity: the wider it went, the
+   further down the alpha came.
+   --------------------------------------------------------------------------- */
+.hero-glow {
+  /* Deliberately no z-index. A stacking context here would isolate the blend
+     group, and `mix-blend-mode` on the layer inside would then have nothing to
+     blend with. The content sits above it on `relative z-10` instead. */
+  width: 100%;
+  height: 52rem;
+  /* Every edge fades, and the plateau in the middle is what stops a field this
+     wide reading as a ball. An ellipse rather than a circle: the section it
+     lights is twice as wide as it is tall. */
+  -webkit-mask-image: radial-gradient(78% 66% at 68% 34%, #000 0%, #000 26%, transparent 82%);
+  mask-image: radial-gradient(78% 66% at 68% 34%, #000 0%, #000 26%, transparent 82%);
+}
+
+.hero-glow-inner {
+  position: absolute;
+  inset: 0;
+  filter: blur(72px) saturate(1.2);
+  /* The blob is a lit solid, so most of its surface is darker than the page it
+     sits on. Multiplied onto a light page it tints; screened onto a dark one it
+     adds light. Straight alpha on either one reads as dirt. */
+  mix-blend-mode: multiply;
+  opacity: 0.2;
+}
+
+.dark .hero-glow-inner {
+  mix-blend-mode: screen;
+  opacity: 0.38;
+}
+
+/* Taller, for a hero whose whole job is to introduce the thing immediately
+   below it. The mask moves up with the height so the bright part stays over
+   the headline rather than drifting down into the content. */
+.hero-glow-tall {
+  height: 78rem;
+  -webkit-mask-image: radial-gradient(78% 52% at 68% 22%, #000 0%, #000 20%, transparent 78%);
+  mask-image: radial-gradient(78% 52% at 68% 22%, #000 0%, #000 20%, transparent 78%);
+}
+
+@media (max-width: 767px) {
+  .hero-glow-tall {
+    height: 44rem;
+    -webkit-mask-image: radial-gradient(96% 48% at 72% 16%, #000 0%, #000 16%, transparent 80%);
+    mask-image: radial-gradient(96% 48% at 72% 16%, #000 0%, #000 16%, transparent 80%);
+  }
+}
+
+/* No WebGL, or a motion preference, or the frame before hydration. Same
+   colours, same corner, painted rather than marched. */
+.hero-glow:not([data-live])::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background:
+    radial-gradient(
+      58% 56% at 70% 34%,
+      color-mix(in oklch, var(--primary) 22%, transparent) 0%,
+      transparent 74%
+    ),
+    radial-gradient(
+      46% 46% at 40% 52%,
+      color-mix(in oklch, var(--primary) 12%, transparent) 0%,
+      transparent 76%
+    );
+}
+
+.dark .hero-glow:not([data-live])::before {
+  background:
+    radial-gradient(
+      58% 56% at 70% 34%,
+      color-mix(in oklch, var(--primary) 34%, transparent) 0%,
+      transparent 74%
+    ),
+    radial-gradient(
+      46% 46% at 40% 52%,
+      color-mix(in oklch, var(--primary) 18%, transparent) 0%,
+      transparent 76%
+    );
+}
+
+/* On a phone there is no empty gutter to sit in, so it becomes a tint in the
+   top corner above the headline rather than a cloud behind it. */
+@media (max-width: 767px) {
+  .hero-glow {
+    height: 30rem;
+    -webkit-mask-image: radial-gradient(96% 62% at 72% 26%, #000 0%, #000 20%, transparent 80%);
+    mask-image: radial-gradient(96% 62% at 72% 26%, #000 0%, #000 20%, transparent 80%);
+  }
+
+  .hero-glow-inner {
+    filter: blur(52px) saturate(1.2);
+    opacity: 0.18;
+  }
+
+  .dark .hero-glow-inner {
+    opacity: 0.34;
+  }
+}
+
+/* Thin scrollbars inside code blocks (BSV Faucet). */
+.scrollbar-faint::-webkit-scrollbar {
+  height: 8px;
+  width: 8px;
+}
+.scrollbar-faint::-webkit-scrollbar-thumb {
+  background: var(--code-bd);
+  border-radius: 9999px;
+}

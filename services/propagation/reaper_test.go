@@ -60,12 +60,15 @@ func TestReapOnce_RebroadcastsStaleReceived(t *testing.T) {
 // TestReapOnce_ReceivedSelection pins which rows the RECEIVED arm picks up:
 // only rows past staleReceivedAge that still carry RawTx. Recent rows (still in
 // the normal intake/requeue path), body-less rows, and terminal rows are left
-// alone. The stale SEEN_ON_NETWORK row is a regression guard that the original
-// rebroadcast behavior is unchanged.
+// alone, and so is a row older than staleScanLookback that a backend ignoring
+// since (Aerospike, and this mock) still returns. The stale SEEN_ON_NETWORK
+// row is a regression guard that the original rebroadcast behavior is
+// unchanged.
 func TestReapOnce_ReceivedSelection(t *testing.T) {
 	now := time.Now()
 	stale := now.Add(-2 * time.Hour)    // > staleReceivedAge, < staleScanLookback
 	recent := now.Add(-1 * time.Minute) // < staleReceivedAge
+	ancient := now.Add(-staleScanLookback - time.Hour)
 
 	log := &eventLog{}
 	ms := newMockStore()
@@ -74,8 +77,10 @@ func TestReapOnce_ReceivedSelection(t *testing.T) {
 		{TxID: "recv-recent", Status: models.StatusReceived, RawTx: []byte{0x02}, Timestamp: recent},
 		{TxID: "recv-nobody", Status: models.StatusReceived, Timestamp: stale}, // no RawTx → skip
 		{TxID: "seen-stale", Status: models.StatusSeenOnNetwork, RawTx: []byte{0x03}, Timestamp: stale},
-		{TxID: "mined-old", Status: models.StatusMined, RawTx: []byte{0x04}, Timestamp: stale}, // terminal → skip
+		{TxID: "mined-old", Status: models.StatusMined, RawTx: []byte{0x04}, Timestamp: stale},         // terminal → skip
+		{TxID: "recv-ancient", Status: models.StatusReceived, RawTx: []byte{0x05}, Timestamp: ancient}, // outside lookback → skip
 	}
+	ms.ignoreSince = true
 
 	merkleSrv := newMerkleServer(log, http.StatusOK)
 	defer merkleSrv.Close()
@@ -87,11 +92,12 @@ func TestReapOnce_ReceivedSelection(t *testing.T) {
 	p.reapOnce(context.Background())
 
 	want := map[string]int{
-		"register:recv-stale":  1, // stale RECEIVED with body → rebroadcast
-		"register:seen-stale":  1, // stale SEEN with body → rebroadcast (unchanged)
-		"register:recv-recent": 0, // too recent
-		"register:recv-nobody": 0, // no RawTx
-		"register:mined-old":   0, // terminal
+		"register:recv-stale":   1, // stale RECEIVED with body → rebroadcast
+		"register:seen-stale":   1, // stale SEEN with body → rebroadcast (unchanged)
+		"register:recv-recent":  0, // too recent
+		"register:recv-nobody":  0, // no RawTx
+		"register:mined-old":    0, // terminal
+		"register:recv-ancient": 0, // outside staleScanLookback
 	}
 	for prefix, exp := range want {
 		if got := log.count(prefix); got != exp {

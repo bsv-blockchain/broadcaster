@@ -229,7 +229,7 @@ Transitions are guarded by `DisallowedPreviousStatuses()` in the SQL UPDATE quer
 
 BSV Broadcaster distinguishes two kinds of submit failure (issue #254):
 
-- **Verdicts about the transaction bytes** — validator failures (script, fee, size, malformation) and network rejections — are terminal: a `REJECTED` row is persisted with the reason in `extraInfo` and, when classifiable, the numeric ARC code (460-476) in `status`. `GET /tx/{txid}` serves the verdict indefinitely (there is no retention window).
+- **Verdicts about the transaction bytes** — validator failures (script, fee, size, malformation) and network rejections — are terminal: a `REJECTED` row is persisted with the reason in `extraInfo` and, when classifiable, the numeric ARC code (460-476) in `status`. `GET /tx/{txid}` serves the verdict for as long as the row is retained: forever by default, or the submitter's tier `retention_days` (see [docs/api-keys.md](api-keys.md#data-retention-per-tier)).
 - **Conditions of BSV Broadcaster's chain view** are not verdicts and persist nothing. The intake nLockTime/BIP113 finality gate is the canonical case: BSV Broadcaster's view of the tip can trail the network, so a "not final yet" answer is a `400` with ARC code `476` and an actionable reason — but no `REJECTED` row, no status event. `GET /tx/{txid}` keeps returning `404` ("no verdict") for a first submission, so clients that resubmit on no-verdict recover automatically once the locktime expires, and a resubmission evaluated against a stale tip can never clobber an in-flight row.
 
 Recovery is client-driven by design — BSV Broadcaster keeps no rejected-tx tracker (a tx that mined before BSV Broadcaster ever saw it has no oracle to consult):

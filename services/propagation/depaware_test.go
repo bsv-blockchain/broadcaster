@@ -405,6 +405,7 @@ func TestRequeueAfterDelay_PendingRequeuesGauge(t *testing.T) {
 	p, cleanup := newPropagatorForDepTest(t, &mockStore{})
 	t.Cleanup(cleanup)
 
+	quiesceRequeues(t)
 	startVal := testutil.ToFloat64(metrics.PropagationPendingRequeues)
 
 	ctx, cancel := context.WithCancel(t.Context())
@@ -441,6 +442,7 @@ func TestRequeueAfterDelay_EmptyMsgs_NoGaugeChange(t *testing.T) {
 	p, cleanup := newPropagatorForDepTest(t, &mockStore{})
 	t.Cleanup(cleanup)
 
+	quiesceRequeues(t)
 	startVal := testutil.ToFloat64(metrics.PropagationPendingRequeues)
 	p.requeueAfterDelay(t.Context(), nil, p.defaultIO)
 	if got := testutil.ToFloat64(metrics.PropagationPendingRequeues); got != startVal {

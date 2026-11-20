@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net/http"
 	"sync"
 	"time"
@@ -11,6 +12,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin"
 	"go.uber.org/zap"
+	"golang.org/x/sync/semaphore"
 
 	"github.com/bsv-blockchain/broadcaster/config"
 	"github.com/bsv-blockchain/broadcaster/events"
@@ -24,6 +26,7 @@ import (
 	"github.com/bsv-blockchain/broadcaster/services/apikey"
 	"github.com/bsv-blockchain/broadcaster/services/httpmiddleware"
 	"github.com/bsv-blockchain/broadcaster/services/ratelimit"
+	"github.com/bsv-blockchain/broadcaster/services/usage"
 	"github.com/bsv-blockchain/broadcaster/store"
 	"github.com/bsv-blockchain/broadcaster/telemetry"
 	"github.com/bsv-blockchain/broadcaster/teranode"
@@ -45,8 +48,15 @@ const (
 type Server struct {
 	services.ReadyHook
 
-	cfg          *config.Config
-	logger       *zap.Logger
+	cfg    *config.Config
+	logger *zap.Logger
+	// usageRecorder meters guarded routes and usageReporter delivers the
+	// counts to providers; both nil unless usage.enabled (see initUsage).
+	usageRecorder *usage.Recorder
+	usageReporter *usage.Reporter
+	// retention enforces per-tier data retention; nil when no tier
+	// configures it or the store cannot (see initRetention).
+	retention    store.RetentionExtender
 	producer     *kafka.Producer
 	publisher    events.Publisher // nil-safe; status updates flow to SSE via Kafka — the api-server itself publishes but does not subscribe
 	store        store.Store
@@ -63,7 +73,25 @@ type Server struct {
 	// letting teranode bounce them with a generic error (issue #245).
 	// Nil-safe: nil (no chain source configured, or disabled) skips the gate.
 	finality *finality.Checker
-	server   *http.Server
+	// intakeSlots bounds POST /txs store writes in flight across the pod
+	// (api.intake_store_concurrency; see withIntakeSlot). Nil, as in tests
+	// built from a struct literal, leaves them unbounded.
+	intakeSlots *semaphore.Weighted
+
+	// callbackSlots bounds merkle-service callback status writes in flight
+	// across the pod (api.callback_store_concurrency, held as
+	// callbackSlotCount; see callbackBatchUpdate). Nil leaves them
+	// unbounded.
+	callbackSlots     *semaphore.Weighted
+	callbackSlotCount int
+
+	server *http.Server
+	// site is the docs site's static export; nil means the one embedded in
+	// the binary (web.FS). Tests inject their own.
+	site fs.FS
+	// siteRoutes holds the route patterns the docs site registered. Written
+	// once while the router is built, read-only while it serves.
+	siteRoutes map[string]bool
 
 	// keyResolver, identify and limiter are built by initAccessControl from
 	// auth.* and ratelimit.*; nil when disabled (the default), in which case
@@ -119,12 +147,13 @@ func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, publi
 	// sample, which undercounted submissions after every rollout.
 	metrics.PreRegisterTxSubmissions()
 	metrics.PreRegisterStatusTransitions(models.StatusSeenOnNetwork, models.StatusSeenMultipleNodes)
-	return &Server{
+	srv := &Server{
 		cfg:            cfg,
 		logger:         logger.Named("api-server"),
 		producer:       producer,
 		publisher:      publisher,
 		store:          st,
+		intakeSlots:    semaphore.NewWeighted(int64(cfg.IntakeStoreConcurrencyLimit())),
 		txTracker:      tracker,
 		teranode:       tc,
 		merkleClient:   mc,
@@ -133,6 +162,9 @@ func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, publi
 		submissionCh:   make(chan submissionRecord, submissionRecorderBuffer),
 		submissionStop: make(chan struct{}),
 	}
+	srv.callbackSlotCount = cfg.CallbackStoreConcurrencyLimit()
+	srv.callbackSlots = semaphore.NewWeighted(int64(srv.callbackSlotCount))
+	return srv
 }
 
 func (s *Server) Name() string { return "api-server" }
@@ -170,7 +202,9 @@ func (s *Server) newRouter() *gin.Engine {
 	s.applyTrustedPlatform(router)
 	router.Use(otelgin.Middleware(s.cfg.Telemetry.ServiceName, otelgin.WithGinFilter(func(c *gin.Context) bool {
 		p := c.FullPath()
-		return p != "/health" && p != "/ready" && p != "/metrics"
+		// The docs site (a page view fetches a few dozen assets) is filtered
+		// out too: it is not API traffic.
+		return p != "/health" && p != "/ready" && p != "/metrics" && !s.siteRoutes[p]
 	})))
 	router.Use(gin.CustomRecovery(s.recoverPanic))
 	router.Use(s.requestLogger())
@@ -184,6 +218,8 @@ func (s *Server) Start(ctx context.Context) error {
 	if err := s.initAccessControl(); err != nil { //nolint:contextcheck // false positive: contextcheck's call graph walks into apikey.Middleware's inner gin closures (newMiddleware -> authenticated), which use c.Request.Context() -- the correct per-request context -- not a ctx parameter for the linter to compare against; initAccessControl itself takes no ctx.
 		return err
 	}
+	s.initRetention(ctx)
+	s.initUsage(ctx)
 	if s.cfg.Admin.Enabled {
 		if err := s.startAdmin(ctx); err != nil {
 			return err
@@ -347,6 +383,10 @@ func (s *Server) requestLogger() gin.HandlerFunc {
 			// check in handleCallback) at Warn: it carries neither header, so
 			// a misconfigured callback token is still reported loudly.
 			s.logger.Debug("request", fields...)
+		case status == http.StatusNotFound && s.siteRoutes[route]:
+			// A missing docs-site asset (a stale cached page asking for an old
+			// build's chunk, a crawler guessing a path) is not an API fault.
+			s.logger.Debug("request", fields...)
 		case status >= 400:
 			s.logger.Warn("request", fields...)
 		default:
@@ -408,5 +448,7 @@ func (s *Server) Stop() error {
 	}()
 
 	wg.Wait()
+	// After the listeners drained, so the last requests are counted.
+	s.stopUsage()
 	return errors.Join(publicErr, adminErr)
 }

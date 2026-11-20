@@ -158,3 +158,33 @@ updates:
       include: "scope"
     cooldown:
       default-days: 3
+
+  # ──────────────────────────────────────────────────────────────
+  # 6. npm (web/: the docs site embedded in the binary)
+  # ──────────────────────────────────────────────────────────────
+  - package-ecosystem: "npm"
+    directory: "/web"
+    target-branch: "main"
+    schedule:
+      interval: "weekly"
+      day: "tuesday"
+      time: "12:15"
+      timezone: "America/New_York"
+    allow:
+      - dependency-type: "direct"
+    groups:
+      npm-all:
+        applies-to: version-updates
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+    open-pull-requests-limit: 5
+    assignees: ["mrz1836"]
+    labels: ["chore", "dependencies", "npm"]
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+    cooldown:
+      default-days: 3
+      semver-patch-days: 3
+      semver-minor-days: 7
+      semver-major-days: 14

@@ -93,7 +93,7 @@ func TestAuthStoreServesKeysAndQuota(t *testing.T) {
 	require.Empty(t, inMain, "the main store must not see the key")
 
 	api := gin.New()
-	api.GET("/limited", srv.guarded(1, func(c *gin.Context) { c.Status(http.StatusNoContent) })...)
+	api.GET("/limited", srv.guarded("v1/test", 1, func(c *gin.Context) { c.Status(http.StatusNoContent) })...)
 	call := func() *httptest.ResponseRecorder {
 		req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/limited", nil)
 		req.Header.Set("Authorization", "Bearer "+created.Key)

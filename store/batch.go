@@ -66,55 +66,111 @@ type SingleStoreReturning interface {
 	UpdateStatusReturning(ctx context.Context, status *models.TransactionStatus) (StatusUpdate, error)
 }
 
+// ForEach runs fn(i) for every i in [0, n) with at most conc calls in flight.
+// The first error is returned after every started call has finished; once
+// ctx is done, or any call has failed, no further calls start.
+//
+// Stopping at the first failure is what keeps a per-row loop from turning an
+// outage into a marathon: with the server gone, a million-row block would
+// otherwise pay op_timeout_ms for every remaining row before returning, and
+// the rows it did write meanwhile are exactly as partial as they would be
+// after one failure. Callers get the same (partial results, first error)
+// pair either way, just promptly.
+func ForEach(ctx context.Context, n, conc int, fn func(i int) error) error {
+	if conc < 1 {
+		conc = 1
+	}
+	sem := make(chan struct{}, conc)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var firstErr error
+	record := func(err error) {
+		mu.Lock()
+		if firstErr == nil {
+			firstErr = err
+		}
+		mu.Unlock()
+	}
+	failed := func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return firstErr != nil
+	}
+	for i := 0; i < n; i++ {
+		// Checked explicitly: a select with both a free slot and a done ctx
+		// ready picks at random, which is how a cancelled loop still started
+		// most of its calls.
+		if err := ctx.Err(); err != nil {
+			record(err)
+			break
+		}
+		if failed() {
+			break
+		}
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			record(ctx.Err())
+			wg.Wait()
+			return firstErr
+		}
+		// Re-checked after the slot, not only before it: the send blocks
+		// while every worker is busy, which is exactly when one of them
+		// fails, so the check above was made against a state that is stale by
+		// the time the slot frees. Without this, a failing loop dispatches
+		// one more operation — bounded, but the contract above says none.
+		//
+		// A cancellation is recorded, exactly as the pre-send check records
+		// it. Breaking out silently would leave firstErr nil on a loop that
+		// skipped work, so ForEach would report success for a block it never
+		// finished — the one outcome this helper must never produce, since
+		// its callers read a nil error as "every row was written".
+		if err := ctx.Err(); err != nil {
+			record(err)
+			<-sem
+			break
+		}
+		if failed() {
+			<-sem
+			break
+		}
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			if err := fn(i); err != nil {
+				record(err)
+			}
+		}(i)
+	}
+	wg.Wait()
+	return firstErr
+}
+
 // BatchGetOrInsertStatusParallel runs GetOrInsertStatus concurrently for each
-// row, bounded by defaultBatchConcurrency. Result order matches input order.
-// Returns the first error encountered by any goroutine; rows whose call
-// failed get a zero-value BatchInsertResult so callers can still iterate the
-// slice safely.
+// row, bounded by BatchConcurrency. Result order matches input order. Like
+// ForEach it stops starting rows at the first failure (or once ctx is done)
+// and returns that error; rows that failed or never started get a zero-value
+// BatchInsertResult, so callers can still iterate the slice safely and tell
+// the rows that were inserted from the rest.
 func BatchGetOrInsertStatusParallel(ctx context.Context, s SingleStore, statuses []*models.TransactionStatus) ([]BatchInsertResult, error) {
 	if len(statuses) == 0 {
 		return nil, nil
 	}
-
 	results := make([]BatchInsertResult, len(statuses))
-	sem := make(chan struct{}, currentBatchConcurrency())
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-	var firstErr error
-
-	for i, st := range statuses {
-		select {
-		case sem <- struct{}{}:
-		case <-ctx.Done():
-			mu.Lock()
-			if firstErr == nil {
-				firstErr = ctx.Err()
-			}
-			mu.Unlock()
-			continue
+	err := ForEach(ctx, len(statuses), currentBatchConcurrency(), func(i int) error {
+		existing, inserted, err := s.GetOrInsertStatus(ctx, statuses[i])
+		if err != nil {
+			return err
 		}
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			defer func() { <-sem }()
-			existing, inserted, err := s.GetOrInsertStatus(ctx, st)
-			if err != nil {
-				mu.Lock()
-				if firstErr == nil {
-					firstErr = err
-				}
-				mu.Unlock()
-				return
-			}
-			if inserted {
-				results[i] = BatchInsertResult{Inserted: true}
-			} else {
-				results[i] = BatchInsertResult{Existing: existing, Inserted: false}
-			}
-		}()
-	}
-	wg.Wait()
-	return results, firstErr
+		if inserted {
+			results[i] = BatchInsertResult{Inserted: true}
+		} else {
+			results[i] = BatchInsertResult{Existing: existing}
+		}
+		return nil
+	})
+	return results, err
 }
 
 // BatchUpdateStatusReturningParallel is the diagnostic-rich form of

@@ -345,6 +345,11 @@ func (s *Store) GetOrInsertStatus(ctx context.Context, status *models.Transactio
 	if status.PartitionKey != "" {
 		bins["partition_key"] = status.PartitionKey
 	}
+	// The propagation consumer loads the tx from here (messages carry the
+	// txid only, #329), as does the reaper's stuck-RECEIVED rebroadcast.
+	if len(status.RawTx) > 0 {
+		bins["raw_tx"] = []byte(status.RawTx)
+	}
 
 	policy := s.writePolicy(ctx)
 	policy.RecordExistsAction = aero.CREATE_ONLY
@@ -575,7 +580,7 @@ loop:
 // IterateStatusesSince streams scan results to fn one record at a time. The
 // Aerospike client already produces records over a channel — we just hand
 // them off without buffering, so peak memory is O(1) plus whatever fn keeps.
-func (s *Store) IterateStatusesSince(ctx context.Context, _ time.Time, fn func(*models.TransactionStatus) error) error {
+func (s *Store) IterateStatusesSince(ctx context.Context, since time.Time, fn func(*models.TransactionStatus) error) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -599,6 +604,11 @@ func (s *Store) IterateStatusesSince(ctx context.Context, _ time.Time, fn func(*
 			if rec.Err != nil {
 				return rec.Err
 			}
+			// The scan is the whole set, so honor since here: callers
+			// filter on the window the store contract promises.
+			if ms := getInt64(rec.Record, "timestamp"); ms > 0 && time.UnixMilli(ms).Before(since) {
+				continue
+			}
 			txid := getString(rec.Record, "txid")
 			if err := fn(recordToStatus(rec.Record, txid)); err != nil {
 				return err
@@ -612,8 +622,8 @@ func (s *Store) IterateStatusesSince(ctx context.Context, _ time.Time, fn func(*
 // use) projecting only the three bins hydration reads.
 //
 // This is the largest of the three backend wins: IterateStatusesSince above is
-// a full-namespace scan that ignores `since` entirely and transfers whole
-// records, so hydration used to pull every row in the set — raw_tx included —
+// a full-namespace scan that filters `since` only client-side and transfers
+// whole records, so hydration used to pull every row in the set — raw_tx included —
 // across the wire on every api-server boot (issue #276).
 //
 // The MINED height cutoff is applied client-side via scan.Keep: Aerospike's
@@ -1145,6 +1155,9 @@ func minedWrite(rec *aero.Record, txid, blockHash string, blockHeight uint64, no
 		return nil, nil, false
 	}
 	prev = recordToStatus(rec, txid)
+	// prevs accumulate across a whole block in SetMinedByTxIDs; no caller
+	// reads their body, so drop it (Postgres' prev CTE never selects it).
+	prev.RawTx = nil
 	ops = []*aero.Operation{
 		aero.PutOp(aero.NewBin("status", string(models.StatusMined))),
 		aero.PutOp(aero.NewBin("block_hash", blockHash)),
@@ -3497,6 +3510,12 @@ func recordToStatus(rec *aero.Record, txid string) *models.TransactionStatus {
 			status.MerklePath = b
 		}
 	}
+	// raw_tx, as the other backends' reads return it: the propagation reaper
+	// rebroadcasts from it off IterateStatusesSince, and rejectedAncestor
+	// climbs to a grandparent through GetStatus's copy.
+	if b, ok := rec.Bins["raw_tx"].([]byte); ok && len(b) > 0 {
+		status.RawTx = b
+	}
 	if v, ok := rec.Bins["competing_txs"]; ok {
 		switch ct := v.(type) {
 		case []byte:
@@ -3792,4 +3811,52 @@ func (s *Store) LookupPartitionKeys(ctx context.Context, txids []string) (map[st
 		out[ids[i]] = store.ParentKey{Status: models.Status(getString(rec, "status")), PartitionKey: getString(rec, "partition_key")}
 	}
 	return out, nil
+}
+
+// LookupRawTxs implements store.Store with one batch read of two bins.
+func (s *Store) LookupRawTxs(ctx context.Context, txids []string) (map[string]store.RawTxRow, error) {
+	out := make(map[string]store.RawTxRow, len(txids))
+	keys := make([]*aero.Key, 0, len(txids))
+	ids := make([]string, 0, len(txids))
+	for _, txid := range txids {
+		key, err := s.key(setTransactions, txid)
+		if err != nil {
+			continue
+		}
+		keys = append(keys, key)
+		ids = append(ids, txid)
+	}
+	if len(keys) == 0 {
+		return out, nil
+	}
+	recs, err := s.client.BatchGet(s.batchPolicy(ctx), keys, "status", "raw_tx")
+	if err != nil {
+		return nil, fmt.Errorf("lookup raw txs: %w", err)
+	}
+	for i, rec := range recs {
+		if rec == nil || i >= len(ids) {
+			continue
+		}
+		raw, _ := rec.Bins["raw_tx"].([]byte)
+		out[ids[i]] = store.RawTxRow{Status: models.Status(getString(rec, "status")), RawTx: raw}
+	}
+	return out, nil
+}
+
+// SetRawTx implements store.Store. UPDATE_ONLY keeps it from creating a
+// bare record for an unknown txid.
+func (s *Store) SetRawTx(ctx context.Context, txid string, rawTx []byte) error {
+	key, err := s.key(setTransactions, txid)
+	if err != nil {
+		return err
+	}
+	wp := s.writePolicy(ctx)
+	wp.RecordExistsAction = aero.UPDATE_ONLY
+	if err := s.client.PutBins(wp, key, aero.NewBin("raw_tx", rawTx)); err != nil {
+		if isKeyNotFound(err) {
+			return fmt.Errorf("set raw tx %s: %w", txid, store.ErrNotFound)
+		}
+		return fmt.Errorf("set raw tx %s: %w", txid, err)
+	}
+	return nil
 }

@@ -2,6 +2,8 @@ package api_server
 
 import (
 	"fmt"
+	"maps"
+	"slices"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -11,6 +13,7 @@ import (
 	"github.com/bsv-blockchain/broadcaster/metrics"
 	"github.com/bsv-blockchain/broadcaster/services/apikey"
 	"github.com/bsv-blockchain/broadcaster/services/ratelimit"
+	"github.com/bsv-blockchain/broadcaster/services/usage"
 	"github.com/bsv-blockchain/broadcaster/store"
 )
 
@@ -79,7 +82,8 @@ func (s *Server) initAccessControl() error {
 	rl := s.cfg.RateLimit
 	s.keyResolver = apikey.NewResolver(keys,
 		time.Duration(rl.KeyCacheTTLMs)*time.Millisecond,
-		time.Duration(rl.KeyCacheStaleMaxMs)*time.Millisecond)
+		time.Duration(rl.KeyCacheStaleMaxMs)*time.Millisecond,
+		apikey.WithRoutes(s.introspectionRoutes()...))
 	s.identify = apikey.Middleware(s.keyResolver)
 	// Export the apikey-identification series at 0 from the first scrape
 	// whenever auth is on, independent of ratelimit.enabled: identification
@@ -96,10 +100,39 @@ func (s *Server) initAccessControl() error {
 	return nil
 }
 
-// guarded prefixes h with the identify and rate-limit middleware the config
-// enables, charging units for the route. With both off it is just h.
-func (s *Server) guarded(units int64, h gin.HandlerFunc) []gin.HandlerFunc {
+// introspectionRoutes builds a resolver route per auth.introspection
+// provider, in name order. Config validation has already checked prefixes,
+// URLs and tokens.
+func (s *Server) introspectionRoutes() []apikey.Route {
+	names := slices.Sorted(maps.Keys(s.cfg.Auth.Introspection))
+	routes := make([]apikey.Route, 0, len(names))
+	for _, name := range names {
+		p := s.cfg.Auth.Introspection[name]
+		routes = append(routes, apikey.Route{
+			Prefix: p.KeyPrefix,
+			Lookup: apikey.NewIntrospector(apikey.IntrospectorConfig{
+				Name: name, URL: p.URL, Token: p.ServiceToken(), Timeout: p.Timeout(), Tiers: p.Tiers,
+			}, s.logger),
+		})
+		s.logger.Info("api keys under prefix verified by introspection provider",
+			zap.String("provider", name), zap.String("key_prefix", p.KeyPrefix))
+	}
+	metrics.PreRegisterIntrospection(names)
+	return routes
+}
+
+// guarded prefixes h with the usage, identify and rate-limit middleware the
+// config enables, charging units for the route. name is the route's stable
+// usage name (usage.RouteName rules: lowercase, at most 3 "/" segments and
+// 64 characters, never an id). With everything off it is just h.
+func (s *Server) guarded(name string, units int64, h gin.HandlerFunc) []gin.HandlerFunc {
+	if !usage.ValidEndpoint(name) {
+		panic(fmt.Sprintf("guarded: invalid usage route name %q", name)) // a programming error, caught at boot
+	}
 	var hs []gin.HandlerFunc
+	if s.usageRecorder != nil {
+		hs = append(hs, s.usageRecorder.Middleware(name, units))
+	}
 	if s.identify != nil {
 		hs = append(hs, s.identify)
 	}

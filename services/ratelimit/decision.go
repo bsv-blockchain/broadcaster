@@ -19,4 +19,7 @@ type Tier struct {
 	UnitsPerMinute int64
 	MaxInFlight    int
 	MaxBatch       int
+	// Burst is the token-bucket capacity where the tier is enforced by a
+	// local bucket: ratelimit.anonymous.burst_units, or UnitsPerMinute.
+	Burst int64
 }

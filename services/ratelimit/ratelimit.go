@@ -27,6 +27,7 @@ const HeaderReason = apikey.HeaderRateLimitReason
 const (
 	ctxLimiter          = "ratelimit.limiter"
 	ctxTier             = "ratelimit.tier"
+	ctxCharged          = "ratelimit.charged"
 	localBucketCapacity = 100_000
 	warnInterval        = 10 * time.Second
 	// StatusClientClosedRequest aliases apikey's exported constant so both
@@ -87,7 +88,7 @@ func New(cfg config.RateLimitConfig, qs store.QuotaStore, logger *zap.Logger, op
 }
 
 func tierFrom(name string, t config.TierConfig) Tier {
-	return Tier{Name: name, UnitsPerMinute: t.UnitsPerMinute, MaxInFlight: t.MaxInFlight, MaxBatch: t.MaxBatch}
+	return Tier{Name: name, UnitsPerMinute: t.UnitsPerMinute, MaxInFlight: t.MaxInFlight, MaxBatch: t.MaxBatch, Burst: t.Burst()}
 }
 
 func (rl *RateLimiter) tierFor(p apikey.Principal) Tier {
@@ -222,13 +223,14 @@ func tierFromContext(c *gin.Context) (Tier, bool) {
 func (rl *RateLimiter) charge(c *gin.Context, p apikey.Principal, tier Tier, units int64) bool {
 	if units <= 0 || tier.UnitsPerMinute == 0 {
 		metrics.RateLimitDecisionsTotal.WithLabelValues(tier.Name, "allowed").Inc()
+		addCharged(c, units)
 		return true
 	}
-	if units > tier.UnitsPerMinute {
+	if units > tier.UnitsPerMinute || (p.Anonymous() && units > tier.Burst) {
 		// A 429 here would never resolve itself: the request can never fit
-		// in a full, empty window either. 413 says so plainly instead of
-		// inviting a retry loop.
-		rl.rejectUnpayable(c, tier, units)
+		// in a full, empty window (or bucket) either. 413 says so plainly
+		// instead of inviting a retry loop.
+		rl.rejectUnpayable(c, tier, units, p.Anonymous())
 		return false
 	}
 	d, ok := rl.takeDecision(c, p, tier, units)
@@ -241,7 +243,32 @@ func (rl *RateLimiter) charge(c *gin.Context, p apikey.Principal, tier Tier, uni
 		return false
 	}
 	metrics.RateLimitDecisionsTotal.WithLabelValues(tier.Name, "allowed").Inc()
+	addCharged(c, units)
 	return true
+}
+
+// addCharged adds units to what this request has been charged.
+func addCharged(c *gin.Context, units int64) {
+	if units <= 0 {
+		return
+	}
+	prev, _ := c.Get(ctxCharged)
+	n, _ := prev.(int64)
+	c.Set(ctxCharged, n+units)
+}
+
+// Charged returns the cost units the limiter granted this request (the
+// route's charge plus any ChargeTxs), and whether a limiter guards the
+// route at all. A request the limiter refused, or whose client hung up
+// before the quota was granted, was charged 0. An unbounded tier is
+// charged its nominal cost.
+func Charged(c *gin.Context) (units int64, limited bool) {
+	if _, ok := c.Get(ctxLimiter); !ok {
+		return 0, false
+	}
+	v, _ := c.Get(ctxCharged)
+	units, _ = v.(int64)
+	return units, true
 }
 
 // takeDecision resolves one Decision for the caller's tier: the anonymous
@@ -252,9 +279,9 @@ func (rl *RateLimiter) charge(c *gin.Context, p apikey.Principal, tier Tier, uni
 // anything to a reader who is no longer there.
 func (rl *RateLimiter) takeDecision(c *gin.Context, p apikey.Principal, tier Tier, units int64) (Decision, bool) {
 	if p.Anonymous() {
-		return rl.anon.take(p.Subject(), tier.UnitsPerMinute, units, rl.now()), true
+		return rl.anon.take(p.Subject(), tier.UnitsPerMinute, tier.Burst, units, rl.now()), true
 	}
-	d, err := rl.keyed.take(c.Request.Context(), p.KeyID, tier.UnitsPerMinute, units)
+	d, err := rl.keyed.take(c.Request.Context(), p.QuotaKey(), tier.UnitsPerMinute, units)
 	if err == nil {
 		return d, true
 	}
@@ -266,16 +293,20 @@ func (rl *RateLimiter) takeDecision(c *gin.Context, p apikey.Principal, tier Tie
 	}
 	metrics.RateLimitStoreFailOpenTotal.Inc()
 	rl.warn("quota store unavailable; failing open to the local bucket", zap.String("key_id", p.KeyID), zap.Error(err))
-	return rl.failopen.take(p.Subject(), tier.UnitsPerMinute, units, rl.now()), true
+	return rl.failopen.take(p.Subject(), tier.UnitsPerMinute, tier.UnitsPerMinute, units, rl.now()), true
 }
 
 // rejectUnpayable answers a charge that can never succeed under this tier,
 // regardless of how empty the window is — a batch sized (or mis-configured)
-// above the tier's entire per-minute budget.
-func (rl *RateLimiter) rejectUnpayable(c *gin.Context, tier Tier, units int64) {
+// above the tier's entire per-minute budget, or an unkeyed caller's burst.
+func (rl *RateLimiter) rejectUnpayable(c *gin.Context, tier Tier, units int64, anonymous bool) {
 	metrics.RateLimitDecisionsTotal.WithLabelValues(tier.Name, "unpayable").Inc()
+	msg := fmt.Sprintf("request costs %d units, above the %s tier's %d per minute", units, tier.Name, tier.UnitsPerMinute)
+	if anonymous && units <= tier.UnitsPerMinute {
+		msg = fmt.Sprintf("request costs %d units, above the %s tier's burst of %d", units, tier.Name, tier.Burst)
+	}
 	c.AbortWithStatusJSON(http.StatusRequestEntityTooLarge, gin.H{
-		"error": fmt.Sprintf("request costs %d units, above the %s tier's %d per minute", units, tier.Name, tier.UnitsPerMinute),
+		"error": msg,
 		"tier":  tier.Name,
 	})
 }

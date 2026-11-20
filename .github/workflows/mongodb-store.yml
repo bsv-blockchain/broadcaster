@@ -45,12 +45,21 @@ concurrency:
 
 jobs:
   mongodb-store:
-    name: mongodb-store
+    name: mongodb-store (mongo ${{ matrix.mongo }})
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # 7 runs the per-row status-update fallback; 8 (Atlas runs 8.0) runs
+        # the native client-bulkWrite path in BatchUpdateStatusReturning.
+        mongo: ["7", "8"]
+        include:
+          - mongo: "8"
+            expect_native: "1"
     services:
       mongo:
-        image: mongo:7
+        image: mongo:${{ matrix.mongo }}
         ports:
           - 27017:27017
         options: >-
@@ -68,5 +77,8 @@ jobs:
       - name: Run MongoDB store tests
         env:
           BSV_BROADCASTER_MONGODB_URI: mongodb://127.0.0.1:27017
+          # Set on the 8 leg: the native status-batch tests fail rather than
+          # skip if the server is not detected as supporting bulkWrite.
+          BSV_BROADCASTER_MONGODB_EXPECT_NATIVE: ${{ matrix.expect_native }}
           BSV_BROADCASTER_MONGODB_REQUIRED: "1"
         run: go test -tags=mongodb -race -timeout=15m ./store/mongodb/...
