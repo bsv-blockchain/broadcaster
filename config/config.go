@@ -1309,8 +1309,8 @@ const (
 
 // DefaultAerospikeBatchSize is the fallback for store.aerospike.batch_size.
 // Batch loops advance by this step; a non-positive value never moves and
-// hangs mined-status, BUMP, and STUMP cleanup (issue #90). viper and
-// aerospike.New share this constant so the two cannot drift.
+// hangs mined-status, BUMP, and STUMP cleanup (issue #90). validate and
+// aerospike.New both reject a non-positive value.
 const DefaultAerospikeBatchSize = 500
 
 // Default policy values for the GET /policy endpoint. They mirror teranode's
