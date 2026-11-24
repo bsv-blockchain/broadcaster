@@ -23,7 +23,7 @@
         "ghcr.io/devcontainers/features/docker-outside-of-docker:1": {},
         "ghcr.io/devcontainers/features/github-cli:1": {}
     },
-    "image": "mcr.microsoft.com/devcontainers/go:2-1-trixie",
+    "image": "mcr.microsoft.com/devcontainers/go:2-1-trixie@sha256:74f45fc4c2abe0de9a9acdb4225ffb3e58e6b28f9af2e209afaa8920a3d3b623",
     "name": "broadcaster dev container",
     "onCreateCommand": "go install github.com/mrz1836/mage-x/cmd/magex@latest",
     "postCreateCommand": "magex lint && magex vet && magex test",

@@ -44,7 +44,7 @@ func TestKafkaStartOffset(t *testing.T) {
 
 	rp, err := redpanda.Run(
 		ctx,
-		"docker.redpanda.com/redpandadata/redpanda:v26.1.9",
+		"docker.redpanda.com/redpandadata/redpanda:v26.1.9@sha256:8cb52078690728e2b3d1507fc84eda4c07d4d59bd8fa241e9b1cc7eb7de096c9",
 		redpanda.WithAutoCreateTopics(),
 	)
 	if err != nil {

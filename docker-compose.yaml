@@ -55,7 +55,7 @@ services:
   # docker.io mirror of docker.redpanda.com/redpandadata/redpanda — the
   # vendor registry stalls podman pulls from some networks.
   redpanda:
-    image: docker.io/redpandadata/redpanda:v26.3.1
+    image: docker.io/redpandadata/redpanda:v26.3.1@sha256:260532f70fd840bf2159106bd4ef900f199c1f5ca2a23cb362642320513b90f5
     command:
       - redpanda
       - start
@@ -83,7 +83,7 @@ services:
 
   # One-shot analogue of _base/topics.yaml; see compose/topic-init.sh.
   topic-init:
-    image: docker.io/redpandadata/redpanda:v26.3.1
+    image: docker.io/redpandadata/redpanda:v26.3.1@sha256:260532f70fd840bf2159106bd4ef900f199c1f5ca2a23cb362642320513b90f5
     entrypoint: ["/bin/bash", "/topic-init.sh"]
     # Keep in step with propagation.partitions in compose/bsv-broadcaster-config.yaml:
     # BSV Broadcaster hard-fails at boot if the topic has fewer partitions than the
@@ -103,7 +103,7 @@ services:
   # 7 services x max_conns 25 = 175 > the alpine default of 100. The other
   # k8s tuning flags (2GB shared_buffers etc.) are dropped — laptop-sized.
   postgres:
-    image: docker.io/library/postgres:18-alpine
+    image: docker.io/library/postgres:18-alpine@sha256:0115267ab5a509022df9319c77be365cef335adb71556c75f60f5360ee247e71
     command: ["-c", "max_connections=500"]
     environment:
       POSTGRES_DB: bsv_broadcaster
@@ -147,7 +147,7 @@ services:
   # merkle-service's own database (never shared with BSV Broadcaster's; postgres:17
   # matches tests/e2e/harness/containers.go).
   merkle-postgres:
-    image: docker.io/library/postgres:18-alpine
+    image: docker.io/library/postgres:18-alpine@sha256:0115267ab5a509022df9319c77be365cef335adb71556c75f60f5360ee247e71
     environment:
       POSTGRES_DB: merkle
       POSTGRES_USER: merkle
@@ -205,7 +205,7 @@ services:
   # OTLP sink for the telemetry env above (tools/otel-collector.yaml
   # unchanged; debug exporter dumps traces/metrics to its logs).
   otel-collector:
-    image: docker.io/otel/opentelemetry-collector-contrib:0.165.0
+    image: docker.io/otel/opentelemetry-collector-contrib:0.165.0@sha256:e40d61f10c9a617cca1ffd1be4d7e2b3a4b0f0001798ff07e58cabe82e618cea
     command: ["--config=/etc/otel-collector.yaml"]
     volumes:
       - ./tools/otel-collector.yaml:/etc/otel-collector.yaml:Z
