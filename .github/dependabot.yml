@@ -44,6 +44,11 @@ updates:
         applies-to: version-updates
         patterns: ["*"]
         update-types: ["minor", "patch"]
+    ignore:
+      # pebble v2 refuses to open databases written by v1 (format major version 1).
+      # Remove once a format-ratchet/migration step ships.
+      - dependency-name: "github.com/cockroachdb/pebble"
+        update-types: ["version-update:semver-major"]
     open-pull-requests-limit: 10
     assignees: ["mrz1836"]
     labels: ["chore", "dependencies", "gomod"]
@@ -177,6 +182,18 @@ updates:
         applies-to: version-updates
         patterns: ["*"]
         update-types: ["minor", "patch"]
+    ignore:
+      # eslint-config-next bundles plugins (import, react, jsx-a11y) that only
+      # support ESLint 9. Remove once eslint-config-next supports ESLint 10.
+      - dependency-name: "eslint"
+        update-types: ["version-update:semver-major"]
+      # typescript-eslint (via eslint-config-next) requires typescript <6.1.0,
+      # so block 6.1+ and 7. Remove once typescript-eslint supports newer releases.
+      - dependency-name: "typescript"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      # Types track the Node runtime in web/.nvmrc (24); bump together with it.
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
     open-pull-requests-limit: 5
     assignees: ["mrz1836"]
     labels: ["chore", "dependencies", "npm"]

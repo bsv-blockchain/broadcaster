@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	aero "github.com/aerospike/aerospike-client-go/v7"
+	aero "github.com/aerospike/aerospike-client-go/v8"
 
 	"github.com/bsv-blockchain/broadcaster/models"
 )
