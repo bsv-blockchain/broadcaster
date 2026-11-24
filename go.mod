@@ -7,19 +7,19 @@ require (
 	github.com/aerospike/aerospike-client-go/v7 v7.10.2
 	github.com/bsv-blockchain/go-bt/v2 v2.7.6
 	github.com/bsv-blockchain/go-chaincfg v1.7.1
-	github.com/bsv-blockchain/go-chaintracks v1.4.8
-	github.com/bsv-blockchain/go-p2p-message-bus v0.3.1
-	github.com/bsv-blockchain/go-sdk v1.7.5
-	github.com/bsv-blockchain/go-teranode-p2p-client v0.3.3
+	github.com/bsv-blockchain/go-chaintracks v1.4.9
+	github.com/bsv-blockchain/go-p2p-message-bus v0.3.4
+	github.com/bsv-blockchain/go-sdk v1.7.8
+	github.com/bsv-blockchain/go-teranode-p2p-client v0.3.4
 	github.com/bsv-blockchain/teranode v0.16.1
 	github.com/cockroachdb/pebble v1.1.5
 	github.com/fergusstrange/embedded-postgres v1.34.0
 	github.com/gin-gonic/gin v1.12.0
 	github.com/hashicorp/golang-lru/v2 v2.0.7
-	github.com/jackc/pgx/v5 v5.12.0
+	github.com/jackc/pgx/v5 v5.13.0
 	github.com/moby/moby/api v1.57.0
 	github.com/moby/moby/client v0.6.3
-	github.com/mrz1836/go-whatsonchain v1.3.1
+	github.com/mrz1836/go-whatsonchain v1.4.0
 	github.com/prometheus/client_golang v1.25.0
 	github.com/prometheus/client_model v0.6.3
 	github.com/spf13/cobra v1.10.2
@@ -28,7 +28,7 @@ require (
 	github.com/testcontainers/testcontainers-go v0.45.0
 	github.com/testcontainers/testcontainers-go/modules/postgres v0.45.0
 	github.com/testcontainers/testcontainers-go/modules/redpanda v0.45.0
-	go.mongodb.org/mongo-driver/v2 v2.10.0
+	go.mongodb.org/mongo-driver/v2 v2.10.1
 	go.opentelemetry.io/contrib/bridges/prometheus v0.72.0
 	go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin v0.72.0
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.72.0
