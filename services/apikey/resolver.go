@@ -1,9 +1,12 @@
 package apikey
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -29,9 +32,28 @@ var (
 	ErrUnavailable = errors.New("api key store unavailable")
 )
 
-// Lookup is the slice of store.APIKeyStore the resolver reads.
+// Lookup is the slice of store.APIKeyStore the resolver reads. An
+// Introspector implements it for keys verified by an external provider.
 type Lookup interface {
 	GetAPIKeyByHash(ctx context.Context, hash string) (*store.APIKey, error)
+}
+
+// Route sends every key issued under Prefix to Lookup. The resolver always
+// routes Prefix ("bsvb_") to the API key store; WithRoutes adds the
+// introspection providers from auth.introspection.
+type Route struct {
+	Prefix string
+	Lookup Lookup
+}
+
+// ResolverOption configures a Resolver.
+type ResolverOption func(*Resolver)
+
+// WithRoutes adds routes for keys issued under other prefixes. Config
+// validation keeps prefixes from overlapping; should two still match one
+// key, the longer prefix wins.
+func WithRoutes(routes ...Route) ResolverOption {
+	return func(r *Resolver) { r.routes = append(r.routes, routes...) }
 }
 
 // cacheEntry is stored in both the positive and the negative cache. key is
@@ -86,7 +108,7 @@ type refreshState struct {
 // Throttling a single client's flood of invalid-key attempts is Middleware's
 // job (the per-IP auth-failure limiter), not the resolver's.
 type Resolver struct {
-	lookup   Lookup
+	routes   []Route // longest prefix first
 	ttl      time.Duration
 	staleMax time.Duration
 	now      func() time.Time
@@ -104,12 +126,18 @@ type Resolver struct {
 	onRefreshDone func()
 }
 
-// NewResolver builds a Resolver over lookup.
-func NewResolver(lookup Lookup, ttl, staleMax time.Duration) *Resolver {
+// NewResolver builds a Resolver that verifies Prefix keys against lookup,
+// plus any routes opts add.
+func NewResolver(lookup Lookup, ttl, staleMax time.Duration, opts ...ResolverOption) *Resolver {
 	r := &Resolver{
-		lookup: lookup, ttl: ttl, staleMax: staleMax, now: time.Now,
+		routes: []Route{{Prefix: Prefix, Lookup: lookup}},
+		ttl:    ttl, staleMax: staleMax, now: time.Now,
 		refresh: make(map[string]refreshState),
 	}
+	for _, o := range opts {
+		o(r)
+	}
+	slices.SortStableFunc(r.routes, func(a, b Route) int { return cmp.Compare(len(b.Prefix), len(a.Prefix)) })
 	// Failing state only matters while hash has a positive entry to serve
 	// stale (resolveStale), so it lives and dies with that entry: when the
 	// entry leaves the cache (LRU eviction, or removal on a not-found), so
@@ -133,7 +161,8 @@ func NewResolver(lookup Lookup, ttl, staleMax time.Duration) *Resolver {
 // for raw completes -- the lookup itself keeps running for any other caller
 // sharing it).
 func (r *Resolver) Resolve(ctx context.Context, raw string) (*store.APIKey, error) {
-	if err := Validate(raw); err != nil {
+	lk, ok := r.route(raw)
+	if !ok {
 		return nil, ErrUnauthorized
 	}
 	hash := Hash(raw)
@@ -145,7 +174,7 @@ func (r *Resolver) Resolve(ctx context.Context, raw string) (*store.APIKey, erro
 			return usable(e.key, now)
 		}
 		if now.Sub(e.fetched) < r.staleMax {
-			return r.resolveStale(ctx, hash, e, now)
+			return r.resolveStale(ctx, lk, hash, e, now)
 		}
 	}
 	if e, ok := r.negative.Get(hash); ok && now.Sub(e.fetched) < r.ttl {
@@ -153,7 +182,7 @@ func (r *Resolver) Resolve(ctx context.Context, raw string) (*store.APIKey, erro
 		return nil, ErrUnauthorized
 	}
 
-	fr, ctxDone, err := r.syncFetch(ctx, hash)
+	fr, ctxDone, err := r.syncFetch(ctx, lk, hash)
 	if err != nil {
 		if ctxDone {
 			// The caller gave up, not the store; don't count this as a
@@ -170,9 +199,9 @@ func (r *Resolver) Resolve(ctx context.Context, raw string) (*store.APIKey, erro
 // resolveStale handles a positive entry that is past its TTL but still
 // within staleMax. See the Resolver doc comment for the two-tier policy
 // this implements.
-func (r *Resolver) resolveStale(ctx context.Context, hash string, e cacheEntry, now time.Time) (*store.APIKey, error) {
+func (r *Resolver) resolveStale(ctx context.Context, lk Lookup, hash string, e cacheEntry, now time.Time) (*store.APIKey, error) {
 	if !r.isFailing(hash) {
-		fr, ctxDone, err := r.syncFetch(ctx, hash)
+		fr, ctxDone, err := r.syncFetch(ctx, lk, hash)
 		if err == nil {
 			return usable(fr.key, now)
 		}
@@ -201,7 +230,7 @@ func (r *Resolver) resolveStale(ctx context.Context, hash string, e cacheEntry, 
 	//nolint:contextcheck // deliberately detached: the refresh must outlive
 	// this request, so it always runs on context.Background
 	// (see maybeRefreshInBackground), never on ctx.
-	r.maybeRefreshInBackground(hash, now)
+	r.maybeRefreshInBackground(lk, hash, now)
 	cacheResult("stale")
 	return usable(e.key, now)
 }
@@ -211,8 +240,8 @@ func (r *Resolver) resolveStale(ctx context.Context, hash string, e cacheEntry, 
 // whether ctx.Done() ended the wait rather than the lookup itself
 // finishing; callers that have a stale fallback available react to that
 // differently than callers that don't.
-func (r *Resolver) syncFetch(ctx context.Context, hash string) (fr fetchResult, ctxDone bool, err error) {
-	ch := r.group.DoChan(hash, func() (any, error) { return r.fetch(ctx, hash) })
+func (r *Resolver) syncFetch(ctx context.Context, lk Lookup, hash string) (fr fetchResult, ctxDone bool, err error) {
+	ch := r.group.DoChan(hash, func() (any, error) { return r.fetch(ctx, lk, hash) })
 	select {
 	case res := <-ch:
 		if res.Err != nil {
@@ -234,7 +263,7 @@ func (r *Resolver) syncFetch(ctx context.Context, hash string) (fr fetchResult, 
 // Middleware can use it to let a caller with a key already proven good skip
 // the per-IP auth-failure throttle entirely.
 func (r *Resolver) cachedUsable(raw string) bool {
-	if Validate(raw) != nil {
+	if _, ok := r.route(raw); !ok {
 		return false
 	}
 	now := r.now()
@@ -310,7 +339,7 @@ func (r *Resolver) clearFailing(hash string) {
 // callback exists to prevent. The caller still serves the stale value it
 // already holds; the next lookup for the key goes through the synchronous
 // path, as an untracked key should.
-func (r *Resolver) maybeRefreshInBackground(hash string, now time.Time) {
+func (r *Resolver) maybeRefreshInBackground(lk Lookup, hash string, now time.Time) {
 	r.refreshMu.Lock()
 	st, tracked := r.refresh[hash]
 	if !tracked || st.inFlight || now.Before(st.retryAt) {
@@ -352,7 +381,7 @@ func (r *Resolver) maybeRefreshInBackground(hash string, now time.Time) {
 		// whichever caller's stale read triggered it.
 		ctx, cancel := context.WithTimeout(context.Background(), lookupTimeout)
 		defer cancel()
-		_, fetchErr, _ = r.group.Do(hash, func() (any, error) { return r.fetch(ctx, hash) })
+		_, fetchErr, _ = r.group.Do(hash, func() (any, error) { return r.fetch(ctx, lk, hash) })
 	}()
 }
 
@@ -370,7 +399,7 @@ type fetchResult struct {
 // goroutine may have just finished populating one while this call waited
 // for the group slot -- before ever touching the store, and labels the
 // eventual cache result itself so the caller doesn't have to infer it.
-func (r *Resolver) fetch(ctx context.Context, hash string) (fetchResult, error) {
+func (r *Resolver) fetch(ctx context.Context, lk Lookup, hash string) (fetchResult, error) {
 	now := r.now()
 	if e, ok := r.positive.Get(hash); ok && now.Sub(e.fetched) < r.ttl {
 		cacheResult("hit")
@@ -387,7 +416,7 @@ func (r *Resolver) fetch(ctx context.Context, hash string) (fetchResult, error) 
 	// and a background refresh always runs with its own detached context.
 	lctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), lookupTimeout)
 	defer cancel()
-	k, err := r.lookup.GetAPIKeyByHash(lctx, hash)
+	k, err := lk.GetAPIKeyByHash(lctx, hash)
 	if errors.Is(err, store.ErrAPIKeyNotFound) {
 		k, err = nil, nil
 	}
@@ -412,6 +441,19 @@ func (r *Resolver) fetch(ctx context.Context, hash string) (fetchResult, error) 
 	r.positive.Add(hash, cacheEntry{key: cloneKey(k), fetched: fetched})
 	cacheResult("miss")
 	return fetchResult{key: k}, nil
+}
+
+// route returns the lookup that verifies raw: the route whose prefix raw
+// carries, provided raw is a well-formed key under it. The singleflight and
+// both caches stay keyed by hash alone: Hash covers the prefix, so keys
+// from different routes never share an entry.
+func (r *Resolver) route(raw string) (Lookup, bool) {
+	for _, rt := range r.routes {
+		if strings.HasPrefix(raw, rt.Prefix) {
+			return rt.Lookup, ValidateWithPrefix(raw, rt.Prefix) == nil
+		}
+	}
+	return nil, false
 }
 
 func usable(k *store.APIKey, now time.Time) (*store.APIKey, error) {

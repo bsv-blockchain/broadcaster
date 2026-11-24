@@ -154,6 +154,12 @@ type mockStore struct {
 	// rawByTxID carries raw_tx alongside statusByTxID so GetStatus returns
 	// rows shaped like the real backends'. See setStatusRow.
 	rawByTxID map[string][]byte
+	// lookupRawErr / lookupRawCalls drive and count LookupRawTxs.
+	// ignoreSince makes IterateStatusesSince return rows outside the
+	// window, as Aerospike's full-set scan does.
+	ignoreSince    bool
+	lookupRawErr   error
+	lookupRawCalls int
 	// retrySeq records the order rows entered the durable retry queue, so
 	// GetReadyRetries can break next_retry_at ties the way an index scan does.
 	retrySeq     map[string]int
@@ -193,6 +199,39 @@ func (m *mockStore) GetStatus(_ context.Context, txid string) (*models.Transacti
 		return &models.TransactionStatus{TxID: txid, Status: st, RawTx: m.rawByTxID[txid]}, nil
 	}
 	return nil, store.ErrNotFound
+}
+
+// LookupRawTxs serves the rows seeded by setStatus / setStatusRow, the way
+// GetStatus does. lookupRawErr fails every call while set; lookupRawCalls
+// counts calls so tests can assert the inline-raw_tx path skips the store.
+func (m *mockStore) LookupRawTxs(_ context.Context, txids []string) (map[string]store.RawTxRow, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.lookupRawCalls++
+	if m.lookupRawErr != nil {
+		return nil, m.lookupRawErr
+	}
+	out := make(map[string]store.RawTxRow, len(txids))
+	for _, txid := range txids {
+		if st, ok := m.statusByTxID[txid]; ok {
+			out[txid] = store.RawTxRow{Status: st, RawTx: m.rawByTxID[txid]}
+		}
+	}
+	return out, nil
+}
+
+// setLookupRawErr sets (or, with nil, clears) the LookupRawTxs failure.
+func (m *mockStore) setLookupRawErr(err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.lookupRawErr = err
+}
+
+// lookupRawCallCount reads lookupRawCalls under the lock.
+func (m *mockStore) lookupRawCallCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.lookupRawCalls
 }
 
 type clearedCall struct {
@@ -482,7 +521,7 @@ func (m *mockStore) IterateStatusesSince(_ context.Context, since time.Time, fn 
 		// Honor the lookback filter so replay tests can pin behavior that
 		// depends on it. Rows with a zero Timestamp are always returned —
 		// matches existing tests that don't bother setting one.
-		if !r.Timestamp.IsZero() && r.Timestamp.Before(since) {
+		if !m.ignoreSince && !r.Timestamp.IsZero() && r.Timestamp.Before(since) {
 			continue
 		}
 		m.iterated++ // count rows actually visited (issue #290 early-abort test)
@@ -599,7 +638,7 @@ func newPropagator(merkleSrvURL, teranodeSrvURL string, st store.Store) *Propaga
 // handleAndFlush is a helper that adds a message and flushes (simulating consumer behavior)
 func handleAndFlush(t *testing.T, p *Propagator, payload []byte) error {
 	t.Helper()
-	if err := p.handleMessage(context.Background(), consumerMsg(payload)); err != nil {
+	if err := p.handleMessage(t.Context(), consumerMsg(payload)); err != nil {
 		return err
 	}
 	if err := flushSync(t, p); err != nil {
@@ -609,12 +648,32 @@ func handleAndFlush(t *testing.T, p *Propagator, payload []byte) error {
 	return nil
 }
 
+// quiesceRequeues waits out requeue goroutines earlier tests left behind
+// before a test baselines the process-global PropagationPendingRequeues
+// gauge. Each exits when its test's context ends or after requeueDelay; one
+// finishing mid-test otherwise reads as this test's goroutines going
+// negative.
+func quiesceRequeues(t *testing.T) {
+	t.Helper()
+	deadline := time.Now().Add(defaultRequeueDelay + time.Second)
+	for testutil.ToFloat64(metrics.PropagationPendingRequeues) != 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("PropagationPendingRequeues = %v after %s; a requeue goroutine is stuck",
+				testutil.ToFloat64(metrics.PropagationPendingRequeues), defaultRequeueDelay+time.Second)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 // flushSync drains pendingMsgs and synchronously waits for the resulting
 // processBatch goroutine to finish. Mirrors the pre-pipelining semantics
 // that existing tests rely on (assert state right after flushBatch returns).
 func flushSync(t *testing.T, p *Propagator) error {
 	t.Helper()
-	if err := p.flushBatch(context.Background()); err != nil {
+	// t.Context, not Background: a requeue goroutine this flush schedules
+	// waits requeueDelay on it, and must exit with the test instead of
+	// moving the global PropagationPendingRequeues gauge under a later one.
+	if err := p.flushBatch(t.Context()); err != nil {
 		return err
 	}
 	p.WaitForBatches()

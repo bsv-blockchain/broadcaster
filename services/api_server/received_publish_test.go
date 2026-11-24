@@ -3,22 +3,28 @@ package api_server
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"net/http/httptest"
+	"slices"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/bsv-blockchain/go-sdk/script"
+	sdkTx "github.com/bsv-blockchain/go-sdk/transaction"
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
+	"golang.org/x/sync/semaphore"
 
 	"github.com/bsv-blockchain/broadcaster/config"
 	"github.com/bsv-blockchain/broadcaster/kafka"
 	"github.com/bsv-blockchain/broadcaster/models"
 	"github.com/bsv-blockchain/broadcaster/store"
-	"github.com/bsv-blockchain/go-sdk/script"
-	sdkTx "github.com/bsv-blockchain/go-sdk/transaction"
 )
 
 // TestHandleSubmitTransaction_PublishesReceivedWithTokenHint pins the fix
@@ -129,6 +135,12 @@ func rejectedTxIDs(txids ...string) *mockStore {
 }
 
 func newReceivedServer(ms *mockStore) (*orderingPub, *kafka.RecordingBroker, *gin.Engine) {
+	return newReceivedServerWith(ms, nil)
+}
+
+// newReceivedServerWith is newReceivedServer with a hook to adjust the
+// server before its routes are registered.
+func newReceivedServerWith(ms *mockStore, adjust func(*Server)) (*orderingPub, *kafka.RecordingBroker, *gin.Engine) {
 	broker := &kafka.RecordingBroker{}
 	pub := &orderingPub{broker: broker}
 	gin.SetMode(gin.TestMode)
@@ -141,6 +153,9 @@ func newReceivedServer(ms *mockStore) (*orderingPub, *kafka.RecordingBroker, *gi
 		txTracker:      store.NewTxTracker(),
 		submissionCh:   make(chan submissionRecord, submissionRecorderBuffer),
 		submissionStop: make(chan struct{}),
+	}
+	if adjust != nil {
+		adjust(srv)
 	}
 	router := gin.New()
 	srv.registerRoutes(router)
@@ -444,10 +459,11 @@ func TestHandleSubmitTransactions_AllConcurrentDuplicatesPublishNoReceived(t *te
 	}
 }
 
-// TestHandleSubmit_DedupErrorPublishesNoReceived: when the CAS errors the
-// handler cannot tell whether it is the first attempt, so it queues the tx
-// best-effort but publishes no RECEIVED, on either endpoint.
-func TestHandleSubmit_DedupErrorPublishesNoReceived(t *testing.T) {
+// TestHandleSubmit_DedupErrorSheds503: when the CAS errors the row may not
+// exist, and the propagation message carries the txid only (#329), so the
+// consumer would have no raw tx to load. Both endpoints answer 503 with
+// Retry-After and publish nothing: no Kafka message, no status event.
+func TestHandleSubmit_DedupErrorSheds503(t *testing.T) {
 	failing := func() *mockStore {
 		return &mockStore{
 			getOrInsertFn: func(*models.TransactionStatus) (*models.TransactionStatus, bool, error) {
@@ -465,29 +481,39 @@ func TestHandleSubmit_DedupErrorPublishesNoReceived(t *testing.T) {
 	} {
 		t.Run(tc.path, func(t *testing.T) {
 			pub, broker, router := newReceivedServer(failing())
-			postSubmit(t, router, tc.path, tc.body)
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, tc.path, bytes.NewReader(tc.body))
+			req.Header.Set("Content-Type", "application/octet-stream")
+			w := httptest.NewRecorder()
+			router.ServeHTTP(w, req)
+			if w.Code != http.StatusServiceUnavailable {
+				t.Fatalf("status = %d, want 503; body=%s", w.Code, w.Body.String())
+			}
+			if w.Header().Get("Retry-After") == "" {
+				t.Error("503 without Retry-After")
+			}
 			if len(pub.publishes) != 0 || len(pub.bulkPublishes) != 0 {
 				t.Errorf("CAS error published events: single=%+v bulk=%+v", pub.publishes, pub.bulkPublishes)
 			}
-			if len(broker.Sends)+broker.BatchCalls != 1 {
-				t.Errorf("CAS error must still queue propagation, got sends=%d batches=%d", len(broker.Sends), broker.BatchCalls)
+			if n := len(broker.Sends) + broker.BatchCalls; n != 0 {
+				t.Errorf("CAS error queued propagation: sends=%d batches=%d", len(broker.Sends), broker.BatchCalls)
 			}
 		})
 	}
 }
 
-// TestHandleSubmitTransactions_RowsKeepOwnTimestamps: a batch's rows are not
-// one equal-timestamp run (catchup would have to drain it whole, and a
-// Last-Event-ID reconnect mid-burst would skip the rest), and the
-// RECEIVED carries the earliest INSERTED row's timestamp, so that reconnect
-// replays the batch's remaining rows instead of skipping them.
-func TestHandleSubmitTransactions_RowsKeepOwnTimestamps(t *testing.T) {
+// TestHandleSubmitTransactions_ReceivedCarriesInsertedRowTimestamp: the
+// RECEIVED carries the inserted row's timestamp, so a Last-Event-ID
+// reconnect replays the batch's rows instead of skipping them, and a CAS
+// loser's row does not contribute one.
+func TestHandleSubmitTransactions_ReceivedCarriesInsertedRowTimestamp(t *testing.T) {
 	rawA, rawB, txidA, txidB := twoDistinctTxs(t)
+	var mu sync.Mutex
 	rows := map[string]time.Time{}
 	ms := &mockStore{getOrInsertFn: func(in *models.TransactionStatus) (*models.TransactionStatus, bool, error) {
+		mu.Lock()
 		rows[in.TxID] = in.Timestamp
+		mu.Unlock()
 		if in.TxID == txidA {
-			time.Sleep(2 * time.Millisecond) // the next row's clock reading must differ
 			return &models.TransactionStatus{TxID: txidA, Status: models.StatusRejected}, false, nil
 		}
 		return nil, true, nil
@@ -495,8 +521,8 @@ func TestHandleSubmitTransactions_RowsKeepOwnTimestamps(t *testing.T) {
 	pub, _, router := newReceivedServer(ms)
 	postSubmit(t, router, "/txs", append(append([]byte(nil), rawA...), rawB...))
 
-	if !rows[txidB].After(rows[txidA]) {
-		t.Errorf("row timestamps A=%v B=%v; each row must keep its own", rows[txidA], rows[txidB])
+	if rows[txidB].IsZero() {
+		t.Fatalf("row %s written without a timestamp", txidB)
 	}
 	if len(pub.publishes) != 1 || pub.publishes[0].TxID != txidB {
 		t.Fatalf("expected one RECEIVED for the inserted %s, got %+v", txidB, pub.publishes)
@@ -511,8 +537,11 @@ func TestHandleSubmitTransactions_RowsKeepOwnTimestamps(t *testing.T) {
 // Last-Event-ID reconnect mid-burst replays the rows rather than skipping them.
 func TestHandleSubmitTransactions_BulkReceivedSitsBelowEveryRow(t *testing.T) {
 	rawA, rawB, txidA, txidB := twoDistinctTxs(t)
+	var mu sync.Mutex
 	rows := map[string]time.Time{}
 	ms := &mockStore{getOrInsertFn: func(in *models.TransactionStatus) (*models.TransactionStatus, bool, error) {
+		mu.Lock()
+		defer mu.Unlock()
 		rows[in.TxID] = in.Timestamp
 		return nil, true, nil
 	}}
@@ -540,5 +569,309 @@ func TestBulkReceivedAt(t *testing.T) {
 	}
 	if got, want := bulkReceivedAt(ts, 2), time.Date(2026, 11, 3, 12, 0, 0, 122_999_999, time.UTC); !got.Equal(want) {
 		t.Errorf("bulk: %v, want %v", got, want)
+	}
+}
+
+// TestHandleSubmitTransactions_PartialCASFailure_PublishesReceivedForInserted:
+// when a /txs CAS fails after earlier rows were inserted, the batch sheds
+// with 503 and nothing reaches Kafka, but the inserted rows still get their
+// RECEIVED. The retry republishes them as CAS losers, which never publish
+// RECEIVED (#391), so this is the only chance.
+func TestHandleSubmitTransactions_PartialCASFailure_PublishesReceivedForInserted(t *testing.T) {
+	rawA, rawB, txidA, _ := twoDistinctTxs(t)
+	ms := &mockStore{
+		getOrInsertFn: func(in *models.TransactionStatus) (*models.TransactionStatus, bool, error) {
+			if in.TxID == txidA {
+				return in, true, nil
+			}
+			return nil, false, errors.New("store unavailable")
+		},
+	}
+	pub, broker, router := newReceivedServer(ms)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/txs", bytes.NewReader(append(append([]byte(nil), rawA...), rawB...)))
+	req.Header.Set("Content-Type", "application/octet-stream")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503; body=%s", w.Code, w.Body.String())
+	}
+	if n := len(broker.Sends) + broker.BatchCalls; n != 0 {
+		t.Errorf("shed batch queued propagation: sends=%d batches=%d", len(broker.Sends), broker.BatchCalls)
+	}
+	events := append(append([]*models.TransactionStatus(nil), pub.publishes...), pub.bulkPublishes...)
+	var got []string
+	for _, e := range events {
+		got = append(got, e.TxID+":"+string(e.Status))
+		for _, id := range e.TxIDs {
+			got = append(got, id+":"+string(e.Status))
+		}
+	}
+	want := txidA + ":" + string(models.StatusReceived)
+	if !slices.Contains(got, want) || len(events) != 1 {
+		t.Errorf("events = %v, want exactly one RECEIVED for the inserted %s", got, txidA)
+	}
+}
+
+// Rows after a failed CAS are inserted too now that the batch CASes
+// concurrently, so a shed must publish RECEIVED for every row this request
+// inserted, not only the rows ahead of the failure.
+func TestHandleSubmitTransactions_EarlyCASFailure_PublishesReceivedForLaterInserted(t *testing.T) {
+	prev := store.BatchConcurrency()
+	store.SetBatchConcurrency(2)
+	t.Cleanup(func() { store.SetBatchConcurrency(prev) })
+
+	rawA, rawB, txidA, txidB := twoDistinctTxs(t)
+	// A fails only once B's CAS is in flight: the batch stops starting rows
+	// after a failure, so this pins that B started and was inserted.
+	bStarted := make(chan struct{})
+	ms := &mockStore{
+		getOrInsertFn: func(in *models.TransactionStatus) (*models.TransactionStatus, bool, error) {
+			if in.TxID == txidA {
+				<-bStarted
+				return nil, false, errors.New("store unavailable")
+			}
+			close(bStarted)
+			return in, true, nil
+		},
+	}
+	pub, broker, router := newReceivedServer(ms)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/txs", bytes.NewReader(append(append([]byte(nil), rawA...), rawB...)))
+	req.Header.Set("Content-Type", "application/octet-stream")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503; body=%s", w.Code, w.Body.String())
+	}
+	if n := len(broker.Sends) + broker.BatchCalls; n != 0 {
+		t.Errorf("shed batch queued propagation: sends=%d batches=%d", len(broker.Sends), broker.BatchCalls)
+	}
+	events := append(append([]*models.TransactionStatus(nil), pub.publishes...), pub.bulkPublishes...)
+	var got []string
+	for _, e := range events {
+		got = append(got, e.TxID+":"+string(e.Status))
+		for _, id := range e.TxIDs {
+			got = append(got, id+":"+string(e.Status))
+		}
+	}
+	want := txidB + ":" + string(models.StatusReceived)
+	if !slices.Contains(got, want) || len(events) != 1 {
+		t.Errorf("events = %v, want exactly one RECEIVED for the inserted %s", got, txidB)
+	}
+}
+
+// A /txs batch dedups in one store call, not one per row: on MongoDB that is
+// one InsertMany for the whole batch instead of a majority-acknowledged
+// round trip per BatchConcurrency rows.
+func TestHandleSubmitTransactions_OneBatchCASPerRequest(t *testing.T) {
+	rawA, rawB, _, _ := twoDistinctTxs(t)
+	ms := &mockStore{}
+	_, _, router := newReceivedServerWith(ms, func(s *Server) { s.store = nativeBatchStore{ms} })
+	if w := submit(t, router, "/txs", append(append([]byte(nil), rawA...), rawB...)); w.Code >= 300 {
+		t.Fatalf("status = %d; body=%s", w.Code, w.Body.String())
+	}
+	if n := ms.batchCASCalls.Load(); n != 1 {
+		t.Errorf("BatchGetOrInsertStatus calls = %d, want 1 for the whole batch", n)
+	}
+}
+
+// On a native-batch store the batch CAS holds a pod-wide intake slot: with
+// every slot taken, the request waits instead of opening another store
+// connection, and gives up with 503 when the client does.
+func TestHandleSubmitTransactions_BatchCASWaitsForIntakeSlot(t *testing.T) {
+	rawA, rawB, _, _ := twoDistinctTxs(t)
+	ms := &mockStore{}
+	slots := semaphore.NewWeighted(1)
+	if !slots.TryAcquire(1) {
+		t.Fatal("could not take the only slot")
+	}
+	_, _, router := newReceivedServerWith(ms, func(s *Server) {
+		s.store = nativeBatchStore{ms}
+		s.intakeSlots = slots
+	})
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+	req := httptest.NewRequestWithContext(ctx, http.MethodPost, "/txs", bytes.NewReader(append(append([]byte(nil), rawA...), rawB...)))
+	req.Header.Set("Content-Type", "application/octet-stream")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503; body=%s", w.Code, w.Body.String())
+	}
+	if n := ms.batchCASCalls.Load(); n != 0 {
+		t.Errorf("BatchGetOrInsertStatus calls = %d, want 0 while no slot is free", n)
+	}
+}
+
+// A txid repeated in one body is CASed and published once. CASed twice
+// concurrently, either copy could win, and the loser would take the
+// republish path: a raw_tx rewrite of the row this request just wrote and a
+// second propagation message.
+func TestHandleSubmitTransactions_RepeatedTxidCASedOnce(t *testing.T) {
+	rawA, _, txidA, _ := twoDistinctTxs(t)
+	var calls atomic.Int32
+	ms := &mockStore{getOrInsertFn: func(in *models.TransactionStatus) (*models.TransactionStatus, bool, error) {
+		if calls.Add(1) > 1 {
+			return &models.TransactionStatus{TxID: in.TxID, Status: models.StatusReceived}, false, nil
+		}
+		return in, true, nil
+	}}
+	_, broker, router := newReceivedServer(ms)
+	w := submit(t, router, "/txs", append(append([]byte(nil), rawA...), rawA...))
+	if w.Code >= 300 {
+		t.Fatalf("status = %d; body=%s", w.Code, w.Body.String())
+	}
+
+	if n := calls.Load(); n != 1 {
+		t.Errorf("CAS calls = %d, want 1", n)
+	}
+	if len(ms.setRawTxCalls) != 0 {
+		t.Errorf("SetRawTx called for %v; nothing was republished", slices.Collect(maps.Keys(ms.setRawTxCalls)))
+	}
+	envs := publishedEnvelopes(t, broker)
+	if len(envs) != 1 || envs[0]["txid"] != txidA {
+		t.Errorf("published %v, want one message for %s", envs, txidA)
+	}
+	var resp struct {
+		Submitted  int `json:"submitted"`
+		Duplicates int `json:"duplicates"`
+		Total      int `json:"total"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.Submitted != 1 || resp.Duplicates != 1 || resp.Total != 2 {
+		t.Errorf("response = %+v, want submitted 1, duplicates 1, total 2", resp)
+	}
+}
+
+// ctxCheckingPub fails a publish whose context is already done, as the Kafka
+// producer does.
+type ctxCheckingPub struct{ *orderingPub }
+
+func (p ctxCheckingPub) Publish(ctx context.Context, st *models.TransactionStatus) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return p.orderingPub.Publish(ctx, st)
+}
+
+func (p ctxCheckingPub) PublishBulk(ctx context.Context, st *models.TransactionStatus) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return p.orderingPub.PublishBulk(ctx, st)
+}
+
+// A client that gives up mid-batch cancels the request, and the batch sheds.
+// The rows it inserted still get their RECEIVED: only the inserter publishes
+// it (#391), so dropping it here would lose it for good.
+func TestHandleSubmitTransactions_ShedAfterClientCancel_PublishesReceived(t *testing.T) {
+	prev := store.BatchConcurrency()
+	store.SetBatchConcurrency(1)
+	t.Cleanup(func() { store.SetBatchConcurrency(prev) })
+
+	rawA, rawB, txidA, txidB := twoDistinctTxs(t)
+	ctx, cancel := context.WithCancel(t.Context())
+	ms := &mockStore{getOrInsertFn: func(in *models.TransactionStatus) (*models.TransactionStatus, bool, error) {
+		if in.TxID == txidB {
+			cancel() // the client times out while B's write is in flight
+			return nil, false, context.Canceled
+		}
+		return in, true, nil
+	}}
+	var pub ctxCheckingPub
+	_, _, router := newReceivedServerWith(ms, func(s *Server) {
+		pub = ctxCheckingPub{s.publisher.(*orderingPub)}
+		s.publisher = pub
+	})
+	req := httptest.NewRequestWithContext(ctx, http.MethodPost, "/txs", bytes.NewReader(append(append([]byte(nil), rawA...), rawB...)))
+	req.Header.Set("Content-Type", "application/octet-stream")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503; body=%s", w.Code, w.Body.String())
+	}
+	if len(pub.publishes) != 1 || pub.publishes[0].TxID != txidA || pub.publishes[0].Status != models.StatusReceived {
+		t.Errorf("publishes = %+v, want one RECEIVED for the inserted %s", pub.publishes, txidA)
+	}
+}
+
+// On a store without a native batch insert the rows CAS in parallel, and
+// every row holds its own intake slot, so concurrent batches share the
+// pod-wide bound however many rows each runs at once.
+func TestHandleSubmitTransactions_PerRowCASBoundedPodWide(t *testing.T) {
+	prev := store.BatchConcurrency()
+	store.SetBatchConcurrency(4)
+	t.Cleanup(func() { store.SetBatchConcurrency(prev) })
+
+	rawA, rawB, _, _ := twoDistinctTxs(t)
+	var mu sync.Mutex
+	inFlight, maxInFlight := 0, 0
+	ms := &mockStore{getOrInsertFn: func(in *models.TransactionStatus) (*models.TransactionStatus, bool, error) {
+		mu.Lock()
+		inFlight++
+		maxInFlight = max(maxInFlight, inFlight)
+		mu.Unlock()
+		time.Sleep(5 * time.Millisecond) // long enough for an unbounded sibling to overlap
+		mu.Lock()
+		inFlight--
+		mu.Unlock()
+		return in, true, nil
+	}}
+	_, _, router := newReceivedServerWith(ms, func(s *Server) { s.intakeSlots = semaphore.NewWeighted(1) })
+	if w := submit(t, router, "/txs", append(append([]byte(nil), rawA...), rawB...)); w.Code >= 300 {
+		t.Fatalf("status = %d; body=%s", w.Code, w.Body.String())
+	}
+	if maxInFlight != 1 {
+		t.Errorf("max concurrent CAS calls = %d, want 1 (the pod-wide slots)", maxInFlight)
+	}
+}
+
+// A native batch that fails with no per-row results (Postgres's single
+// statement) knows of no inserted row: 503, nothing published.
+func TestHandleSubmitTransactions_NativeBatchErrorWithoutResults(t *testing.T) {
+	rawA, rawB, _, _ := twoDistinctTxs(t)
+	ms := &mockStore{batchCASFn: func([]*models.TransactionStatus) ([]store.BatchInsertResult, error) {
+		return nil, errors.New("statement failed")
+	}}
+	pub, broker, router := newReceivedServerWith(ms, func(s *Server) { s.store = nativeBatchStore{ms} })
+	w := submit(t, router, "/txs", append(append([]byte(nil), rawA...), rawB...))
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503; body=%s", w.Code, w.Body.String())
+	}
+	if n := len(pub.publishes) + len(pub.bulkPublishes) + len(broker.Sends) + broker.BatchCalls; n != 0 {
+		t.Errorf("published %d events/messages for a batch with no known insert", n)
+	}
+}
+
+// A native batch that fails after inserting some rows reports them per row;
+// the shed publishes RECEIVED for exactly those and nothing reaches Kafka.
+func TestHandleSubmitTransactions_NativeBatchPartialError(t *testing.T) {
+	rawA, rawB, txidA, _ := twoDistinctTxs(t)
+	ms := &mockStore{batchCASFn: func(rows []*models.TransactionStatus) ([]store.BatchInsertResult, error) {
+		out := make([]store.BatchInsertResult, len(rows))
+		for i, r := range rows {
+			if r.TxID == txidA {
+				out[i] = store.BatchInsertResult{Inserted: true}
+			}
+		}
+		return out, errors.New("second row's write failed")
+	}}
+	pub, broker, router := newReceivedServerWith(ms, func(s *Server) { s.store = nativeBatchStore{ms} })
+	w := submit(t, router, "/txs", append(append([]byte(nil), rawA...), rawB...))
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503; body=%s", w.Code, w.Body.String())
+	}
+	if n := len(broker.Sends) + broker.BatchCalls; n != 0 {
+		t.Errorf("shed batch queued propagation: %d", n)
+	}
+	if len(pub.publishes) != 1 || pub.publishes[0].TxID != txidA || len(pub.bulkPublishes) != 0 {
+		t.Errorf("publishes = %+v bulk = %+v, want one RECEIVED for %s", pub.publishes, pub.bulkPublishes, txidA)
 	}
 }

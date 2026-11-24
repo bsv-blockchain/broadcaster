@@ -332,6 +332,28 @@ var PropagationMissingParentTotal = promauto.NewCounterVec(prometheus.CounterOpt
 	Help: "Teranode missing-parent responses by resolution (requeued vs durable reaper retry vs rejected via a REJECTED ancestor in BSV Broadcaster's store).",
 }, []string{"outcome"}) // requeued, reaper_retry, rejected_ancestor
 
+// PropagationHydrateDroppedTotal counts propagation messages the consumer
+// dropped because it could not load their raw transaction from the store
+// (#329: messages carry the txid only). reason="row_missing": no row for the
+// txid. reason="terminal": the row is terminal and its raw_tx was cleared —
+// redelivered work that is already done, expected. reason="raw_tx_missing":
+// a non-terminal row with no raw_tx; intake always persists raw_tx before
+// publishing, so this should stay at zero. reason="malformed": the message
+// did not decode or carried no txid.
+var PropagationHydrateDroppedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "bsv_broadcaster_propagation_hydrate_dropped_total",
+	Help: "Propagation messages dropped because their raw transaction could not be loaded from the store, by reason.",
+}, []string{"reason"}) // row_missing, terminal, raw_tx_missing, malformed
+
+// PropagationHydrateErrorsTotal counts failed store reads while hydrating
+// propagation messages. The consumer retries with backoff and does not
+// advance past the batch, so a sustained rate means propagation is stalled
+// on the store.
+var PropagationHydrateErrorsTotal = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "bsv_broadcaster_propagation_hydrate_errors_total",
+	Help: "Failed store reads while loading raw transactions for propagation messages.",
+})
+
 // PropagationRequeueExhaustedTotal counts transactions parked at PENDING_RETRY
 // because they burned their whole in-memory NETWORK requeue budget
 // (propagation.retry_max_attempts) without ever producing a network verdict.
@@ -1381,3 +1403,66 @@ var APIKeyCacheTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "bsv_broadcaster_apikey_cache_total",
 	Help: "API key resolutions by cache result (hit|miss|negative|failing|stale|error|canceled).",
 }, []string{"result"})
+
+// APIKeyIntrospectTotal counts calls to external introspection providers
+// (auth.introspection) by provider and result: valid | invalid (the
+// provider answered that the key is not valid) | unauthorized (the provider
+// rejected our service token -- a config error, not an outage) | error |
+// backoff (not called: backing off after an earlier failure).
+var APIKeyIntrospectTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "bsv_broadcaster_apikey_introspect_total",
+	Help: "API key introspection calls by provider and result (valid|invalid|unauthorized|error|backoff).",
+}, []string{"provider", "result"})
+
+// UsageRequestsTotal counts requests metered for usage reporting, by
+// provider (source), route name and status class. No key label: per-key
+// totals go to the provider, not to Prometheus.
+var UsageRequestsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "bsv_broadcaster_usage_requests_total",
+	Help: "Requests metered for usage reporting, by provider, endpoint and status class.",
+}, []string{"source", "endpoint", "class"})
+
+// UsageFlushTotal counts usage report calls by provider and result: ok |
+// retry (kept for a later flush: 503/429, or not sent) | unauthorized |
+// misconfigured (404: no usage endpoint for this token yet; kept) |
+// uncertain (dropped: the receiver may have recorded it) | rejected (400)
+// | disabled (501).
+var UsageFlushTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "bsv_broadcaster_usage_flush_total",
+	Help: "Usage report calls by provider and result (ok|retry|unauthorized|misconfigured|uncertain|rejected|disabled).",
+}, []string{"sink", "result"})
+
+// UsageEntriesSentTotal counts usage entries a provider accepted.
+var UsageEntriesSentTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "bsv_broadcaster_usage_entries_sent_total",
+	Help: "Usage entries accepted by the provider.",
+}, []string{"sink"})
+
+// UsageEntriesDroppedTotal counts usage entries never delivered, by reason:
+// uncertain | rejected | invalid | overflow | disabled | shutdown.
+var UsageEntriesDroppedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "bsv_broadcaster_usage_entries_dropped_total",
+	Help: "Usage entries never delivered, by provider and reason.",
+}, []string{"sink", "reason"})
+
+// UsagePendingEntries is how many usage entries wait for a retry, per
+// provider.
+var UsagePendingEntries = promauto.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "bsv_broadcaster_usage_pending_entries",
+	Help: "Usage entries waiting to be retried, per provider.",
+}, []string{"sink"})
+
+// UsageBuckets is how many usage buckets this replica holds before the
+// next flush.
+var UsageBuckets = promauto.NewGauge(prometheus.GaugeOpts{
+	Name: "bsv_broadcaster_usage_buckets",
+	Help: "Usage buckets held in memory until the next flush.",
+})
+
+// RetentionExtendFailuresTotal counts resubmits whose transaction row could
+// not be extended to the submitter's retention. The submit answers 503 so
+// the client's retry repeats the extend; intake rejections only count it.
+var RetentionExtendFailuresTotal = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "bsv_broadcaster_retention_extend_failures_total",
+	Help: "Resubmits whose transaction row could not be extended to the submitter's retention.",
+})

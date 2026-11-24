@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"net"
 	"net/url"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	chaintracksconfig "github.com/bsv-blockchain/go-chaintracks/config"
 	"github.com/spf13/cobra"
@@ -142,6 +144,7 @@ type Config struct {
 	Auth          AuthConfig          `mapstructure:"auth"`
 	Admin         AdminConfig         `mapstructure:"admin"`
 	RateLimit     RateLimitConfig     `mapstructure:"ratelimit"`
+	Usage         UsageConfig         `mapstructure:"usage"`
 	// ChaintracksServer gates whether the embedded go-chaintracks HTTP API
 	// runs alongside api-server. Default is on so the refactor is a drop-in
 	// replacement for the original single-binary BSV Broadcaster.
@@ -204,6 +207,71 @@ type API struct {
 	// default) trusts none, so the header is never honored regardless of
 	// TrustedPlatform.
 	TrustedProxies []string `mapstructure:"trusted_proxies"`
+	// IntakeStoreConcurrency caps the store writes POST /txs intake keeps in
+	// flight across the whole pod (dedup CAS, retention extends, raw-tx
+	// restores). Each request runs its rows store.batch_concurrency at a
+	// time; this bound stops concurrent batches from multiplying that past
+	// the store's connection pool and starving every other endpoint's
+	// queries. 0 (the default) derives it: half of store.mongodb.max_pool_size
+	// on MongoDB (half the driver's default pool of 100 when that is unset),
+	// else DefaultIntakeStoreConcurrency.
+	IntakeStoreConcurrency int `mapstructure:"intake_store_concurrency"`
+	// CallbackStoreConcurrency caps the status writes merkle-service
+	// callbacks keep in flight across the whole pod. A burst of SEEN
+	// callbacks otherwise runs store.batch_concurrency writes per callback
+	// with no shared bound, takes every pool connection, and stalls /txs and
+	// the quota reservation behind it. 0 (the default) derives it: a quarter
+	// of store.mongodb.max_pool_size on MongoDB, else
+	// DefaultCallbackStoreConcurrency.
+	CallbackStoreConcurrency int `mapstructure:"callback_store_concurrency"`
+}
+
+// DefaultCallbackStoreConcurrency is the callback write cap on backends whose
+// pool api.callback_store_concurrency cannot derive from.
+const DefaultCallbackStoreConcurrency = 16
+
+// CallbackStoreConcurrencyLimit resolves api.callback_store_concurrency (see
+// API.CallbackStoreConcurrency). A quarter of the pool leaves half for /txs
+// (IntakeStoreConcurrencyLimit) and a quarter for reads, the quota
+// reservation and the submission recorder.
+func (c *Config) CallbackStoreConcurrencyLimit() int {
+	if c.APIServer.CallbackStoreConcurrency > 0 {
+		return c.APIServer.CallbackStoreConcurrency
+	}
+	if c.Store.Backend != "mongodb" {
+		return DefaultCallbackStoreConcurrency
+	}
+	pool := c.Store.Mongo.MaxPoolSize
+	if pool <= 0 {
+		pool = mongoDriverDefaultPool
+	}
+	return max(1, pool/4)
+}
+
+// DefaultIntakeStoreConcurrency is the intake write cap on backends whose
+// pool api.intake_store_concurrency cannot derive from.
+const DefaultIntakeStoreConcurrency = 32
+
+// mongoDriverDefaultPool is the MongoDB driver's own max pool size, in force
+// when neither store.mongodb.max_pool_size nor the URI sets one.
+const mongoDriverDefaultPool = 100
+
+// IntakeStoreConcurrencyLimit resolves api.intake_store_concurrency (see
+// API.IntakeStoreConcurrency). Half the pool leaves the rest to the point
+// reads, the submission recorder, SSE catchup and the other services in the
+// process.
+func (c *Config) IntakeStoreConcurrencyLimit() int {
+	if c.APIServer.IntakeStoreConcurrency > 0 {
+		return c.APIServer.IntakeStoreConcurrency
+	}
+	if c.Store.Backend != "mongodb" {
+		return DefaultIntakeStoreConcurrency
+	}
+	pool := c.Store.Mongo.MaxPoolSize
+	if pool <= 0 {
+		pool = mongoDriverDefaultPool
+	}
+	return max(1, pool/2)
 }
 
 // TrustedPlatformCloudflare is the api.trusted_platform value for
@@ -228,6 +296,118 @@ type AuthConfig struct {
 	// key set and one quota window per key. Unset (uri empty) keeps keys and
 	// quota in the main store. See docs/api-keys.md.
 	Store AuthStoreConfig `mapstructure:"store"`
+	// Introspection maps a provider name to a delegated-auth endpoint that
+	// verifies the keys the provider issues under its own prefix. Keys
+	// under the broadcaster's own bsvb_ prefix always resolve from the key
+	// store. See docs/api-keys.md.
+	Introspection map[string]IntrospectionProvider `mapstructure:"introspection"`
+}
+
+// IntrospectionProvider is one auth.introspection entry.
+type IntrospectionProvider struct {
+	// KeyPrefix routes keys to this provider, e.g. "acme_". Keys must follow
+	// the broadcaster's format under it: prefix, 43 base62 characters, "_",
+	// then a 6-character base62 CRC32 of the body.
+	KeyPrefix string `mapstructure:"key_prefix"`
+	// URL is the introspection endpoint. It must be https, except on a
+	// loopback host: the service token travels with every call.
+	URL string `mapstructure:"url"`
+	// Token is the service token sent as a Bearer. Set exactly one of Token
+	// or TokenEnv; prefer TokenEnv so the secret stays out of config files.
+	Token string `mapstructure:"token"`
+	// TokenEnv names the environment variable holding the service token.
+	TokenEnv string `mapstructure:"token_env"`
+	// TimeoutMs bounds each introspection call. 0 means
+	// DefaultIntrospectionTimeoutMs.
+	TimeoutMs int `mapstructure:"timeout_ms"`
+	// UsageURL, when set, is the provider's usage endpoint: with
+	// usage.enabled, the api-server reports what each of this provider's
+	// keys used there, under the provider's own key id. Same URL rules and
+	// service token as URL. See docs/api-keys.md.
+	UsageURL string `mapstructure:"usage_url"`
+	// Tiers maps the tier names the provider returns to ratelimit.tiers
+	// names. A provider tier missing here gets free, so a provider can only
+	// grant the tiers the operator maps. Provider tier names match
+	// case-insensitively.
+	Tiers map[string]string `mapstructure:"tiers"`
+}
+
+// Introspection timeouts. The maximum stays under the API key resolver's
+// own 5s lookup timeout, so a slow provider surfaces as this call's error
+// rather than the resolver abandoning it.
+const (
+	DefaultIntrospectionTimeoutMs = 3000
+	MaxIntrospectionTimeoutMs     = 4500
+)
+
+// ServiceToken returns the provider's service token, Token or the value of
+// the environment variable TokenEnv names, with surrounding whitespace
+// trimmed (a secret mounted from a file usually ends in a newline).
+func (p IntrospectionProvider) ServiceToken() string {
+	if p.TokenEnv != "" {
+		return strings.TrimSpace(os.Getenv(p.TokenEnv))
+	}
+	return strings.TrimSpace(p.Token)
+}
+
+// Timeout is TimeoutMs as a duration, defaulted.
+func (p IntrospectionProvider) Timeout() time.Duration {
+	if p.TimeoutMs == 0 {
+		return DefaultIntrospectionTimeoutMs * time.Millisecond
+	}
+	return time.Duration(p.TimeoutMs) * time.Millisecond
+}
+
+// UsageConfig meters API usage per key and reports it to the delegated-auth
+// providers that set auth.introspection.<name>.usage_url. Off by default.
+type UsageConfig struct {
+	Enabled bool `mapstructure:"enabled"`
+	// FlushIntervalMs is how often each replica reports what it counted.
+	FlushIntervalMs int `mapstructure:"flush_interval_ms"`
+	// MaxBuckets bounds the (key, route, status class, day) cells a replica
+	// holds between flushes; past it new cells are dropped and counted.
+	MaxBuckets int `mapstructure:"max_buckets"`
+	// MaxPendingEntries bounds, per provider, the entries kept for a retry
+	// while the provider is unavailable; the oldest are dropped first.
+	MaxPendingEntries int `mapstructure:"max_pending_entries"`
+	// ShutdownFlushTimeoutMs bounds the final report on shutdown.
+	ShutdownFlushTimeoutMs int `mapstructure:"shutdown_flush_timeout_ms"`
+	// Network is the network name reported with every usage entry, so a
+	// provider whose keys work on several deployments can tell them apart.
+	// Empty (the default) reports the deployment's `network`; set it when
+	// the provider names a network differently (e.g. "ttn" for
+	// teratestnet).
+	Network string `mapstructure:"network"`
+}
+
+// usageNetworkRe bounds usage.network: a short lowercase label.
+var usageNetworkRe = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,31}$`)
+
+// UsageNetwork is the network name reported with usage: usage.network,
+// else the deployment's network.
+func (c *Config) UsageNetwork() string {
+	if c.Usage.Network != "" {
+		return c.Usage.Network
+	}
+	return c.Network
+}
+
+// Usage reporting bounds.
+const (
+	MinUsageFlushIntervalMs = 10_000
+	MaxUsageFlushIntervalMs = 3_600_000
+)
+
+// UsageProviders are the auth.introspection providers with a usage_url, in
+// name order.
+func (c *Config) UsageProviders() []string {
+	var out []string
+	for _, name := range slices.Sorted(maps.Keys(c.Auth.Introspection)) {
+		if c.Auth.Introspection[name].UsageURL != "" {
+			out = append(out, name)
+		}
+	}
+	return out
 }
 
 // AuthStoreConfig is auth.store. Only MongoDB is supported.
@@ -284,6 +464,59 @@ type TierConfig struct {
 	UnitsPerMinute int64 `mapstructure:"units_per_minute"`
 	MaxInFlight    int   `mapstructure:"max_in_flight"`
 	MaxBatch       int   `mapstructure:"max_batch"`
+	// RetentionDays is how long the transaction and submission rows written
+	// for this tier's callers are kept before the store deletes them. Zero
+	// (the default) keeps them forever. Only stores that implement retention
+	// (MongoDB) enforce it; see docs/api-keys.md.
+	RetentionDays int `mapstructure:"retention_days"`
+	// BurstUnits caps the per-IP token bucket that enforces
+	// ratelimit.anonymous: how many units an unkeyed caller can spend at
+	// once before it is held to the refill rate. Zero (the default) keeps
+	// one minute of burst, units_per_minute. Only valid on
+	// ratelimit.anonymous: keyed tiers share a per-minute window instead.
+	BurstUnits int64 `mapstructure:"burst_units"`
+}
+
+// Burst is the bucket capacity for a tier enforced by a token bucket:
+// BurstUnits when set, otherwise one minute of units.
+func (t TierConfig) Burst() int64 {
+	if t.BurstUnits > 0 {
+		return t.BurstUnits
+	}
+	return t.UnitsPerMinute
+}
+
+// Retention is RetentionDays as a duration; zero means keep forever.
+func (t TierConfig) Retention() time.Duration {
+	return time.Duration(t.RetentionDays) * 24 * time.Hour
+}
+
+// RetentionFor is the retention for a caller on tier: ratelimit.anonymous
+// for TierAnonymous, the named tier, or free for a tier that is not
+// configured (the same fallback the rate limiter applies). Zero means keep
+// forever.
+func (rl RateLimitConfig) RetentionFor(tier string) time.Duration {
+	if tier == TierAnonymous {
+		return rl.Anonymous.Retention()
+	}
+	if t, ok := rl.Tiers[tier]; ok {
+		return t.Retention()
+	}
+	return rl.Tiers[TierFree].Retention()
+}
+
+// RetentionConfigured reports whether any tier (or anonymous) sets a
+// retention, i.e. whether rows may ever expire.
+func (rl RateLimitConfig) RetentionConfigured() bool {
+	if rl.Anonymous.RetentionDays > 0 {
+		return true
+	}
+	for _, t := range rl.Tiers {
+		if t.RetentionDays > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // Kafka configures the message broker. Backend picks between a real Sarama
@@ -1384,11 +1617,13 @@ func Load(cmd *cobra.Command) (*Config, error) {
 	if len(legacyEnv) > 0 {
 		cfg.Deprecations = append(cfg.Deprecations, fmt.Sprintf(
 			"environment variables with the legacy %s_ prefix are deprecated; rename them to %s_*: %s",
-			LegacyEnvPrefix, EnvPrefix, strings.Join(legacyEnv, ", ")))
+			LegacyEnvPrefix, EnvPrefix, strings.Join(legacyEnv, ", "),
+		))
 	}
 	if used := viper.ConfigFileUsed(); strings.HasPrefix(used, legacyConfigDir+"/") {
 		cfg.Deprecations = append(cfg.Deprecations, fmt.Sprintf(
-			"config file %s is in the legacy directory %s; move it to /etc/bsv-broadcaster", used, legacyConfigDir))
+			"config file %s is in the legacy directory %s; move it to /etc/bsv-broadcaster", used, legacyConfigDir,
+		))
 	}
 
 	return &cfg, nil
@@ -1463,6 +1698,8 @@ func setDefaults() {
 	viper.SetDefault("api.port", 8080)
 	viper.SetDefault("api.trusted_platform", "")
 	viper.SetDefault("api.trusted_proxies", []string{})
+	viper.SetDefault("api.intake_store_concurrency", 0)
+	viper.SetDefault("api.callback_store_concurrency", 0)
 	// API keys, admin and rate limiting all ship off. Only the free tier
 	// and the anonymous tier have defaults: viper deep-merges maps, so a
 	// default "pro" tier could never be removed by an operator's config.
@@ -1485,6 +1722,14 @@ func setDefaults() {
 	viper.SetDefault("admin.port", 8090)
 	viper.SetDefault("admin.token", "")
 	viper.SetDefault("ratelimit.enabled", false)
+	// Usage reporting ships off; each key is declared so
+	// BSV_BROADCASTER_USAGE_* overrides bind.
+	viper.SetDefault("usage.enabled", false)
+	viper.SetDefault("usage.flush_interval_ms", 60_000)
+	viper.SetDefault("usage.max_buckets", 100_000)
+	viper.SetDefault("usage.max_pending_entries", 100_000)
+	viper.SetDefault("usage.shutdown_flush_timeout_ms", 10_000)
+	viper.SetDefault("usage.network", "")
 	viper.SetDefault("ratelimit.lease_fraction", 0.10)
 	viper.SetDefault("ratelimit.shrink_threshold", 0.80)
 	viper.SetDefault("ratelimit.key_cache_ttl_ms", 30000)
@@ -1495,9 +1740,17 @@ func setDefaults() {
 	viper.SetDefault("ratelimit.anonymous.units_per_minute", 50)
 	viper.SetDefault("ratelimit.anonymous.max_in_flight", 5)
 	viper.SetDefault("ratelimit.anonymous.max_batch", 1)
+	// retention_days 0 keeps rows forever: no deployment starts deleting
+	// data on upgrade. Declared so BSV_BROADCASTER_RATELIMIT_*_RETENTION_DAYS
+	// overrides bind.
+	viper.SetDefault("ratelimit.anonymous.retention_days", 0)
+	// 0 keeps one minute of burst. Declared so
+	// BSV_BROADCASTER_RATELIMIT_ANONYMOUS_BURST_UNITS binds.
+	viper.SetDefault("ratelimit.anonymous.burst_units", 0)
 	viper.SetDefault("ratelimit.tiers.free.units_per_minute", 50)
 	viper.SetDefault("ratelimit.tiers.free.max_in_flight", 5)
 	viper.SetDefault("ratelimit.tiers.free.max_batch", 1)
+	viper.SetDefault("ratelimit.tiers.free.retention_days", 0)
 	viper.SetDefault("kafka.backend", "sarama")
 	// callback_* and merkle_service.* defaults exist so viper.AutomaticEnv
 	// knows the keys: without a registered key a BSV_BROADCASTER_MERKLE_SERVICE_URLS
@@ -2010,6 +2263,154 @@ func validateAuthStore(cfg *Config) error {
 	return nil
 }
 
+// localKeyPrefix is apikey.Prefix, the prefix of keys the broadcaster
+// issues itself. config cannot import apikey (apikey imports config).
+const localKeyPrefix = "bsvb_"
+
+// keyPrefixRe bounds auth.introspection key prefixes: lowercase
+// alphanumerics ending in "_", like bsvb_ itself.
+var keyPrefixRe = regexp.MustCompile(`^[a-z0-9]+_$`)
+
+// validateIntrospection checks auth.introspection. Errors never echo a
+// token.
+func validateIntrospection(cfg *Config) error {
+	if len(cfg.Auth.Introspection) == 0 {
+		return nil
+	}
+	if !cfg.Auth.Enabled {
+		return fmt.Errorf("auth.introspection requires auth.enabled")
+	}
+	prefixes := map[string]string{localKeyPrefix: "the broadcaster's own keys"}
+	names := slices.Sorted(maps.Keys(cfg.Auth.Introspection))
+	for _, name := range names {
+		p := cfg.Auth.Introspection[name]
+		field := "auth.introspection." + name
+		if !tierNameRe.MatchString(name) {
+			return fmt.Errorf("%s: provider name must match %s", field, tierNameRe.String())
+		}
+		if !keyPrefixRe.MatchString(p.KeyPrefix) {
+			return fmt.Errorf("%s.key_prefix %q must match %s", field, p.KeyPrefix, keyPrefixRe.String())
+		}
+		for other, owner := range prefixes {
+			if strings.HasPrefix(p.KeyPrefix, other) || strings.HasPrefix(other, p.KeyPrefix) {
+				return fmt.Errorf("%s.key_prefix %q overlaps %q (%s)", field, p.KeyPrefix, other, owner)
+			}
+		}
+		prefixes[p.KeyPrefix] = field
+		if err := validateProviderURL(field+".url", p.URL); err != nil {
+			return err
+		}
+		if p.UsageURL != "" {
+			if err := validateProviderURL(field+".usage_url", p.UsageURL); err != nil {
+				return err
+			}
+		}
+		switch {
+		case p.Token != "" && p.TokenEnv != "":
+			return fmt.Errorf("%s: set token or token_env, not both", field)
+		case p.TokenEnv != "" && p.ServiceToken() == "":
+			return fmt.Errorf("%s.token_env: environment variable %s is empty or unset", field, p.TokenEnv)
+		case p.ServiceToken() == "":
+			return fmt.Errorf("%s: token or token_env is required", field)
+		case strings.IndexFunc(p.ServiceToken(), func(r rune) bool { return r <= ' ' || r == 0x7f }) >= 0:
+			return fmt.Errorf("%s: the service token contains whitespace or control characters", field)
+		}
+		for providerTier, local := range p.Tiers {
+			if providerTier == "" {
+				return fmt.Errorf("%s.tiers: empty provider tier name", field)
+			}
+			if _, ok := cfg.RateLimit.Tiers[local]; !ok {
+				return fmt.Errorf("%s.tiers.%s: %q is not a configured ratelimit tier", field, providerTier, local)
+			}
+		}
+		if p.TimeoutMs < 0 || p.TimeoutMs > MaxIntrospectionTimeoutMs {
+			return fmt.Errorf("%s.timeout_ms must be between 0 (default %d) and %d", field, DefaultIntrospectionTimeoutMs, MaxIntrospectionTimeoutMs)
+		}
+	}
+	return nil
+}
+
+// validateProviderURL applies the rules for a URL the service token is sent
+// to: absolute https (http only on a loopback host), no user info, query or
+// fragment. field names it in the error.
+func validateProviderURL(field, raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" || (u.Scheme != "https" && (u.Scheme != "http" || !isLoopbackHost(u.Hostname()))) {
+		return fmt.Errorf("%s must be an absolute https URL (http only on a loopback host)", field)
+	}
+	if u.User != nil {
+		return fmt.Errorf("%s must not contain user info; the service token authenticates", field)
+	}
+	if u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
+		return fmt.Errorf("%s must not contain a query or fragment", field)
+	}
+	return nil
+}
+
+// validateUsage checks usage.*.
+func validateUsage(cfg *Config) error {
+	u := cfg.Usage
+	if !u.Enabled {
+		return nil
+	}
+	if !cfg.Auth.Enabled {
+		return fmt.Errorf("usage.enabled requires auth.enabled")
+	}
+	if len(cfg.UsageProviders()) == 0 {
+		return fmt.Errorf("usage.enabled but no auth.introspection provider sets usage_url: there is nowhere to report usage")
+	}
+	if u.FlushIntervalMs < MinUsageFlushIntervalMs || u.FlushIntervalMs > MaxUsageFlushIntervalMs {
+		return fmt.Errorf("usage.flush_interval_ms must be between %d and %d", MinUsageFlushIntervalMs, MaxUsageFlushIntervalMs)
+	}
+	if u.MaxBuckets <= 0 || u.MaxPendingEntries <= 0 || u.ShutdownFlushTimeoutMs <= 0 {
+		return fmt.Errorf("usage.max_buckets, usage.max_pending_entries and usage.shutdown_flush_timeout_ms must be > 0")
+	}
+	if u.Network != "" && !usageNetworkRe.MatchString(u.Network) {
+		return fmt.Errorf("usage.network %q must match %s", u.Network, usageNetworkRe.String())
+	}
+	return nil
+}
+
+// isLoopbackHost reports whether host is localhost or a loopback IP.
+func isLoopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+// minRetentionDays is the shortest retention a tier may configure:
+// rows must outlive every in-flight window — propagation retries, parking,
+// confirmation tracking.
+const minRetentionDays = 7
+
+// maxRetentionDays bounds retention_days (100 years) so the duration cannot
+// overflow into a tiny or negative value.
+const maxRetentionDays = 36500
+
+// validateRetention checks every tier's retention_days. It applies whether
+// or not rate limiting is enabled: retention follows the caller's tier
+// (anonymous when auth is off) either way.
+func validateRetention(rl RateLimitConfig) error {
+	check := func(name string, days int) error {
+		if days != 0 && (days < minRetentionDays || days > maxRetentionDays) {
+			return fmt.Errorf("ratelimit tier %q: retention_days must be 0 (keep forever) or between %d and %d, got %d",
+				name, minRetentionDays, maxRetentionDays, days)
+		}
+		return nil
+	}
+	if err := check(TierAnonymous, rl.Anonymous.RetentionDays); err != nil {
+		return err
+	}
+	for _, name := range slices.Sorted(maps.Keys(rl.Tiers)) {
+		if err := check(name, rl.Tiers[name].RetentionDays); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // validateAccessControl checks the API-key, admin and rate-limit settings.
 func validateAccessControl(cfg *Config) error {
 	switch cfg.APIServer.TrustedPlatform {
@@ -2034,6 +2435,15 @@ func validateAccessControl(cfg *Config) error {
 		}
 	}
 	if err := validateAuthStore(cfg); err != nil {
+		return err
+	}
+	if err := validateIntrospection(cfg); err != nil {
+		return err
+	}
+	if err := validateUsage(cfg); err != nil {
+		return err
+	}
+	if err := validateRetention(cfg.RateLimit); err != nil {
 		return err
 	}
 	rl := cfg.RateLimit
@@ -2074,9 +2484,15 @@ func validateAccessControl(cfg *Config) error {
 	if err := check(TierAnonymous, rl.Anonymous); err != nil {
 		return err
 	}
+	if err := checkAnonymousBurst(rl.Anonymous, rl.Costs); err != nil {
+		return err
+	}
 	for name, t := range rl.Tiers {
 		if !tierNameRe.MatchString(name) {
 			return fmt.Errorf("ratelimit tier name %q is invalid: must match %s", name, tierNameRe.String())
+		}
+		if t.BurstUnits != 0 {
+			return fmt.Errorf("ratelimit tier %q: burst_units is only supported on ratelimit.anonymous", name)
 		}
 		if err := check(name, t); err != nil {
 			return err
@@ -2090,6 +2506,29 @@ func validateAccessControl(cfg *Config) error {
 // value, so anything outside this set risks breaking header syntax or
 // exploding label cardinality.
 var tierNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]*$`)
+
+// checkAnonymousBurst bounds ratelimit.anonymous.burst_units: at most one
+// minute of units (a larger bucket would let a caller beat its own rate),
+// and large enough for the costliest request the tier allows, or that
+// request could never succeed.
+func checkAnonymousBurst(t TierConfig, costs RateLimitCosts) error {
+	if t.BurstUnits == 0 {
+		return nil
+	}
+	if t.BurstUnits < 0 {
+		return fmt.Errorf("ratelimit.anonymous.burst_units must be >= 0, got %d", t.BurstUnits)
+	}
+	if t.UnitsPerMinute <= 0 {
+		return fmt.Errorf("ratelimit.anonymous.burst_units needs a bounded units_per_minute")
+	}
+	if t.BurstUnits > t.UnitsPerMinute {
+		return fmt.Errorf("ratelimit.anonymous.burst_units (%d) exceeds units_per_minute (%d)", t.BurstUnits, t.UnitsPerMinute)
+	}
+	if err := checkTierPayable(TierAnonymous, TierConfig{UnitsPerMinute: t.BurstUnits, MaxBatch: t.MaxBatch}, costs); err != nil {
+		return fmt.Errorf("ratelimit.anonymous.burst_units (%d) is too small: %w", t.BurstUnits, err)
+	}
+	return nil
+}
 
 // checkTierPayable rejects a bounded tier whose configured batch (or even a
 // single /tx, or a single read) could never fit in its own per-minute budget — a batch that

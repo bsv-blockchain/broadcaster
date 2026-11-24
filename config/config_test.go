@@ -685,3 +685,64 @@ func TestResolveChaintracksNetwork_TstnGenesis(t *testing.T) {
 		t.Errorf("tstn genesis: got %s, want %s", got, want)
 	}
 }
+
+// api.intake_store_concurrency defaults to half the MongoDB pool, so the
+// /txs intake writes leave the rest of the pool to everything else.
+func TestIntakeStoreConcurrencyLimit(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		backend string
+		pool    int
+		set     int
+		want    int
+	}{
+		{"explicit value wins", "mongodb", 32, 5, 5},
+		{"half the mongo pool", "mongodb", 32, 0, 16},
+		{"small mongo pool", "mongodb", 12, 0, 6},
+		{"pool of one still writes", "mongodb", 1, 0, 1},
+		{"driver default pool", "mongodb", 0, 0, 50},
+		{"other backends", "postgres", 0, 0, DefaultIntakeStoreConcurrency},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &Config{}
+			cfg.Store.Backend = tc.backend
+			cfg.Store.Mongo.MaxPoolSize = tc.pool
+			cfg.APIServer.IntakeStoreConcurrency = tc.set
+			if got := cfg.IntakeStoreConcurrencyLimit(); got != tc.want {
+				t.Errorf("IntakeStoreConcurrencyLimit() = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+// api.callback_store_concurrency defaults to a quarter of the MongoDB pool,
+// so a burst of merkle-service callbacks leaves /txs its share.
+func TestCallbackStoreConcurrencyLimit(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		backend string
+		pool    int
+		set     int
+		want    int
+	}{
+		{"explicit value wins", backendMongoDB, 32, 5, 5},
+		{"a quarter of the mongo pool", backendMongoDB, 32, 0, 8},
+		{"small mongo pool", backendMongoDB, 4, 0, 1},
+		{"pool of one still writes", backendMongoDB, 1, 0, 1},
+		{"driver default pool", backendMongoDB, 0, 0, 25},
+		{"other backends", "postgres", 0, 0, DefaultCallbackStoreConcurrency},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &Config{}
+			cfg.Store.Backend = tc.backend
+			cfg.Store.Mongo.MaxPoolSize = tc.pool
+			cfg.APIServer.CallbackStoreConcurrency = tc.set
+			if got := cfg.CallbackStoreConcurrencyLimit(); got != tc.want {
+				t.Errorf("CallbackStoreConcurrencyLimit() = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+// backendMongoDB is store.backend's MongoDB value.
+const backendMongoDB = "mongodb"

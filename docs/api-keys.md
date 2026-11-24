@@ -11,6 +11,10 @@ Send your key as a bearer token, the same header ARC clients already use:
 Authorization: Bearer bsvb_…
 ```
 
+Keys issued by a delegated-auth provider the deployment trusts (see
+[`auth.introspection`](#delegated-authentication-authintrospection)) are sent
+the same way.
+
 Requests without a key are served at the anonymous tier, limited per client
 IP by a bucket local to the replica that handled the request (not shared
 across replicas). An IPv6 client is bucketed by its `/64`, not its exact
@@ -37,6 +41,15 @@ per-replica token buckets that refill continuously instead. Because of the
 fixed window, a keyed caller can burst up to roughly 2× its per-minute limit
 across a minute boundary, and a small amount of leased-but-unspent quota can
 go undelivered if a replica goes idle mid-window.
+
+An anonymous bucket holds one minute of units by default, and a new client
+IP starts with a full bucket, so it can spend a whole minute's quota at once
+before being held to the refill rate. Set `ratelimit.anonymous.burst_units`
+to cap that: with `units_per_minute: 600` and `burst_units: 20`, an unkeyed
+caller sends at most two transactions back to back, then one a second. It
+must be no larger than `units_per_minute` and must cover the anonymous
+tier's largest request (`max_batch × submit_tx + read`). A request costing
+more than the burst gets `413`. Keyed tiers do not accept `burst_units`.
 
 A request that reaches a quota decision (allowed or denied by quota) carries
 `RateLimit-Policy` / `RateLimit` (draft-ietf-httpapi-ratelimit-headers-11)
@@ -101,11 +114,12 @@ admin:
 ratelimit:
   enabled: true
   expected_replicas: 3
+  anonymous: { units_per_minute: 50, max_in_flight: 5, max_batch: 1, retention_days: 30 }
   tiers:
-    free:       { units_per_minute: 50,    max_in_flight: 5,   max_batch: 1 }
-    standard:    { units_per_minute: 3000,  max_in_flight: 20,  max_batch: 100 }
-    high:        { units_per_minute: 30000, max_in_flight: 100, max_batch: 1000 }
-    unlimited: { units_per_minute: 0,     max_in_flight: 500, max_batch: 10000 }
+    free:      { units_per_minute: 50,    max_in_flight: 5,   max_batch: 1,     retention_days: 30 }
+    standard:  { units_per_minute: 3000,  max_in_flight: 20,  max_batch: 100,   retention_days: 90 }
+    high:      { units_per_minute: 30000, max_in_flight: 100, max_batch: 1000,  retention_days: 365 }
+    unlimited: { units_per_minute: 0,     max_in_flight: 500, max_batch: 10000, retention_days: 730 }
 ```
 
 **Trust model — read this before setting either option.** `c.ClientIP()`
@@ -131,6 +145,10 @@ logs.
   `units_per_minute`, and `max_batch × costs.submit_tx + costs.read` must
   too (checked at config load; a tier that could never pay for its own
   batch cap fails startup, not the first request).
+- `burst_units` (anonymous only) caps the anonymous bucket; `0` keeps one
+  minute of burst. See the quota description above.
+- `retention_days` is how long the transaction and submission rows a
+  tier's callers write are kept; see [Data retention per tier](#data-retention-per-tier).
 - Revocations and tier changes take effect within `key_cache_ttl_ms`
   (default 30s) while the key store is healthy. If the store is down, a
   key already resolved once keeps authenticating on its last known value
@@ -159,6 +177,73 @@ logs.
   `APIKeyStore`), but a tier assigned to a key must still exist under
   `ratelimit.tiers` — populate that section even in an admin-only,
   quota-off deployment if you plan to issue keys on tiers other than `free`.
+
+### Data retention per tier
+
+Each tier, and `ratelimit.anonymous`, can set `retention_days`: how long the
+rows written for its callers (the transaction row and the caller's
+submission/callback row) are kept before the store deletes them. `0`, the
+default, keeps them forever, so no deployment starts deleting data until a
+tier opts in. Otherwise it is between 7 and 36500 days. The 7-day floor
+outlives the default retry, parking and confirmation windows. A row deleted
+while still in flight (say, a transaction stuck unmined past its
+retention) is not an error, but its later status updates are dropped.
+
+- The caller's tier decides: a keyed caller uses its key's tier (a tier
+  missing from config falls back to `free`, as for rate limits), and an
+  unkeyed caller, or any caller when `auth.enabled` is off, uses
+  `ratelimit.anonymous`. Retention applies whether or not
+  `ratelimit.enabled` is set.
+- The expiry is stamped when a row is written: `now + retention_days`. A later
+  tier change does not move it.
+- **Resubmits extend, never shorten.** When a caller submits a transaction
+  that is already stored, the row's expiry moves out to that caller's, so a
+  transaction lives `retention_days` after the latest submission entitled to
+  the most. To avoid a write on every resubmit (clients that poll by
+  resubmitting), the row is only rewritten when the new expiry is later by
+  more than a thirtieth of the retention, at most a day: a 7-day row by
+  more than about 5.6 hours, a 90-day row by more than a day. So a row
+  can expire up to that much earlier than "retention after my last
+  submission".
+- A keep-forever caller removes the expiry, and a row already kept forever
+  never gains one.
+- If the extension fails, `POST /tx` and `POST /txs` answer `503` with
+  `Retry-After` instead of acknowledging the submission, and the client's
+  retry repeats it (extending is idempotent). The failure is counted in
+  `bsv_broadcaster_retention_extend_failures_total`. An intake rejection
+  (`400`) only counts it.
+- Each caller's submission row keeps its own expiry, normally no later than
+  the transaction row's. It can be later only if an extension failed on the
+  intake-rejection path; `GET /tx` then answers `404` for that txid once the
+  transaction row is gone.
+- **Set `ratelimit.anonymous.retention_days`.** Left at `0`, unkeyed callers
+  keep their rows forever. Since keep-forever removes an expiry, anyone can
+  resubmit a transaction's public raw bytes without a key and make its row
+  permanent, whatever tier first submitted it.
+- Rows written before retention was configured have no expiry and are
+  kept forever.
+
+**Backend support.** Only MongoDB enforces retention, through a TTL index on
+`expires_at` for `transactions` and `submissions` (`tx_expires_ttl`,
+`sub_expires_ttl`, `expireAfterSeconds: 0`, partial on the field existing).
+MongoDB's TTL monitor deletes expired documents in the background (about
+once a minute). On Postgres, Pebble and Aerospike, rows are kept forever and
+the api-server logs a warning at boot when a tier configures retention.
+
+The indexes are built only once retention is configured, by the
+api-server in the background after boot (bounded by
+`store.mongodb.index_timeout_ms`), so readiness does not wait on them.
+Upgrading without configuring retention builds nothing. A failed or
+timed-out build is logged, not fatal: rows are still stamped and expire once
+the indexes exist. On a large `transactions` collection, create them ahead of the
+deploy (same names, keys and options) so boot finds them in place:
+
+```js
+db.transactions.createIndex({expires_at: 1}, {name: "tx_expires_ttl", expireAfterSeconds: 0,
+  partialFilterExpression: {expires_at: {$exists: true}}})
+db.submissions.createIndex({expires_at: 1}, {name: "sub_expires_ttl", expireAfterSeconds: 0,
+  partialFilterExpression: {expires_at: {$exists: true}}})
+```
 
 ### Sharing one key set across deployments (`auth.store`)
 
@@ -242,6 +327,209 @@ When several deployments share one auth store:
   working up to `key_cache_stale_max_ms`, uncached keys get `503`, and quota
   fails open to a per-replica bucket. Host it where every region reaches it
   within `op_timeout_ms`.
+
+### Delegated authentication (`auth.introspection`)
+
+A deployment can delegate verification of some API keys to another service
+(a "provider") that issues and manages them, such as a customer dashboard
+or billing system. Each provider is configured with the prefix its keys
+carry and an introspection endpoint. Keys under that prefix are verified
+there and never reach the key store. Keys under `bsvb_` (the broadcaster's
+own) always resolve from the key store, and a key with any other prefix gets
+`401`.
+
+```yaml
+auth:
+  enabled: true                       # required when auth.introspection is set
+  introspection:
+    acme:                             # provider name: logs, metrics, id namespace
+      key_prefix: acme_
+      url: https://auth.example.com/v1/introspect
+      token_env: ACME_INTROSPECTION_TOKEN  # or token: <literal>; exactly one
+      timeout_ms: 3000                # default 3000, max 4500
+      tiers:                          # provider tier -> ratelimit.tiers name
+        basic: free
+        gold: pro
+```
+
+- `key_prefix` is lowercase alphanumerics ending in `_`, and must not overlap
+  `bsvb_` or another provider's prefix. Provider keys must use the
+  broadcaster's key format under it: the prefix, 43 base62 characters, `_`,
+  then a 6-character base62 CRC32 of the body. Malformed keys are rejected
+  before any network call.
+- `url` must be `https` (plain `http` is accepted only on a loopback host):
+  the service token travels with every call. It must not carry user info, a
+  query or a fragment. Redirects are not followed.
+- The service token is trimmed of surrounding whitespace (a secret mounted
+  from a file usually ends in a newline) and must not contain any other
+  whitespace or control characters.
+- `tiers` maps the tier names the provider returns (matched
+  case-insensitively) to tiers under `ratelimit.tiers`. A provider tier that
+  is not mapped, or a missing tier, gets `free`, so a provider can only grant
+  the tiers you map: it cannot claim an internal or unbounded tier by
+  returning its name.
+
+**Protocol.** For a key it has not seen (or whose cached answer is older than
+`key_cache_ttl_ms`), the api-server sends:
+
+```
+POST <url>
+Authorization: Bearer <service token>
+Content-Type: application/json
+
+{"key_hash": "<hex SHA-256 of the full key, prefix included>"}
+```
+
+The key itself never leaves the broadcaster. The provider answers:
+
+| Response | Meaning |
+|---|---|
+| `200 {"valid": true, "key_id", "tier"?, "limit_id"?, "expires_at"?}` | Usable key. `key_id` identifies the caller. `tier` is mapped through `tiers`. `expires_at` is an RFC 3339 timestamp, or null/absent for no expiry, and is enforced on every request, even from cache. Other fields are ignored. |
+| `200 {"valid": false}` | Unknown, revoked or out-of-scope key: `401`, cached for `key_cache_ttl_ms`. |
+| `401` / `403` | The provider rejected the service token. |
+| `429` / `5xx`, a timeout, any other status, or an answer that can't be decoded | The key can't be verified right now. |
+
+Every failure other than `{"valid": false}` is treated as an outage, never
+as an unknown key: cached keys keep working up to `key_cache_stale_max_ms`,
+uncached keys get `503`, and the cause is logged (at most once per 10s per
+kind).
+
+**Ids are namespaced.** The broadcaster records a provider key as
+`<provider>:<key_id>` (in logs, traces and quota accounting), and its
+`limit_id` as `<provider>:<limit_id>`. Two providers, or a provider and a
+local key, can never collide on an id.
+
+**Shared allowances.** When the answer carries a `limit_id`, every key with
+that `limit_id` shares one quota window, one `max_in_flight` budget and one
+fail-open bucket, so a customer cannot raise their limits by creating more
+keys. Without a `limit_id`, each key is its own allowance, like a `bsvb_` key.
+The provider must return the same tier for every key on one `limit_id`.
+
+**Backoff.** After a failed call the api-server stops calling that provider
+for a while and fails fast instead:
+
+| Failure | Backoff |
+|---|---|
+| `401` / `403`, or an unexpected status such as `404` or a redirect | 30s (a configuration fix is needed) |
+| `429` | `Retry-After` (seconds or an HTTP date, capped at 60s), else 5s |
+| `5xx` | `Retry-After` (capped at 60s), else 2s |
+| timeout, connection error, undecodable answer | 2s |
+| a valid answer without `key_id`, or an `expires_at` that isn't RFC 3339 | none: only that key gets `503` |
+
+A backoff only ever extends. During it, cached keys keep working and uncached
+keys get `503`. This keeps an outage or a bad token from sending every
+request to the provider, which matters for providers that rate-limit per
+source IP: a burst from one replica would otherwise throttle every replica
+behind the same egress. Each replica also makes at most 16 concurrent calls
+to one provider (a cap on calls, not just connections, so it holds over
+HTTP/2); further lookups queue for a free slot.
+
+Revoking a provider key takes effect within the provider's own propagation
+delay plus `key_cache_ttl_ms`. The admin endpoints (`/admin/keys`) manage
+only `bsvb_` keys.
+
+Metric: `bsv_broadcaster_apikey_introspect_total{provider,result}`, where
+`result` is `valid`, `invalid`, `unauthorized` (bad service token), `error`,
+or `backoff` (not called because of an earlier failure).
+
+### Usage reporting to a provider (`usage`)
+
+A provider that sets `usage_url` can receive what each of its keys used. The
+provider can then show customers their usage, or bill for it. This is off
+unless `usage.enabled` is set:
+
+```yaml
+usage:
+  enabled: true                 # requires auth.enabled and a provider usage_url
+  flush_interval_ms: 60000      # how often each replica reports; 10s .. 1h
+  max_buckets: 100000           # cells held per replica between flushes
+  max_pending_entries: 100000   # per provider, kept for a retry while it is down
+  shutdown_flush_timeout_ms: 10000
+  network: ""                   # reported network name; "" = this deployment's `network`
+auth:
+  introspection:
+    acme:
+      # … key_prefix, url, token_env, tiers as above …
+      usage_url: https://auth.example.com/v1/usage   # same URL rules and token as url
+```
+
+**What is counted.** One count per request to a rate-limited route (`/tx`,
+`/txs`, `GET /tx/{txid}`, `/policy`, block processing status) by a key from
+that provider. Anonymous requests, invalid keys and local `bsvb_` keys are
+never reported. Each request lands in a cell of:
+
+- the provider's own `key_id` (as introspection returned it, without the
+  broadcaster's `<provider>:` namespace);
+- the route's stable name, never a path: `v1/tx`, `v1/txs`, `v1/tx/status`,
+  `v1/policy`, `v1/blocks/status`;
+- a status class: `2xx`, `4xx`, `5xx`, or `429` for a request the rate limiter
+  refused;
+- the UTC day the request finished.
+
+Each cell holds a count and `units`, the cost units the request was charged.
+With rate limiting on, that is what the limiter granted: the route's cost,
+plus `costs.submit_tx` per transaction of an accepted `/txs` batch (a batch
+counts as one request). A request it refused, or whose client hung up before
+the charge, gets 0, and a 429 is always 0. With rate limiting off it is the
+same nominal cost. A request whose handler panics is counted as `5xx`.
+
+**Protocol.** Every `flush_interval_ms` (±10%), at shutdown after the
+listeners drain, and early if `max_buckets` fills, each replica sends what
+it counted since its last flush:
+
+```
+POST <usage_url>
+Authorization: Bearer <service token>
+Content-Type: application/json
+Idempotency-Key: <stable per batch>
+
+{"entries": [{"key_id": "…", "network": "mainnet", "endpoint": "v1/tx",
+              "status_class": "2xx", "date_utc": "2026-11-12", "count": 12, "units": 120}]}
+```
+
+Every entry carries `network`, the network the deployment that served the
+requests runs on. A provider's key is often valid on several deployments
+(one per network, sharing an auth store), and this is how the provider tells
+their usage apart. It is the deployment's `network` unless `usage.network`
+overrides the reported name, for a provider that names a network differently
+(for example `ttn` for teratestnet).
+
+A call carries at most 1000 entries and 1 MiB. Counts are deltas: the
+receiver adds them up, so replicas and regions report independently. The
+provider answers `200 {"accepted": n, "dropped": n}`. `dropped` covers
+entries it considered invalid, which are counted and not resent.
+
+**Delivery is at most once.** The receiver adds counts up, so a batch it
+may already have recorded is never resent:
+
+| Answer | What happens |
+|---|---|
+| `200` | Done. |
+| `503`, `429` | Kept and retried after `Retry-After` (capped at 5 minutes), else 60s. |
+| `401`, `403` | Kept and retried after 5 minutes; logged (fix the token). |
+| `404` | Kept and retried after 5 minutes; logged (fix `usage_url`, or wait for the provider to enable usage for this token). |
+| could not connect (dial, DNS or TLS handshake failure: nothing was sent) | Kept, retried after 30s. |
+| `502`, any other status, a timeout once the request was written | **Dropped**: it may already be counted. |
+| `400` | That batch is dropped and logged; later batches still go. |
+| `501` | Reporting to that provider stops until restart. |
+
+Kept batches wait, intact and oldest first, in a queue bounded by
+`max_pending_entries`, which bounds only what is left undelivered after a
+flush; when it is full the oldest are dropped. Every batch
+carries an `Idempotency-Key`, so a provider that de-duplicates on it can
+later let the broadcaster retry uncertain batches too. A replica that
+crashes loses at most one flush interval of counts. On shutdown a flush in
+progress is cancelled, and the final report must finish within
+`shutdown_flush_timeout_ms`.
+
+Metrics: `bsv_broadcaster_usage_requests_total{source,endpoint,class}`,
+`bsv_broadcaster_usage_flush_total{sink,result}` (`ok`, `retry`, `unauthorized`,
+`misconfigured`, `uncertain`, `rejected`, `disabled`),
+`bsv_broadcaster_usage_entries_sent_total{sink}`,
+`bsv_broadcaster_usage_entries_dropped_total{sink,reason}` (`uncertain`,
+`rejected`, `invalid`, `overflow`, `disabled`, `shutdown`),
+`bsv_broadcaster_usage_pending_entries{sink}` and
+`bsv_broadcaster_usage_buckets`. None of them carries a key label.
 
 ### Managing keys
 

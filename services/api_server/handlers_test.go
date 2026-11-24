@@ -12,6 +12,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -49,6 +50,10 @@ type mockStore struct {
 	datahubCalls     int
 	datahubErr       error
 
+	// setRawTxCalls records SetRawTx by txid; setRawTxErr fails it.
+	setRawTxCalls map[string][]byte
+	setRawTxErr   error
+
 	mu                  sync.Mutex
 	updateStatusCalls   []*models.TransactionStatus
 	stumps              map[string]*models.Stump
@@ -75,6 +80,12 @@ type mockStore struct {
 	// used directly. Default behavior (nil hook) is the legacy "always
 	// fresh insert" stub: (nil, false, nil).
 	getOrInsertFn func(status *models.TransactionStatus) (*models.TransactionStatus, bool, error)
+	// /txs CASes its rows concurrently, so the hook runs on several
+	// goroutines at once: it must guard any state it records into.
+	// batchCASCalls counts BatchGetOrInsertStatus calls; batchCASFn, when
+	// set, answers them.
+	batchCASCalls atomic.Int32
+	batchCASFn    func([]*models.TransactionStatus) ([]store.BatchInsertResult, error)
 	// tipHeight is served by GetActiveTipBlockHeight (the /health
 	// blockHeight source); tipCalls counts reads so tests can assert the
 	// handler's TTL cache actually coalesces probes.
@@ -102,12 +113,42 @@ func (m *mockStore) GetOrInsertStatus(_ context.Context, status *models.Transact
 	if m.getOrInsertFn != nil {
 		return m.getOrInsertFn(status)
 	}
-	return nil, false, nil
+	// Default: the CAS inserts, as a real store does for a fresh txid.
+	return status, true, nil
 }
 
-func (m *mockStore) BatchGetOrInsertStatus(context.Context, []*models.TransactionStatus) ([]store.BatchInsertResult, error) {
-	return nil, nil
+// SetRawTx records the raw bytes intake restores before a republish.
+func (m *mockStore) SetRawTx(_ context.Context, txid string, rawTx []byte) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.setRawTxErr != nil {
+		return m.setRawTxErr
+	}
+	if m.setRawTxCalls == nil {
+		m.setRawTxCalls = make(map[string][]byte)
+	}
+	m.setRawTxCalls[txid] = rawTx
+	return nil
 }
+
+// BatchGetOrInsertStatus counts calls and answers from batchCASFn when set,
+// else runs GetOrInsertStatus per row through the shared parallel helper, so
+// getOrInsertFn drives batch results the way it drives single ones. The
+// handler calls it only on a native-batch store (nativeBatchStore).
+func (m *mockStore) BatchGetOrInsertStatus(ctx context.Context, statuses []*models.TransactionStatus) ([]store.BatchInsertResult, error) {
+	m.batchCASCalls.Add(1)
+	if m.batchCASFn != nil {
+		return m.batchCASFn(statuses)
+	}
+	return store.BatchGetOrInsertStatusParallel(ctx, m, statuses)
+}
+
+// nativeBatchStore is a mockStore that reports a native batch insert
+// (store.NativeBatchInserter), as Postgres and MongoDB do, so /txs dedups
+// through one BatchGetOrInsertStatus call.
+type nativeBatchStore struct{ *mockStore }
+
+func (nativeBatchStore) NativeBatchGetOrInsert() {}
 
 func (m *mockStore) BatchUpdateStatus(context.Context, []*models.TransactionStatus) error {
 	return nil
@@ -998,7 +1039,13 @@ func TestHandleSubmitTransaction_ValidationFailure_RecordsSubmissionAndPublishes
 	}
 	wantTxID := parsed.TxID().String()
 
-	ms := &mockStore{}
+	ms := &mockStore{
+		// (nil, false, nil) makes persistRejectedAtIntake fall through to
+		// UpdateStatus, which is what this test captures.
+		getOrInsertFn: func(*models.TransactionStatus) (*models.TransactionStatus, bool, error) {
+			return nil, false, nil
+		},
+	}
 	pub := &recordingCallbackPub{}
 	val := validator.NewValidator(nil)
 	broker := &kafka.RecordingBroker{}
@@ -1027,9 +1074,8 @@ func TestHandleSubmitTransaction_ValidationFailure_RecordsSubmissionAndPublishes
 		t.Fatalf("expected 400, got %d: %s", w.Code, w.Body.String())
 	}
 
-	// Persistence: persistRejectedAtIntake's GetOrInsertStatus stub
-	// returns (nil, false, nil), so the code falls through to
-	// UpdateStatus — captured here.
+	// Persistence: the GetOrInsertStatus stub above makes
+	// persistRejectedAtIntake fall through to UpdateStatus — captured here.
 	ms.mu.Lock()
 	calls := append([]*models.TransactionStatus(nil), ms.updateStatusCalls...)
 	ms.mu.Unlock()
@@ -1241,7 +1287,13 @@ func TestHandleSubmitTransactions_ValidationFailure_RecordsSubmissionAndPublishe
 	}
 	wantTxID := parsed.TxID().String()
 
-	ms := &mockStore{}
+	ms := &mockStore{
+		// (nil, false, nil) makes persistRejectedAtIntake fall through to
+		// UpdateStatus, which is what this test captures.
+		getOrInsertFn: func(*models.TransactionStatus) (*models.TransactionStatus, bool, error) {
+			return nil, false, nil
+		},
+	}
 	pub := &recordingCallbackPub{}
 	val := validator.NewValidator(nil)
 	broker := &kafka.RecordingBroker{}

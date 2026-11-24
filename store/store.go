@@ -232,6 +232,27 @@ func (pp PeerPolicy) SanitizePolicySizes() (PeerPolicy, int) {
 	return pp, dropped
 }
 
+// NativeBatchInserter marks a backend whose BatchGetOrInsertStatus writes a
+// batch in a few statements on one connection (Postgres, MongoDB) instead of
+// a bounded per-row loop over GetOrInsertStatus (Aerospike, Pebble). The
+// /txs handler uses it to decide how much of its pod-wide store budget a
+// batch takes: one slot for the whole call, or one per row in flight.
+type NativeBatchInserter interface {
+	NativeBatchGetOrInsert()
+}
+
+// NativeBatchStatusUpdater is implemented by a backend whose
+// BatchUpdateStatusReturning can write a batch in a few round trips on one
+// connection at a time (MongoDB 8.0+: a read and a client bulkWrite) instead
+// of a bounded per-row loop. NativeBatchStatusUpdate reports whether it will
+// for the next call; the backend falls back to the loop on an older server.
+// The callback handler uses it to decide how much of its pod-wide store
+// budget a batch takes: one slot for the whole call, or one per row in
+// flight.
+type NativeBatchStatusUpdater interface {
+	NativeBatchStatusUpdate(ctx context.Context) bool
+}
+
 // BatchInsertResult is one entry in the result slice returned by
 // BatchGetOrInsertStatus. Inserted is true when the row was newly written by
 // this call; false when an existing row was found and Existing carries it.
@@ -271,9 +292,17 @@ type Store interface {
 	// reports whether statuses[i] was newly inserted, and result[i].Existing
 	// carries the existing row when !Inserted (it is nil for new inserts).
 	//
-	// Backends with native batch support (e.g. Postgres via the xmax trick)
-	// implement this as a single round-trip; backends without (Aerospike,
-	// Pebble) fall back to a bounded-concurrency loop over GetOrInsertStatus.
+	// Backends with native batch support (Postgres via the xmax trick,
+	// MongoDB via an unordered InsertMany) implement this in one or two round
+	// trips; backends without (Aerospike, Pebble) fall back to a
+	// bounded-concurrency loop over GetOrInsertStatus.
+	//
+	// On error the slice is either nil (no row's outcome is known, as when
+	// Postgres's single statement fails) or has one entry per input, where
+	// Inserted marks every row this call did insert and a zero value marks a
+	// row whose outcome is unknown. Callers that must know exactly which
+	// rows they inserted (the /txs handler publishes RECEIVED only for
+	// those, #391) rely on this.
 	BatchGetOrInsertStatus(ctx context.Context, statuses []*models.TransactionStatus) ([]BatchInsertResult, error)
 
 	// UpdateStatus updates an existing transaction status (used for P2P, blocks, etc.).
@@ -324,6 +353,23 @@ type Store interface {
 	// parents so a child keys like an in-flight parent and lands on the
 	// dispatcher that holds it. Unknown txids are absent from the result.
 	LookupPartitionKeys(ctx context.Context, txids []string) (map[string]ParentKey, error)
+
+	// LookupRawTxs returns, for every txid in txids that has a row, the row's
+	// current status and its stored raw_tx (nil once ClearRetryState has
+	// dropped it). The propagation consumer hydrates txid-only Kafka messages
+	// with it (#329): the message carries no tx bytes, so its size never
+	// tracks the tx-size policy. Unknown txids are absent from the result,
+	// and so is a row that cannot be decoded: one corrupt row must not fail
+	// the batch, or the consumer would retry the same claim batch forever.
+	// err is reserved for the store itself failing.
+	LookupRawTxs(ctx context.Context, txids []string) (map[string]RawTxRow, error)
+
+	// SetRawTx overwrites the stored raw_tx of an existing row without
+	// touching its status. Intake calls it before republishing a row it did
+	// not create (a REJECTED resubmit, a stranded RECEIVED retry), whose
+	// raw_tx may have been cleared, so the consumer can hydrate the
+	// txid-only message. Returns ErrNotFound when the txid has no row.
+	SetRawTx(ctx context.Context, txid string, rawTx []byte) error
 
 	// EnrichMerklePath populates status.MerklePath in place for a MINED/IMMUTABLE
 	// status that already carries a BlockHash, extracting the transaction's
@@ -796,6 +842,13 @@ type Store interface {
 
 	// Close closes the database connection
 	Close() error
+}
+
+// RawTxRow is one LookupRawTxs result: a row's current status and its stored
+// raw transaction bytes.
+type RawTxRow struct {
+	Status models.Status
+	RawTx  []byte
 }
 
 // ParentKey is one LookupPartitionKeys result: a row's current status and the

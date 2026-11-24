@@ -575,7 +575,7 @@ func TestResolveBackgroundKickoffSkipsClearedMarker(t *testing.T) {
 	done := waitForRefresh(r)
 
 	clk.advance(staleRetryBackoff + time.Millisecond)
-	r.maybeRefreshInBackground(Hash(raw), clk.now())
+	r.maybeRefreshInBackground(lk, Hash(raw), clk.now())
 
 	require.Zero(t, refreshLen(r), "the kickoff must not recreate a marker for an untracked key")
 	require.Equal(t, 2, lk.n(), "no background attempt is started for an untracked key")

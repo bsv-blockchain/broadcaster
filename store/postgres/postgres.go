@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -171,11 +172,57 @@ ON CONFLICT (txid) DO NOTHING`
 
 // columnsPerInsertRow is how many placeholders one row in the multi-row
 // INSERT VALUES list consumes. Matches the column list in the static SQL
-// fragment built by BatchGetOrInsertStatus.
+// fragment built by batchGetOrInsertChunk.
 const columnsPerInsertRow = 15
 
-// BatchGetOrInsertStatus is the multi-row form of GetOrInsertStatus. It uses
-// the "xmax = 0" trick: ON CONFLICT DO UPDATE SET txid = excluded.txid is a
+// NativeBatchGetOrInsert marks BatchGetOrInsertStatus as a native batch
+// write (store.NativeBatchInserter).
+func (*Store) NativeBatchGetOrInsert() {}
+
+// batchInsertRows bounds one multi-row INSERT: pgx's extended protocol
+// takes at most 65535 bind parameters, which is 4369 rows at
+// columnsPerInsertRow.
+const batchInsertRows = 1000
+
+// BatchGetOrInsertStatus is the multi-row form of GetOrInsertStatus: one
+// statement per batchInsertRows rows (batchGetOrInsertChunk). Each chunk's
+// rows are sent in txid order, so two concurrent batches that share txids
+// lock them in the same order instead of deadlocking.
+//
+// Chunks run in order, and the first that fails stops the rest. A chunk is
+// one statement, so it is all-or-nothing: on error the result has one entry
+// per input, with the earlier chunks' outcomes and zero values for the rest
+// (store.Store's partial-results contract).
+func (s *Store) BatchGetOrInsertStatus(ctx context.Context, statuses []*models.TransactionStatus) ([]store.BatchInsertResult, error) {
+	if len(statuses) == 0 {
+		return nil, nil
+	}
+	out := make([]store.BatchInsertResult, len(statuses))
+	for start := 0; start < len(statuses); start += batchInsertRows {
+		order := make([]int, min(batchInsertRows, len(statuses)-start))
+		for k := range order {
+			order[k] = start + k
+		}
+		// Stable, so a txid repeated in the chunk keeps its first occurrence
+		// first and that one carries the insert outcome.
+		slices.SortStableFunc(order, func(a, b int) int { return strings.Compare(statuses[a].TxID, statuses[b].TxID) })
+		chunk := make([]*models.TransactionStatus, len(order))
+		for k, i := range order {
+			chunk[k] = statuses[i]
+		}
+		res, err := s.batchGetOrInsertChunk(ctx, chunk)
+		if err != nil {
+			return out, err
+		}
+		for k, i := range order {
+			out[i] = res[k]
+		}
+	}
+	return out, nil
+}
+
+// batchGetOrInsertChunk runs one multi-row INSERT. It uses the "xmax = 0"
+// trick: ON CONFLICT DO UPDATE SET txid = excluded.txid is a
 // no-op write that nonetheless triggers RETURNING for the existing row, and
 // xmax is 0 for newly-inserted rows but non-zero for rows we re-touched. So
 // one round-trip gives us per-row inserted/existing flag plus the existing
@@ -184,11 +231,7 @@ const columnsPerInsertRow = 15
 // The single-row GetOrInsertStatus uses ON CONFLICT DO NOTHING + a fallback
 // SELECT, which is two round-trips when the row exists. For batches of 100+
 // txs the win from collapsing into one round-trip is large.
-func (s *Store) BatchGetOrInsertStatus(ctx context.Context, statuses []*models.TransactionStatus) ([]store.BatchInsertResult, error) {
-	if len(statuses) == 0 {
-		return nil, nil
-	}
-
+func (s *Store) batchGetOrInsertChunk(ctx context.Context, statuses []*models.TransactionStatus) ([]store.BatchInsertResult, error) {
 	// Normalise inputs the same way GetOrInsertStatus does — empty Status
 	// becomes RECEIVED, missing timestamps default to now, CreatedAt is set.
 	// Defaults are computed into local variables, never written back to the
@@ -2344,4 +2387,39 @@ func (s *Store) LookupPartitionKeys(ctx context.Context, txids []string) (map[st
 		out[txid] = store.ParentKey{Status: models.Status(status), PartitionKey: key}
 	}
 	return out, rows.Err()
+}
+
+// LookupRawTxs implements store.Store with one projected query.
+func (s *Store) LookupRawTxs(ctx context.Context, txids []string) (map[string]store.RawTxRow, error) {
+	if len(txids) == 0 {
+		return nil, nil
+	}
+	rows, err := s.pool.Query(ctx,
+		`SELECT txid, status, raw_tx FROM transactions WHERE txid = ANY($1)`, txids)
+	if err != nil {
+		return nil, fmt.Errorf("lookup raw txs: %w", err)
+	}
+	defer rows.Close()
+	out := make(map[string]store.RawTxRow, len(txids))
+	for rows.Next() {
+		var txid, status string
+		var raw []byte
+		if err := rows.Scan(&txid, &status, &raw); err != nil {
+			return nil, fmt.Errorf("lookup raw txs: %w", err)
+		}
+		out[txid] = store.RawTxRow{Status: models.Status(status), RawTx: raw}
+	}
+	return out, rows.Err()
+}
+
+// SetRawTx implements store.Store.
+func (s *Store) SetRawTx(ctx context.Context, txid string, rawTx []byte) error {
+	tag, err := s.pool.Exec(ctx, `UPDATE transactions SET raw_tx=$2 WHERE txid=$1`, txid, rawTx)
+	if err != nil {
+		return fmt.Errorf("set raw tx %s: %w", txid, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("set raw tx %s: %w", txid, store.ErrNotFound)
+	}
+	return nil
 }

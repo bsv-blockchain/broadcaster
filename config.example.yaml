@@ -37,6 +37,12 @@ api:
   # trusted_platform: ""      # "cloudflare" trusts CF-Connecting-IP from ANY
   #                           # peer — safe only when Cloudflare (e.g. a
   #                           # Tunnel) is the sole ingress. See docs/api-keys.md.
+  # intake_store_concurrency: 0   # pod-wide cap on POST /txs store writes in
+  #                               # flight. 0 = half of store.mongodb.max_pool_size
+  #                               # on MongoDB, else 32; keep it below the pool.
+  # callback_store_concurrency: 0 # pod-wide cap on merkle-service callback
+  #                               # status writes. 0 = a quarter of
+  #                               # store.mongodb.max_pool_size on MongoDB, else 16.
 
 # BSV Broadcaster does not create Kafka topics; the broker must already have them
 # (auto-create on first publish is typically disabled in production, and
@@ -503,6 +509,27 @@ auth:
   #   mongodb:
   #     uri: ""              # BSV_BROADCASTER_AUTH_STORE_MONGODB_URI
   #     database: bsv_broadcaster_auth
+  # Optional delegated-auth providers that verify the keys they issue under
+  # their own prefix (bsvb_ keys always come from the key store). A provider
+  # tier not mapped under tiers gets free. See docs/api-keys.md.
+  # introspection:
+  #   acme:
+  #     key_prefix: acme_
+  #     url: https://auth.example.com/v1/introspect   # https (http only on loopback)
+  #     token_env: ACME_INTROSPECTION_TOKEN   # or token: <literal>
+  #     timeout_ms: 3000
+  #     tiers:                                # provider tier -> ratelimit.tiers name
+  #       basic: free
+  #     usage_url: https://auth.example.com/v1/usage  # optional: report this provider's key usage (usage.enabled)
+# Per-key usage reporting to delegated-auth providers that set usage_url.
+# Off by default; requires auth.enabled. See docs/api-keys.md.
+usage:
+  enabled: false
+  flush_interval_ms: 60000
+  max_buckets: 100000
+  max_pending_entries: 100000
+  shutdown_flush_timeout_ms: 10000
+  network: ""   # network name reported with usage; "" = this deployment's network
 admin:
   enabled: false
   host: 127.0.0.1       # kubectl port-forward works with this; set 0.0.0.0 to opt in to in-cluster tooling reaching it directly
@@ -522,15 +549,20 @@ ratelimit:
     units_per_minute: 50
     max_in_flight: 5
     max_batch: 1
+    retention_days: 30  # 0 = keep forever; see docs/api-keys.md "Data retention per tier"
+    burst_units: 0      # 0 = one minute of burst (units_per_minute); lower it to cap
+                        # what a new client IP can spend at once
   # free is required whenever ratelimit.enabled: it's the fallback tier for
   # a key whose configured tier is later removed. Tier names must be
   # lowercase and match ^[a-z0-9][a-z0-9_-]*$. A bounded tier
   # (units_per_minute > 0) must be "payable": costs.submit_tx <=
   # units_per_minute, and, when max_batch > 0, max_batch * costs.submit_tx +
   # costs.read <= units_per_minute. units_per_minute: 0 (e.g. unlimited
-  # below) has no budget to check.
+  # below) has no budget to check. retention_days (0 = keep forever, else
+  # >= 7) is how long a tier's transaction and submission rows are kept;
+  # only the mongodb backend enforces it.
   tiers:
-    free:       { units_per_minute: 50,    max_in_flight: 5,   max_batch: 1 }
-    standard:    { units_per_minute: 3000,  max_in_flight: 20,  max_batch: 100 }
-    high:        { units_per_minute: 30000, max_in_flight: 100, max_batch: 1000 }
-    unlimited: { units_per_minute: 0,     max_in_flight: 500, max_batch: 10000 }
+    free:      { units_per_minute: 50,    max_in_flight: 5,   max_batch: 1,     retention_days: 30 }
+    standard:  { units_per_minute: 3000,  max_in_flight: 20,  max_batch: 100,   retention_days: 90 }
+    high:      { units_per_minute: 30000, max_in_flight: 100, max_batch: 1000,  retention_days: 365 }
+    unlimited: { units_per_minute: 0,     max_in_flight: 500, max_batch: 10000, retention_days: 730 }

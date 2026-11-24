@@ -392,6 +392,7 @@ func TestMerkleWatch_Outage_BoundedRecoverableWithoutNetworkCharge(t *testing.T)
 	p.merkleRetryMaxAttempts = 3
 	defer stopTestPropagator(p)
 
+	quiesceRequeues(t)
 	goroutinesBefore := runtime.NumGoroutine()
 	networkBefore := retryCount("network")
 	exhaustedNetBefore := testutil.ToFloat64(metrics.PropagationRequeueExhaustedTotal)
@@ -665,6 +666,7 @@ func TestMerkleWatch_P100IncidentShape(t *testing.T) {
 	p.requeueDelay = time.Millisecond
 	defer stopTestPropagator(p)
 
+	quiesceRequeues(t)
 	goroutinesBefore := runtime.NumGoroutine()
 	merkleBefore := retryCount("merkle")
 	networkBefore := retryCount("network")

@@ -1,8 +1,11 @@
 package config
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
@@ -26,7 +29,23 @@ func validAccessControl() *Config {
 	}
 }
 
+const testProvider = "acme"
+
+func testIntrospectionProvider() IntrospectionProvider {
+	return IntrospectionProvider{
+		KeyPrefix: "acme_",
+		URL:       "https://auth.example.com/v1/introspect",
+		Token:     "service-token",
+		Tiers:     map[string]string{"gold": "enterprise"},
+	}
+}
+
+func testUsage() UsageConfig {
+	return UsageConfig{Enabled: true, FlushIntervalMs: 60_000, MaxBuckets: 100_000, MaxPendingEntries: 100_000, ShutdownFlushTimeoutMs: 10_000}
+}
+
 func TestValidateAccessControl(t *testing.T) {
+	t.Setenv("TEST_INTROSPECTION_TOKEN", "service-token")
 	cases := []struct {
 		name    string
 		mutate  func(c *Config)
@@ -92,6 +111,158 @@ func TestValidateAccessControl(t *testing.T) {
 		{"auth store negative pool size", func(c *Config) {
 			c.Auth.Store.Mongo = Mongo{URI: "mongodb://auth:27017", Database: "bsv_broadcaster_auth", MaxPoolSize: -1}
 		}, "auth.store.mongodb.max_pool_size"},
+		{"introspection provider", func(c *Config) {
+			c.Auth.Introspection = map[string]IntrospectionProvider{testProvider: testIntrospectionProvider()}
+		}, ""},
+		{"introspection provider with token_env", func(c *Config) {
+			p := testIntrospectionProvider()
+			p.Token, p.TokenEnv = "", "TEST_INTROSPECTION_TOKEN"
+			c.Auth.Introspection = map[string]IntrospectionProvider{testProvider: p}
+		}, ""},
+		{"introspection token_env unset", func(c *Config) {
+			p := testIntrospectionProvider()
+			p.Token, p.TokenEnv = "", "TEST_INTROSPECTION_TOKEN_UNSET"
+			c.Auth.Introspection = map[string]IntrospectionProvider{testProvider: p}
+		}, "TEST_INTROSPECTION_TOKEN_UNSET is empty or unset"},
+		{"introspection token and token_env", func(c *Config) {
+			p := testIntrospectionProvider()
+			p.TokenEnv = "TEST_INTROSPECTION_TOKEN"
+			c.Auth.Introspection = map[string]IntrospectionProvider{testProvider: p}
+		}, "not both"},
+		{"introspection without token", func(c *Config) {
+			p := testIntrospectionProvider()
+			p.Token = ""
+			c.Auth.Introspection = map[string]IntrospectionProvider{testProvider: p}
+		}, "token or token_env is required"},
+		{"introspection without auth", func(c *Config) {
+			c.Auth.Enabled, c.RateLimit.Enabled = false, false
+			c.Auth.Introspection = map[string]IntrospectionProvider{testProvider: testIntrospectionProvider()}
+		}, "auth.introspection requires auth.enabled"},
+		{"introspection prefix shadows local keys", func(c *Config) {
+			p := testIntrospectionProvider()
+			p.KeyPrefix = "bsvb_"
+			c.Auth.Introspection = map[string]IntrospectionProvider{testProvider: p}
+		}, "overlaps"},
+		{"introspection duplicate prefix", func(c *Config) {
+			c.Auth.Introspection = map[string]IntrospectionProvider{"one": testIntrospectionProvider(), "two": testIntrospectionProvider()}
+		}, "overlaps"},
+		{"introspection prefix without underscore", func(c *Config) {
+			p := testIntrospectionProvider()
+			p.KeyPrefix = "bsv"
+			c.Auth.Introspection = map[string]IntrospectionProvider{testProvider: p}
+		}, "key_prefix"},
+		{"introspection relative url", func(c *Config) {
+			p := testIntrospectionProvider()
+			p.URL = "/v1/introspect"
+			c.Auth.Introspection = map[string]IntrospectionProvider{testProvider: p}
+		}, "absolute https URL"},
+		{"introspection timeout above max", func(c *Config) {
+			p := testIntrospectionProvider()
+			p.TimeoutMs = 5000
+			c.Auth.Introspection = map[string]IntrospectionProvider{testProvider: p}
+		}, "timeout_ms"},
+		{"introspection plain http to a remote host", func(c *Config) {
+			p := testIntrospectionProvider()
+			p.URL = "http://auth.example.com/v1/introspect"
+			c.Auth.Introspection = map[string]IntrospectionProvider{testProvider: p}
+		}, "https"},
+		{"introspection url with user info", func(c *Config) {
+			p := testIntrospectionProvider()
+			p.URL = "https://user:pass@auth.example.com/v1/introspect"
+			c.Auth.Introspection = map[string]IntrospectionProvider{testProvider: p}
+		}, "must not contain user info"},
+		{"introspection url with a query", func(c *Config) {
+			p := testIntrospectionProvider()
+			p.URL = "https://auth.example.com/v1/introspect?key=x"
+			c.Auth.Introspection = map[string]IntrospectionProvider{testProvider: p}
+		}, "must not contain a query or fragment"},
+		{"introspection plain http on loopback", func(c *Config) {
+			p := testIntrospectionProvider()
+			p.URL = "http://127.0.0.1:8099/introspect"
+			c.Auth.Introspection = map[string]IntrospectionProvider{testProvider: p}
+		}, ""},
+		{"introspection token with trailing newline is trimmed", func(c *Config) {
+			p := testIntrospectionProvider()
+			p.Token = "service-token\n"
+			c.Auth.Introspection = map[string]IntrospectionProvider{testProvider: p}
+		}, ""},
+		{"introspection token with inner whitespace", func(c *Config) {
+			p := testIntrospectionProvider()
+			p.Token = "service token"
+			c.Auth.Introspection = map[string]IntrospectionProvider{testProvider: p}
+		}, "whitespace or control characters"},
+		{"introspection tier maps to an unconfigured tier", func(c *Config) {
+			p := testIntrospectionProvider()
+			p.Tiers = map[string]string{"gold": "platinum"}
+			c.Auth.Introspection = map[string]IntrospectionProvider{testProvider: p}
+		}, `"platinum" is not a configured ratelimit tier`},
+		{"introspection without a tier map", func(c *Config) {
+			p := testIntrospectionProvider()
+			p.Tiers = nil
+			c.Auth.Introspection = map[string]IntrospectionProvider{testProvider: p}
+		}, ""},
+		{"introspection bad provider name", func(c *Config) {
+			c.Auth.Introspection = map[string]IntrospectionProvider{"Wo C": testIntrospectionProvider()}
+		}, "provider name"},
+		{"tier retention two years", func(c *Config) {
+			c.RateLimit.Tiers["enterprise"] = TierConfig{MaxInFlight: 500, MaxBatch: 10000, RetentionDays: 730}
+		}, ""},
+		{"tier retention below minimum", func(c *Config) {
+			c.RateLimit.Tiers["enterprise"] = TierConfig{MaxInFlight: 500, MaxBatch: 10000, RetentionDays: 3}
+		}, "retention_days must be 0 (keep forever) or between 7 and 36500"},
+		{"tier retention that would overflow", func(c *Config) {
+			c.RateLimit.Tiers["enterprise"] = TierConfig{MaxInFlight: 500, MaxBatch: 10000, RetentionDays: 213504}
+		}, "between 7 and 36500"},
+		{"negative anonymous retention", func(c *Config) { c.RateLimit.Anonymous.RetentionDays = -1 }, "retention_days"},
+		{"retention validated with ratelimit off", func(c *Config) {
+			c.RateLimit.Enabled = false
+			c.RateLimit.Tiers[TierFree] = TierConfig{RetentionDays: 1}
+		}, "retention_days"},
+		{"usage reported to a provider", func(c *Config) {
+			p := testIntrospectionProvider()
+			p.UsageURL = "https://auth.example.com/v1/usage"
+			c.Auth.Introspection = map[string]IntrospectionProvider{testProvider: p}
+			c.Usage = testUsage()
+		}, ""},
+		{"usage enabled with no provider usage_url", func(c *Config) {
+			c.Auth.Introspection = map[string]IntrospectionProvider{testProvider: testIntrospectionProvider()}
+			c.Usage = testUsage()
+		}, "no auth.introspection provider sets usage_url"},
+		{"usage enabled without auth", func(c *Config) {
+			c.Auth.Enabled, c.RateLimit.Enabled = false, false
+			c.Usage = testUsage()
+		}, "usage.enabled requires auth.enabled"},
+		{"usage flush interval too short", func(c *Config) {
+			p := testIntrospectionProvider()
+			p.UsageURL = "https://auth.example.com/v1/usage"
+			c.Auth.Introspection = map[string]IntrospectionProvider{testProvider: p}
+			c.Usage = testUsage()
+			c.Usage.FlushIntervalMs = 1000
+		}, "usage.flush_interval_ms"},
+		{"usage network override", func(c *Config) {
+			p := testIntrospectionProvider()
+			p.UsageURL = "https://auth.example.com/v1/usage"
+			c.Auth.Introspection = map[string]IntrospectionProvider{testProvider: p}
+			c.Usage = testUsage()
+			c.Usage.Network = "ttn"
+		}, ""},
+		{"usage network not a label", func(c *Config) {
+			p := testIntrospectionProvider()
+			p.UsageURL = "https://auth.example.com/v1/usage"
+			c.Auth.Introspection = map[string]IntrospectionProvider{testProvider: p}
+			c.Usage = testUsage()
+			c.Usage.Network = "Tera Testnet"
+		}, "usage.network"},
+		{"usage_url plain http to a remote host", func(c *Config) {
+			p := testIntrospectionProvider()
+			p.UsageURL = "http://auth.example.com/v1/usage"
+			c.Auth.Introspection = map[string]IntrospectionProvider{testProvider: p}
+		}, "usage_url must be an absolute https URL"},
+		{"usage_url with a query", func(c *Config) {
+			p := testIntrospectionProvider()
+			p.UsageURL = "https://auth.example.com/v1/usage?x=1"
+			c.Auth.Introspection = map[string]IntrospectionProvider{testProvider: p}
+		}, "usage_url must not contain a query"},
 		{"ratelimit without auth", func(c *Config) { c.Auth.Enabled = false }, "requires auth.enabled"},
 		{"auth with zero cache ttl", func(c *Config) { c.RateLimit.KeyCacheTTLMs = 0 }, "key_cache_ttl_ms"},
 		{"stale shorter than ttl", func(c *Config) { c.RateLimit.KeyCacheStaleMaxMs = 1 }, "key_cache_ttl_ms"},
@@ -135,6 +306,24 @@ func TestValidateAccessControl(t *testing.T) {
 		{"anonymous max_batch exceeds units_per_minute", func(c *Config) {
 			c.RateLimit.Anonymous = TierConfig{UnitsPerMinute: 10, MaxBatch: 5}
 		}, "max_batch"},
+		{"anonymous burst_units fits the largest request", func(c *Config) {
+			c.RateLimit.Anonymous = TierConfig{UnitsPerMinute: 600, MaxInFlight: 5, MaxBatch: 1, BurstUnits: 11} // 1*10+1=11
+		}, ""},
+		{"anonymous burst_units too small for the largest request", func(c *Config) {
+			c.RateLimit.Anonymous = TierConfig{UnitsPerMinute: 600, MaxInFlight: 5, MaxBatch: 1, BurstUnits: 10} // 1*10+1=11 > 10
+		}, "burst_units (10) is too small"},
+		{"anonymous burst_units above units_per_minute", func(c *Config) {
+			c.RateLimit.Anonymous = TierConfig{UnitsPerMinute: 50, MaxInFlight: 5, MaxBatch: 1, BurstUnits: 51}
+		}, "exceeds units_per_minute"},
+		{"anonymous burst_units negative", func(c *Config) {
+			c.RateLimit.Anonymous = TierConfig{UnitsPerMinute: 50, MaxInFlight: 5, MaxBatch: 1, BurstUnits: -1}
+		}, "burst_units must be >= 0"},
+		{"anonymous burst_units on an unbounded tier", func(c *Config) {
+			c.RateLimit.Anonymous = TierConfig{UnitsPerMinute: 0, MaxInFlight: 5, MaxBatch: 1, BurstUnits: 20}
+		}, "bounded units_per_minute"},
+		{"burst_units on a keyed tier", func(c *Config) {
+			c.RateLimit.Tiers["enterprise"] = TierConfig{UnitsPerMinute: 600, BurstUnits: 20}
+		}, "only supported on ratelimit.anonymous"},
 		{"unbounded tier skips the payability check even with a huge max_batch", func(c *Config) {
 			c.RateLimit.Tiers["enterprise"] = TierConfig{UnitsPerMinute: 0, MaxBatch: 1_000_000}
 		}, ""},
@@ -239,5 +428,155 @@ func TestAuthStoreDefaultsAndEnv(t *testing.T) {
 	got := overridden.Auth.Store.Mongo
 	if !overridden.Auth.Store.Configured() || got.URI != "mongodb://auth-env:27017" || got.Database != "bsv_broadcaster_auth" || got.OpTimeoutMs != 1500 {
 		t.Errorf("env override = %+v", got)
+	}
+}
+
+// TestIntrospectionLoadsFromFile runs the real Load path: providers come
+// from the config file, the token from the variable token_env names.
+func TestIntrospectionLoadsFromFile(t *testing.T) {
+	viper.Reset()
+	t.Cleanup(viper.Reset)
+	t.Setenv("TEST_PROVIDER_SERVICE_TOKEN", "from-env\n")
+
+	cfgFile := filepath.Join(t.TempDir(), "config.yaml")
+	yaml := `kafka:
+  backend: memory
+store:
+  backend: pebble
+auth:
+  enabled: true
+  introspection:
+    acme:
+      key_prefix: acme_
+      url: https://auth.example.com/v1/introspect
+      token_env: TEST_PROVIDER_SERVICE_TOKEN
+      timeout_ms: 2000
+      tiers:
+        Gold: free
+`
+	if err := os.WriteFile(cfgFile, []byte(yaml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cmd := &cobra.Command{}
+	BindFlags(cmd)
+	if err := cmd.Flags().Set("config", cfgFile); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(cmd)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	p, ok := cfg.Auth.Introspection[testProvider]
+	if !ok {
+		t.Fatalf("auth.introspection.acme missing: %+v", cfg.Auth.Introspection)
+	}
+	if p.KeyPrefix != "acme_" || p.ServiceToken() != "from-env" || p.Timeout() != 2*time.Second {
+		t.Errorf("acme provider = %+v (token %q, timeout %v)", p, p.ServiceToken(), p.Timeout())
+	}
+	// viper lowercases map keys; the introspector matches provider tiers
+	// case-insensitively, so this is harmless.
+	if p.Tiers["gold"] != "free" {
+		t.Errorf("tiers = %v, want gold -> free", p.Tiers)
+	}
+	if (IntrospectionProvider{}).Timeout() != DefaultIntrospectionTimeoutMs*time.Millisecond {
+		t.Error("zero timeout_ms must default")
+	}
+}
+
+func TestRetentionFor(t *testing.T) {
+	rl := RateLimitConfig{
+		Anonymous: TierConfig{RetentionDays: 30},
+		Tiers: map[string]TierConfig{
+			TierFree:     {RetentionDays: 90},
+			"enterprise": {RetentionDays: 730},
+			"archive":    {},
+		},
+	}
+	day := 24 * time.Hour
+	for tier, want := range map[string]time.Duration{
+		TierAnonymous: 30 * day,
+		TierFree:      90 * day,
+		"enterprise":  730 * day,
+		"archive":     0,
+		"unknown":     90 * day, // falls back to free
+	} {
+		if got := rl.RetentionFor(tier); got != want {
+			t.Errorf("RetentionFor(%q) = %v, want %v", tier, got, want)
+		}
+	}
+	if !rl.RetentionConfigured() {
+		t.Error("RetentionConfigured = false")
+	}
+	if (RateLimitConfig{Tiers: map[string]TierConfig{TierFree: {}}}).RetentionConfigured() {
+		t.Error("RetentionConfigured = true with no retention set")
+	}
+}
+
+// TestRetentionDaysBind proves the shipped defaults keep rows forever and
+// that the env overrides bind (each key needs a SetDefault).
+func TestRetentionDaysBind(t *testing.T) {
+	viper.Reset()
+	t.Cleanup(viper.Reset)
+	cfg, err := Load(&cobra.Command{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.RateLimit.RetentionConfigured() {
+		t.Fatalf("defaults configure retention: anonymous=%d free=%d", cfg.RateLimit.Anonymous.RetentionDays, cfg.RateLimit.Tiers[TierFree].RetentionDays)
+	}
+	viper.Reset()
+	t.Setenv("BSV_BROADCASTER_RATELIMIT_ANONYMOUS_RETENTION_DAYS", "30")
+	t.Setenv("BSV_BROADCASTER_RATELIMIT_TIERS_FREE_RETENTION_DAYS", "90")
+	cfg, err = Load(&cobra.Command{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.RateLimit.Anonymous.RetentionDays != 30 || cfg.RateLimit.Tiers[TierFree].RetentionDays != 90 {
+		t.Errorf("env overrides: anonymous=%d free=%d, want 30/90", cfg.RateLimit.Anonymous.RetentionDays, cfg.RateLimit.Tiers[TierFree].RetentionDays)
+	}
+}
+
+// TestUsageDefaultsBind pins the shipped usage defaults (off, 60s flushes)
+// and that BSV_BROADCASTER_USAGE_* overrides bind.
+func TestUsageDefaultsBind(t *testing.T) {
+	viper.Reset()
+	t.Cleanup(viper.Reset)
+	cfg, err := Load(&cobra.Command{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Usage.Enabled || cfg.Usage.FlushIntervalMs != 60_000 || cfg.Usage.MaxBuckets != 100_000 ||
+		cfg.Usage.MaxPendingEntries != 100_000 || cfg.Usage.ShutdownFlushTimeoutMs != 10_000 {
+		t.Fatalf("usage defaults = %+v", cfg.Usage)
+	}
+	viper.Reset()
+	t.Setenv("BSV_BROADCASTER_USAGE_FLUSH_INTERVAL_MS", "30000")
+	cfg, err = Load(&cobra.Command{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Usage.FlushIntervalMs != 30_000 {
+		t.Errorf("BSV_BROADCASTER_USAGE_FLUSH_INTERVAL_MS override = %d", cfg.Usage.FlushIntervalMs)
+	}
+}
+
+func TestUsageNetwork(t *testing.T) {
+	c := &Config{Network: NetworkTeratestnet}
+	if got := c.UsageNetwork(); got != NetworkTeratestnet {
+		t.Errorf("default UsageNetwork = %q, want the deployment network", got)
+	}
+	c.Usage.Network = "ttn"
+	if got := c.UsageNetwork(); got != "ttn" {
+		t.Errorf("overridden UsageNetwork = %q, want ttn", got)
+	}
+	viper.Reset()
+	t.Cleanup(viper.Reset)
+	t.Setenv("BSV_BROADCASTER_USAGE_NETWORK", "ttn")
+	cfg, err := Load(&cobra.Command{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Usage.Network != "ttn" {
+		t.Errorf("BSV_BROADCASTER_USAGE_NETWORK override = %q", cfg.Usage.Network)
 	}
 }
