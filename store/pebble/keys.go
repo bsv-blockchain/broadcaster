@@ -2,6 +2,7 @@ package pebble
 
 import (
 	"fmt"
+	"time"
 )
 
 // Pebble is a flat KV store, so we encode primary records and secondary
@@ -107,6 +108,17 @@ func idxTxUpdatedKey(updatedUnixNs int64, txid string) []byte {
 
 func idxTxUpdatedPrefix() []byte {
 	return []byte(prefixIdxTxUpdated)
+}
+
+// idxTxUpdatedLowerBound returns the first idx:tx:updated key a since-bounded
+// scan needs. Keys encode uint64(updatedUnixNs), so lexical order matches time
+// order only for non-negative timestamps; a zero or pre-epoch since falls back
+// to the whole prefix and leaves the cutoff to the row-side check.
+func idxTxUpdatedLowerBound(since time.Time) []byte {
+	if since.IsZero() || since.UnixNano() < 0 {
+		return idxTxUpdatedPrefix()
+	}
+	return idxTxUpdatedKey(since.UnixNano(), "")
 }
 
 func idxSubTxIDKey(txid, id string) []byte {
