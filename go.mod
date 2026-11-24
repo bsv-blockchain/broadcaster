@@ -11,7 +11,7 @@ require (
 	github.com/bsv-blockchain/go-p2p-message-bus v0.3.1
 	github.com/bsv-blockchain/go-sdk v1.7.5
 	github.com/bsv-blockchain/go-teranode-p2p-client v0.3.3
-	github.com/bsv-blockchain/teranode v0.16.1-beta-txmeta-2
+	github.com/bsv-blockchain/teranode v0.16.1
 	github.com/cockroachdb/pebble v1.1.5
 	github.com/fergusstrange/embedded-postgres v1.34.0
 	github.com/gin-gonic/gin v1.12.0
