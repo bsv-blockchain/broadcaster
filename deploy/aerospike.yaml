@@ -63,7 +63,7 @@ spec:
     spec:
       containers:
         - name: aerospike
-          image: aerospike/aerospike-server:7.0
+          image: aerospike/aerospike-server:7.0@sha256:6b0e92d22dd3b57efeaa48527b29ac8e1ccd464c6a2d9b23563f527ea00d319e
           ports:
             - containerPort: 3000
               name: service
