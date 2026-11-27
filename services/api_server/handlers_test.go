@@ -20,12 +20,14 @@ import (
 	sdkTx "github.com/bsv-blockchain/go-sdk/transaction"
 	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 
 	"github.com/bsv-blockchain/broadcaster/config"
 	"github.com/bsv-blockchain/broadcaster/kafka"
 	"github.com/bsv-blockchain/broadcaster/metrics"
 	"github.com/bsv-blockchain/broadcaster/models"
+	"github.com/bsv-blockchain/broadcaster/services/apikey"
 	"github.com/bsv-blockchain/broadcaster/store"
 	"github.com/bsv-blockchain/broadcaster/validator"
 )
@@ -95,6 +97,8 @@ type mockStore struct {
 	// for the GET /tx callback-state tests.
 	subsByTxID  map[string][]*models.Submission
 	getStatusFn func(txid string) *models.TransactionStatus
+	// getStatusErr, when set, is returned by GetStatus.
+	getStatusErr error
 	// peerPolicies feeds ListPeerPolicies for the GET /policy tests;
 	// listPeerPoliciesErr injects a store failure.
 	peerPolicies        []store.PeerPolicy
@@ -202,6 +206,9 @@ func (m *mockStore) BatchUpdateStatusReturning(_ context.Context, statuses []*mo
 }
 
 func (m *mockStore) GetStatus(_ context.Context, txid string) (*models.TransactionStatus, error) {
+	if m.getStatusErr != nil {
+		return nil, m.getStatusErr
+	}
 	if m.getStatusFn != nil {
 		return m.getStatusFn(txid), nil
 	}
@@ -2611,4 +2618,50 @@ func validStumpBytes(size int, seed byte) []byte {
 // knows no parents, so every submission keys by its own txid.
 func (m *mockStore) LookupPartitionKeys(_ context.Context, _ []string) (map[string]store.ParentKey, error) {
 	return nil, nil
+}
+
+// TestHandleGetTransaction_ClientCanceled_Returns499 pins that a caller hanging
+// up mid-read is reported as 499, not 500. The store surfaces the cancelled
+// request context as its error; counting that as a server error made 5xx-rate
+// alerts fire on ordinary client disconnects.
+func TestHandleGetTransaction_ClientCanceled_Returns499(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	const txid = "bb22000000000000000000000000000000000000000000000000000000000000"
+	srv := &Server{
+		cfg:    &config.Config{},
+		logger: zap.NewNop(),
+		store:  &mockStore{getStatusErr: fmt.Errorf("query status: %w", context.Canceled)},
+	}
+	router := gin.New()
+	srv.registerRoutes(router)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	req := httptest.NewRequestWithContext(ctx, http.MethodGet, "/tx/"+txid, nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	require.Equal(t, apikey.StatusClientClosedRequest, w.Code)
+}
+
+// TestHandleGetTransaction_StoreError_Returns500 pins the other side: a store
+// failure while the caller is still connected stays a 500.
+func TestHandleGetTransaction_StoreError_Returns500(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	const txid = "cc33000000000000000000000000000000000000000000000000000000000000"
+	srv := &Server{
+		cfg:    &config.Config{},
+		logger: zap.NewNop(),
+		store:  &mockStore{getStatusErr: errors.New("connection refused")},
+	}
+	router := gin.New()
+	srv.registerRoutes(router)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/tx/"+txid, nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusInternalServerError, w.Code)
 }
