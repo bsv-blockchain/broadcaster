@@ -28,6 +28,7 @@ import (
 	"github.com/bsv-blockchain/broadcaster/merkleservice"
 	"github.com/bsv-blockchain/broadcaster/metrics"
 	"github.com/bsv-blockchain/broadcaster/models"
+	"github.com/bsv-blockchain/broadcaster/services/apikey"
 	"github.com/bsv-blockchain/broadcaster/services/ratelimit"
 	"github.com/bsv-blockchain/broadcaster/services/usage"
 	"github.com/bsv-blockchain/broadcaster/store"
@@ -1066,6 +1067,14 @@ func (s *Server) handleGetTransaction(c *gin.Context) {
 
 	status, err := s.store.GetStatus(c.Request.Context(), txid)
 	if err != nil {
+		// A caller that hangs up mid-read cancels the request context, and the
+		// store returns that cancellation as its error. Nothing failed on our
+		// side, so answer 499 (logged at Debug by requestLogger) instead of a
+		// 500 that pages whoever alerts on the 5xx rate.
+		if errors.Is(c.Request.Context().Err(), context.Canceled) {
+			c.AbortWithStatus(apikey.StatusClientClosedRequest)
+			return
+		}
 		s.logger.Error("failed to get status", logfields.TxID(txid), zap.Error(err))
 		c.JSON(http.StatusInternalServerError, gin.H{jsonKeyError: "internal error"})
 		return

@@ -647,17 +647,16 @@ func (s *Store) GetStatus(ctx context.Context, txid string) (*models.Transaction
 	return st, nil
 }
 
-// GetStatusesSince walks the updated-at index newest-first. The since filter
-// is client-side because index keys are ordered ascending; a ReverseIter
-// cutoff at the since timestamp would require a descending encoding we don't
-// need given the expected cardinality.
+// GetStatusesSince walks the updated-at index in ascending key order starting
+// at since (or the whole prefix for a zero or pre-epoch since). The row-side
+// timestamp check remains as a guard against stale index keys and negative since.
 func (s *Store) GetStatusesSince(ctx context.Context, since time.Time) ([]*models.TransactionStatus, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	prefix := idxTxUpdatedPrefix()
 	iter, err := s.db.NewIter(&pebbledb.IterOptions{
-		LowerBound: prefix,
+		LowerBound: idxTxUpdatedLowerBound(since),
 		UpperBound: endOfPrefix(prefix),
 	})
 	if err != nil {
@@ -688,13 +687,20 @@ func (s *Store) GetStatusesSince(ctx context.Context, since time.Time) ([]*model
 // hands each row to fn directly instead of accumulating a slice. The Pebble
 // iterator already streams keys lazily, so peak memory is bounded by whatever
 // fn retains rather than the full history depth.
+//
+// Seeking to a non-negative since makes scan cost proportional to rows in the
+// window rather than all history, as long as stored timestamps are
+// non-negative (pre-epoch rows sort after every positive key, so they are
+// still read and dropped by the row-side check); zero and pre-epoch since
+// scan the whole prefix. With a consistent index and no updates during the
+// scan, results match the previous full-prefix scan.
 func (s *Store) IterateStatusesSince(ctx context.Context, since time.Time, fn func(*models.TransactionStatus) error) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	prefix := idxTxUpdatedPrefix()
 	iter, err := s.db.NewIter(&pebbledb.IterOptions{
-		LowerBound: prefix,
+		LowerBound: idxTxUpdatedLowerBound(since),
 		UpperBound: endOfPrefix(prefix),
 	})
 	if err != nil {

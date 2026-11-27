@@ -53,13 +53,18 @@ jobs:
       matrix:
         # 7 runs the per-row status-update fallback; 8 (Atlas runs 8.0) runs
         # the native client-bulkWrite path in BatchUpdateStatusReturning.
+        # Each leg's image is pinned by digest (multi-arch index of the tag);
+        # re-resolve with `docker buildx imagetools inspect mongo:<tag>` to bump.
         mongo: ["7", "8"]
         include:
+          - mongo: "7"
+            image: mongo:7@sha256:41e8195b2791692695e1dc9bd21cd51d0a3af05fff8ace9304a5c1acf94f1ae1
           - mongo: "8"
+            image: mongo:8@sha256:747773029b84309981a3624a1af64ffc8c4d792283cc0834f26fe01fc6d28b34
             expect_native: "1"
     services:
       mongo:
-        image: mongo:${{ matrix.mongo }}
+        image: ${{ matrix.image }}
         ports:
           - 27017:27017
         options: >-
@@ -69,7 +74,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version-file: go.mod
           cache: true

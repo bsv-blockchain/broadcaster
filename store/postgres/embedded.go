@@ -6,7 +6,7 @@ import (
 	"net"
 	"os"
 
-	embedded "github.com/fergusstrange/embedded-postgres"
+	embedded "github.com/fergusstrange/embedded-postgres/v2"
 
 	"github.com/bsv-blockchain/broadcaster/config"
 )
@@ -57,7 +57,7 @@ func startEmbedded(cfg config.Postgres) (dsn string, stop func() error, err erro
 			Port(port).
 			DataPath(cfg.EmbeddedDataDir).
 			RuntimePath(cfg.EmbeddedCacheDir).
-			BinariesPath(cfg.EmbeddedCacheDir),
+			CachePath(cfg.EmbeddedCacheDir),
 	)
 	if err := ep.Start(); err != nil {
 		return "", nil, fmt.Errorf("start embedded postgres on port %d: %w", port, err)

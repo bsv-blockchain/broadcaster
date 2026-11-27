@@ -22,7 +22,11 @@ spec:
     spec:
       containers:
         - name: kafka
-          image: bitnami/kafka:3.7
+          # Bitnami removed its free images from docker.io/bitnami (bitnami/kafka:3.7
+          # no longer resolves); bitnamilegacy hosts the same frozen 3.7 build.
+          # Pinned by digest (multi-arch index). It receives no further updates, so
+          # move to a maintained Kafka/Redpanda image before relying on this beyond dev.
+          image: docker.io/bitnamilegacy/kafka:3.7@sha256:c274f870840a5d854fb601408c398e596c795582d869b5d85c7f7d882e5c478d
           ports:
             - containerPort: 9092
               name: kafka
