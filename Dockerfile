@@ -15,12 +15,12 @@
 # merkle service, datahub, webhook delivery) and TLS handshakes fail without
 # the system CA bundle. distroless/cc ships it, so no extra install step.
 
-# Intentionally not pinned to @sha256: — gcr.io/distroless/cc-debian12 is a
-# multi-arch manifest list consumed by the matrix amd64/arm64 build in
-# .github/workflows/build.yml, and dependabot's docker ecosystem
-# (.github/dependabot.yml) tracks upstream changes. See Scorecard alert #58
-# (dismissed: "won't fix").
-FROM gcr.io/distroless/cc-debian12
+# Pinned by digest (OpenSSF Scorecard Pinned-Dependencies). The digest is the
+# multi-arch image index for :latest, not a single-platform manifest, so the
+# matrix amd64/arm64 build in .github/workflows/build.yml still resolves the
+# right platform. dependabot's docker ecosystem (.github/dependabot.yml) bumps
+# the digest when upstream republishes :latest.
+FROM gcr.io/distroless/cc-debian12:latest@sha256:e5d81ddde149641e2a9ba55be4545bc125c67de07508b03ba4c22e6eb0ded5aa
 
 ARG TARGETOS
 ARG TARGETARCH

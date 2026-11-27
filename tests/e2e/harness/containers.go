@@ -242,7 +242,7 @@ func startContainersOnNetwork(ctx context.Context, t *testing.T, opts MerkleStar
 	// 25600805894).
 	pg, err := postgres.Run(
 		ctx,
-		"postgres:17-alpine",
+		"postgres:17-alpine@sha256:f9cf3e1f0066f0eb0c48707d864f0ac5941e9ff454a072077d97a4d278d07d73",
 		postgres.WithDatabase(postgresDB),
 		postgres.WithUsername(postgresUser),
 		postgres.WithPassword(postgresPass),
@@ -262,7 +262,7 @@ func startContainersOnNetwork(ctx context.Context, t *testing.T, opts MerkleStar
 	// helper for host-side test debug.
 	rp, err := redpanda.Run(
 		ctx,
-		"docker.redpanda.com/redpandadata/redpanda:v26.1.9",
+		"docker.redpanda.com/redpandadata/redpanda:v26.1.9@sha256:8cb52078690728e2b3d1507fc84eda4c07d4d59bd8fa241e9b1cc7eb7de096c9",
 		redpanda.WithAutoCreateTopics(),
 		redpanda.WithListener(fmt.Sprintf("%s:%d", netAliasRedpanda, inNetworkKafkaPort)),
 		network.WithNetwork([]string{netAliasRedpanda}, nw),
