@@ -190,15 +190,43 @@ func (m *mockStore) setStatusRow(txid string, status models.Status, rawTx []byte
 	m.rawByTxID[txid] = append([]byte(nil), rawTx...)
 }
 
-// GetStatus serves the seeded statusByTxID map; unknown txids return
+// GetStatus returns a row the way a real store does: whatever was last
+// written to it wins, then the seeded statusByTxID map, then a seeded replay
+// or parked row. Parked rows carry their retry bins. Unknown txids return
 // store.ErrNotFound, matching the real backends' contract.
 func (m *mockStore) GetStatus(_ context.Context, txid string) (*models.TransactionStatus, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if st, ok := m.statusByTxID[txid]; ok {
-		return &models.TransactionStatus{TxID: txid, Status: st, RawTx: m.rawByTxID[txid]}, nil
+	var (
+		st    models.Status
+		known bool
+	)
+	for i := len(m.updates) - 1; i >= 0; i-- {
+		if m.updates[i].TxID == txid {
+			st, known = m.updates[i].Status, true
+			break
+		}
 	}
-	return nil, store.ErrNotFound
+	if !known {
+		if seeded, ok := m.statusByTxID[txid]; ok {
+			return &models.TransactionStatus{TxID: txid, Status: seeded, RawTx: m.rawByTxID[txid]}, nil
+		}
+		st, known = m.latestStatusLocked(txid)
+	}
+	pr, parked := m.pendingRetries[txid]
+	if !known && !parked {
+		return nil, store.ErrNotFound
+	}
+	if !known {
+		st = models.StatusPendingRetry
+	}
+	row := &models.TransactionStatus{TxID: txid, Status: st, RawTx: m.rawByTxID[txid]}
+	if parked && st == models.StatusPendingRetry {
+		row.RawTx = pr.RawTx
+		row.RetryCount = pr.RetryCount
+		row.NextRetryAt = pr.NextRetryAt
+	}
+	return row, nil
 }
 
 // LookupRawTxs serves the rows seeded by setStatus / setStatusRow, the way
@@ -621,7 +649,7 @@ func newTeranodeServer(log *eventLog, statusCode int) *httptest.Server {
 
 func newPropagator(merkleSrvURL, teranodeSrvURL string, st store.Store) *Propagator {
 	cfg := &config.Config{
-		CallbackURL: "http://localhost:8080/callback",
+		CallbackURL: testLocalCallbackURL,
 	}
 	cfg.Propagation.MerkleConcurrency = 10
 
@@ -703,7 +731,7 @@ func TestHandleMessage_ForwardsCallbackToken(t *testing.T) {
 	defer teranodeSrv.Close()
 
 	cfg := &config.Config{
-		CallbackURL:   "http://localhost:8080/callback",
+		CallbackURL:   testLocalCallbackURL,
 		CallbackToken: "secret-bsv-broadcaster-token",
 	}
 	cfg.Propagation.MerkleConcurrency = 10
@@ -1260,7 +1288,7 @@ func TestProcessBatch_BulkPublish_OneEventPerStatus(t *testing.T) {
 	defer teranodeSrv.Close()
 
 	ms := newMockStore()
-	cfg := &config.Config{CallbackURL: "http://localhost:8080/callback"}
+	cfg := &config.Config{CallbackURL: testLocalCallbackURL}
 	cfg.Propagation.MerkleConcurrency = 10
 
 	mc := merkleservice.NewClient(merkleSrv.URL, "", 5*time.Second)
@@ -1328,7 +1356,7 @@ func TestBroadcastInChunks_ParallelismHonorsConfig(t *testing.T) {
 	defer teranodeSrv.Close()
 
 	ms := newMockStore()
-	cfg := &config.Config{CallbackURL: "http://localhost:8080/callback"}
+	cfg := &config.Config{CallbackURL: testLocalCallbackURL}
 	cfg.Propagation.MerkleConcurrency = 10
 	cfg.Propagation.TeranodeMaxBatchSize = 25
 	cfg.Propagation.MaxParallelChunks = 4

@@ -102,6 +102,15 @@ type propagationMsg struct {
 	// PENDING_RETRY reason instead of the generic no-verdict text.
 	// Process-local like retryCount; never serialized.
 	retryReason string
+	// pulledAncestor marks a parked row the reaper added to a retry batch
+	// only because a due descendant needed it (see withParkedAncestors). An
+	// attempt that settles nothing leaves its row exactly as it was: it was
+	// not due, and the descendant's need must not spend its retry budget or
+	// overwrite its recorded reason. Process-local; never serialized.
+	pulledAncestor bool
+	// parkedAttempts is a pulled ancestor's stored retry_count, which sets
+	// its pull cooldown. Process-local; never serialized.
+	parkedAttempts int
 }
 
 type Propagator struct {
@@ -176,6 +185,11 @@ type Propagator struct {
 	pendingRetryBackoff     time.Duration
 	pendingRetryMaxBackoff  time.Duration
 	pendingRetryMaxAttempts int
+	// pullCooldown holds parked ancestors the reaper pulled into a batch
+	// until their own backoff has passed, so descendants cannot resubmit
+	// them every tick (see withParkedAncestors).
+	pullCooldownMu sync.Mutex
+	pullCooldown   map[string]time.Time
 
 	// broadcastJobs feeds the persistent worker pool that runs every
 	// per-endpoint POST /txs call. Replaces the previous per-broadcast

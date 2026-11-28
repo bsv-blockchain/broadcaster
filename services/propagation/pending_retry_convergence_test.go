@@ -58,14 +58,15 @@ import (
 type depAwareTeranode struct {
 	server *httptest.Server
 
-	mu       sync.Mutex
-	accepted map[string]bool
-	requests int // POST /txs count — one per broadcast chunk
+	mu        sync.Mutex
+	accepted  map[string]bool
+	requests  int            // POST /txs count — one per broadcast chunk
+	submitted map[string]int // times each txid was sent
 }
 
 func newDepAwareTeranode(t *testing.T, preAccepted ...string) *depAwareTeranode {
 	t.Helper()
-	d := &depAwareTeranode{accepted: make(map[string]bool)}
+	d := &depAwareTeranode{accepted: make(map[string]bool), submitted: make(map[string]int)}
 	for _, txid := range preAccepted {
 		d.accepted[strings.ToLower(txid)] = true
 	}
@@ -80,6 +81,12 @@ func (d *depAwareTeranode) requestCount() int {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return d.requests
+}
+
+func (d *depAwareTeranode) submitCount(txid string) int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.submitted[strings.ToLower(txid)]
 }
 
 func (d *depAwareTeranode) isAccepted(txid string) bool {
@@ -122,6 +129,9 @@ func (d *depAwareTeranode) handle(w http.ResponseWriter, req *http.Request) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.requests++
+	for _, p := range txs {
+		d.submitted[strings.ToLower(p.txid)]++
+	}
 
 	// Snapshot BEFORE deciding anything, so siblings in this same request
 	// cannot satisfy each other's dependencies.
@@ -195,7 +205,7 @@ func park(ms *mockStore, link chainLink, parkedAt time.Time) {
 // against a dependency-aware teranode.
 func newReaperPropagator(t *testing.T, teranodeURL string, st *mockStore, batchCap int) *Propagator {
 	t.Helper()
-	cfg := &config.Config{CallbackURL: "http://localhost:8080/callback"}
+	cfg := &config.Config{CallbackURL: testLocalCallbackURL}
 	cfg.Propagation.MerkleConcurrency = 10
 	if batchCap > 0 {
 		cfg.Propagation.ReaperRebroadcastBatch = batchCap
