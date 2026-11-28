@@ -190,27 +190,43 @@ func (m *mockStore) setStatusRow(txid string, status models.Status, rawTx []byte
 	m.rawByTxID[txid] = append([]byte(nil), rawTx...)
 }
 
-// GetStatus serves the seeded statusByTxID map; unknown txids return
+// GetStatus returns a row the way a real store does: whatever was last
+// written to it wins, then the seeded statusByTxID map, then a seeded replay
+// or parked row. Parked rows carry their retry bins. Unknown txids return
 // store.ErrNotFound, matching the real backends' contract.
 func (m *mockStore) GetStatus(_ context.Context, txid string) (*models.TransactionStatus, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if st, ok := m.statusByTxID[txid]; ok {
-		return &models.TransactionStatus{TxID: txid, Status: st, RawTx: m.rawByTxID[txid]}, nil
-	}
-	// A parked row carries its retry bins, as the real stores' GetStatus does.
-	if pr, ok := m.pendingRetries[txid]; ok {
-		if st, ok := m.latestStatusLocked(txid); !ok || st == models.StatusPendingRetry {
-			return &models.TransactionStatus{
-				TxID:        txid,
-				Status:      models.StatusPendingRetry,
-				RawTx:       pr.RawTx,
-				RetryCount:  pr.RetryCount,
-				NextRetryAt: pr.NextRetryAt,
-			}, nil
+	var (
+		st    models.Status
+		known bool
+	)
+	for i := len(m.updates) - 1; i >= 0; i-- {
+		if m.updates[i].TxID == txid {
+			st, known = m.updates[i].Status, true
+			break
 		}
 	}
-	return nil, store.ErrNotFound
+	if !known {
+		if seeded, ok := m.statusByTxID[txid]; ok {
+			return &models.TransactionStatus{TxID: txid, Status: seeded, RawTx: m.rawByTxID[txid]}, nil
+		}
+		st, known = m.latestStatusLocked(txid)
+	}
+	pr, parked := m.pendingRetries[txid]
+	if !known && !parked {
+		return nil, store.ErrNotFound
+	}
+	if !known {
+		st = models.StatusPendingRetry
+	}
+	row := &models.TransactionStatus{TxID: txid, Status: st, RawTx: m.rawByTxID[txid]}
+	if parked && st == models.StatusPendingRetry {
+		row.RawTx = pr.RawTx
+		row.RetryCount = pr.RetryCount
+		row.NextRetryAt = pr.NextRetryAt
+	}
+	return row, nil
 }
 
 // LookupRawTxs serves the rows seeded by setStatus / setStatusRow, the way
