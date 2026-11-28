@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/url"
+	"sort"
 	"time"
 
 	"go.uber.org/zap"
@@ -11,6 +12,7 @@ import (
 	"github.com/bsv-blockchain/broadcaster/logfields"
 	"github.com/bsv-blockchain/broadcaster/metrics"
 	"github.com/bsv-blockchain/broadcaster/models"
+	"github.com/bsv-blockchain/broadcaster/store"
 )
 
 // Stale thresholds for the reaper rebroadcast scan.
@@ -500,9 +502,264 @@ func (p *Propagator) drainParkedRetries(ctx context.Context, now, since time.Tim
 			retryReason: r.LastReason,
 		})
 	}
+	msgs = p.withParkedAncestors(ctx, msgs, p.rebroadcastBatch)
 	p.logger.Info("reaper: rebroadcasting parked txs", zap.Int("count", len(msgs)))
 	p.rebroadcastStuck(ctx, msgs, true)
 }
+
+// Bounds on withParkedAncestors per tick. The walk has to reach the top of a
+// chain before it can pull anything, so the read cap is generous — the walk
+// keeps only txids and parent lists — and wall time is the bound that
+// protects the reaper lease. A chain deeper than either allows is not pulled
+// for; it drains through the normal retry rotation, as before.
+const (
+	parkedAncestorReadsPerBatch = 64
+	parkedAncestorWalkTimeout   = 10 * time.Second
+)
+
+// withParkedAncestors appends to msgs up to budget of their ancestors that
+// are themselves parked at PENDING_RETRY, so layerByDependency can send them
+// ahead of the due rows that spend them. Without this, a due child whose
+// parent sits further back in the parked queue is broadcast alone, fails,
+// and is rebooked, and a deep chain drains about one link per full pass.
+//
+// The selection is dependency-closed. Every row, due or found, gets a level
+// one above its highest parked parent, and ancestors are taken in level order
+// while budget lasts; due rows cost nothing but take part in the ordering.
+// A row that depends on something the walk could not settle (a read error,
+// a bound hit, a row in pull cooldown) is not pulled, and neither is
+// anything that spends it.
+//
+// A pulled row is not due. An attempt that settles nothing must leave its
+// retry_count, next_retry_at and retry_reason as they were (pulledAncestor),
+// and it is not pulled again until its own next backoff has passed
+// (pullCooldown), so descendants cannot spend its budget or resubmit it
+// every tick. Pulled rows are not locked as GetReadyRetries' rows are; a
+// second reaper sending one costs a duplicate submit.
+func (p *Propagator) withParkedAncestors(ctx context.Context, msgs []propagationMsg, budget int) []propagationMsg {
+	if budget <= 0 || p.store == nil {
+		return msgs
+	}
+	walkCtx, cancel := context.WithTimeout(ctx, parkedAncestorWalkTimeout)
+	defer cancel()
+	now := time.Now()
+
+	type node struct {
+		parents    []string
+		retryCount int
+		due        bool // already in the batch
+	}
+	nodes := make(map[string]*node, len(msgs))
+	for _, m := range msgs {
+		nodes[m.TXID] = &node{parents: m.InputTXIDs, due: true}
+	}
+	// unknown holds txids the walk could not settle. Neither they nor
+	// anything spending them can be pulled.
+	unknown := make(map[string]struct{})
+	var order []string // discovery order, for a stable selection
+	seen := make(map[string]struct{})
+	var queue []string
+	enqueue := func(parents []string) {
+		for _, parent := range parents {
+			if _, ok := nodes[parent]; ok {
+				continue
+			}
+			if _, ok := seen[parent]; ok {
+				continue
+			}
+			seen[parent] = struct{}{}
+			queue = append(queue, parent)
+		}
+	}
+	for _, m := range msgs {
+		enqueue(m.InputTXIDs)
+	}
+
+	maxReads := parkedAncestorReadsPerBatch * budget
+	reads := 0
+	for len(queue) > 0 {
+		if reads >= maxReads || walkCtx.Err() != nil {
+			for _, txid := range queue {
+				unknown[txid] = struct{}{}
+			}
+			break
+		}
+		txid := queue[0]
+		queue = queue[1:]
+		reads++
+		row, err := p.store.GetStatus(walkCtx, txid)
+		if err != nil {
+			if !errors.Is(err, store.ErrNotFound) {
+				unknown[txid] = struct{}{}
+			}
+			continue
+		}
+		if row == nil || row.Status != models.StatusPendingRetry || len(row.RawTx) == 0 {
+			continue
+		}
+		if p.inPullCooldown(txid, now) {
+			unknown[txid] = struct{}{}
+			continue
+		}
+		parents := parentTxIDsOf(propagationMsg{TXID: txid, RawTx: row.RawTx})
+		nodes[txid] = &node{parents: parents, retryCount: row.RetryCount}
+		order = append(order, txid)
+		enqueue(parents)
+	}
+	if len(order) == 0 {
+		return msgs
+	}
+
+	// level is 0 for a row with no parked parent, else one more than its
+	// highest parked parent; blocked when it depends on something unknown.
+	const blocked = -1
+	level := make(map[string]int, len(nodes))
+	var levelOf func(txid string, path map[string]struct{}) int
+	levelOf = func(txid string, path map[string]struct{}) int {
+		if l, ok := level[txid]; ok {
+			return l
+		}
+		if _, cycle := path[txid]; cycle {
+			return blocked
+		}
+		path[txid] = struct{}{}
+		defer delete(path, txid)
+		l := 0
+		for _, parent := range nodes[txid].parents {
+			if _, ok := unknown[parent]; ok {
+				l = blocked
+				break
+			}
+			if _, ok := nodes[parent]; !ok {
+				continue // settled, or not ours
+			}
+			pl := levelOf(parent, path)
+			if pl == blocked {
+				l = blocked
+				break
+			}
+			if pl+1 > l {
+				l = pl + 1
+			}
+		}
+		level[txid] = l
+		return l
+	}
+	all := make([]string, 0, len(nodes))
+	for _, m := range msgs {
+		all = append(all, m.TXID)
+	}
+	all = append(all, order...)
+	path := make(map[string]struct{})
+	ranked := make([]string, 0, len(all))
+	for _, txid := range all {
+		if levelOf(txid, path) != blocked {
+			ranked = append(ranked, txid)
+		}
+	}
+	sort.SliceStable(ranked, func(i, j int) bool { return level[ranked[i]] < level[ranked[j]] })
+
+	// Walk the ranked rows top-down, taking ancestors while budget lasts.
+	// failed marks rows that did not make the batch and rows, due or taken,
+	// that wait on one; their descendants are not pulled. Unrelated chains
+	// ranked later still are.
+	failed := make(map[string]struct{})
+	waitsOnFailed := func(txid string) bool {
+		for _, parent := range nodes[txid].parents {
+			if _, ok := failed[parent]; ok {
+				return true
+			}
+		}
+		return false
+	}
+	pulled := 0
+	for _, txid := range ranked {
+		n := nodes[txid]
+		if n.due {
+			if waitsOnFailed(txid) {
+				failed[txid] = struct{}{}
+			}
+			continue
+		}
+		if pulled >= budget || walkCtx.Err() != nil || waitsOnFailed(txid) {
+			failed[txid] = struct{}{}
+			continue
+		}
+		row, err := p.store.GetStatus(walkCtx, txid)
+		if err != nil || row == nil || row.Status != models.StatusPendingRetry || len(row.RawTx) == 0 {
+			// Accepted or mined since the walk would satisfy its children;
+			// anything else would not. Only the former is safe to skip.
+			if err != nil || row == nil || !statusSatisfiesChildren(row.Status) {
+				failed[txid] = struct{}{}
+			}
+			continue
+		}
+		msgs = append(msgs, propagationMsg{
+			TXID:           txid,
+			RawTx:          row.RawTx,
+			InputTXIDs:     n.parents,
+			pulledAncestor: true,
+			parkedAttempts: n.retryCount,
+		})
+		pulled++
+	}
+	p.logger.Info("reaper: pulled parked ancestors into the batch",
+		zap.Int("count", pulled), zap.Int("found", len(order)),
+		zap.Int("unresolved", len(unknown)), zap.Int("reads", reads))
+	return msgs
+}
+
+// statusSatisfiesChildren reports whether a parent in status st is on the
+// network, so a child spending it can be accepted.
+func statusSatisfiesChildren(st models.Status) bool {
+	switch st {
+	case models.StatusAcceptedByNetwork, models.StatusSeenOnNetwork, models.StatusSeenMultipleNodes,
+		models.StatusMined, models.StatusImmutable:
+		return true
+	default:
+		return false
+	}
+}
+
+// inPullCooldown reports whether txid was pulled as an ancestor recently
+// enough that it should not be resubmitted yet, and forgets expired entries.
+func (p *Propagator) inPullCooldown(txid string, now time.Time) bool {
+	p.pullCooldownMu.Lock()
+	defer p.pullCooldownMu.Unlock()
+	until, ok := p.pullCooldown[txid]
+	if !ok {
+		return false
+	}
+	if now.Before(until) {
+		return true
+	}
+	delete(p.pullCooldown, txid)
+	return false
+}
+
+// startPullCooldown holds txid out of further pulls for the backoff its own
+// next attempt would get, without touching its durable schedule.
+func (p *Propagator) startPullCooldown(txid string, retryCount int, now time.Time) {
+	until := now.Add(p.nextPendingRetryDelay(retryCount + 1))
+	p.pullCooldownMu.Lock()
+	defer p.pullCooldownMu.Unlock()
+	if p.pullCooldown == nil {
+		p.pullCooldown = make(map[string]time.Time)
+	}
+	// Expired entries of rows never seen again would otherwise accumulate.
+	if len(p.pullCooldown) >= pullCooldownSweepAt {
+		for k, v := range p.pullCooldown {
+			if !now.Before(v) {
+				delete(p.pullCooldown, k)
+			}
+		}
+	}
+	p.pullCooldown[txid] = until
+}
+
+// pullCooldownSweepAt is the pullCooldown size at which expired entries are
+// swept; live entries are bounded by pulls per tick times ticks per backoff.
+const pullCooldownSweepAt = 10000
 
 // rebroadcastStuck pushes msgs back through the register+broadcast pipeline
 // and settles each result.
@@ -518,6 +775,14 @@ func (p *Propagator) rebroadcastStuck(ctx context.Context, msgs []propagationMsg
 	// original Kafka message terminated long ago) get a no-op notify,
 	// which is fine.
 	registered, _ := p.registerBatch(ctx, msgs)
+	// Cool down only the pulled rows that will actually be sent; one whose
+	// /watch registration failed stays eligible for the next tick.
+	coolFrom := time.Now()
+	for _, m := range registered {
+		if m.pulledAncestor {
+			p.startPullCooldown(m.TXID, m.parkedAttempts, coolFrom)
+		}
+	}
 	if len(registered) == 0 {
 		return
 	}
@@ -589,6 +854,10 @@ func (p *Propagator) rebroadcastStuck(ctx context.Context, msgs []propagationMsg
 
 	if parked {
 		for _, m := range unresolved {
+			if m.pulledAncestor {
+				// Not due: its own schedule and reason stand.
+				continue
+			}
 			p.schedulePendingRetry(ctx, m.TXID, m.RawTx, m.retryReason)
 		}
 	}

@@ -402,7 +402,7 @@ func TestReapOnce_RebroadcastBatchConfigurable(t *testing.T) {
 	teranodeSrv := newTeranodeServer(log, http.StatusOK)
 	defer teranodeSrv.Close()
 
-	cfg := &config.Config{CallbackURL: "http://localhost:8080/callback"}
+	cfg := &config.Config{CallbackURL: testLocalCallbackURL}
 	cfg.Propagation.MerkleConcurrency = 10
 	cfg.Propagation.ReaperRebroadcastBatch = 5
 	mc := merkleservice.NewClient(merkleSrv.URL, "", 5*time.Second)
@@ -450,7 +450,7 @@ func TestReapOnce_LogsBacklogDepth(t *testing.T) {
 	defer teranodeSrv.Close()
 
 	core, recorded := observer.New(zapcore.InfoLevel)
-	cfg := &config.Config{CallbackURL: "http://localhost:8080/callback"}
+	cfg := &config.Config{CallbackURL: testLocalCallbackURL}
 	cfg.Propagation.MerkleConcurrency = 10
 	mc := merkleservice.NewClient(merkleSrv.URL, "", 5*time.Second)
 	tc := teranode.NewClient([]string{teranodeSrv.URL}, "", teranode.HealthConfig{FailureThreshold: 1 << 20})

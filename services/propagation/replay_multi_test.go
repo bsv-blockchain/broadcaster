@@ -18,10 +18,12 @@ import (
 )
 
 // testBroadcasterCallbackURL and testBroadcasterCallbackToken are the callback_url and
-// callback_token the propagation tests configure.
+// callback_token the propagation tests configure. testLocalCallbackURL is the
+// callback_url the reaper and lifecycle tests configure.
 const (
 	testBroadcasterCallbackURL   = "http://broadcaster/cb"
 	testBroadcasterCallbackToken = "tok"
+	testLocalCallbackURL         = "http://localhost:8080/callback"
 )
 
 // A tx is registered once any endpoint accepts it: with one merkle-service

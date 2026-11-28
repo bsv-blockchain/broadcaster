@@ -36,7 +36,7 @@ func TestReapOnce_RebroadcastChunksByBytes(t *testing.T) {
 	teranodeSrv := newTeranodeServer(log, http.StatusOK)
 	defer teranodeSrv.Close()
 
-	cfg := &config.Config{CallbackURL: "http://localhost:8080/callback"}
+	cfg := &config.Config{CallbackURL: testLocalCallbackURL}
 	cfg.Propagation.MerkleConcurrency = 10
 	cfg.Propagation.TeranodeMaxBatchBytes = 2500
 	mc := merkleservice.NewClient(merkleSrv.URL, "", 5*time.Second)
