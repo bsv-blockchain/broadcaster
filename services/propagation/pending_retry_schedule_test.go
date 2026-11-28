@@ -3,14 +3,23 @@ package propagation
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/bsv-blockchain/go-sdk/chainhash"
+	"github.com/bsv-blockchain/go-sdk/script"
+	sdkTx "github.com/bsv-blockchain/go-sdk/transaction"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
+	"go.uber.org/zap"
+
+	"github.com/bsv-blockchain/broadcaster/config"
+	"github.com/bsv-blockchain/broadcaster/merkleservice"
 	"github.com/bsv-blockchain/broadcaster/metrics"
 	"github.com/bsv-blockchain/broadcaster/models"
+	"github.com/bsv-blockchain/broadcaster/teranode"
 )
 
 // orphanRetryReason is the last thing the network said about a parked orphan:
@@ -419,5 +428,265 @@ func TestReapOnce_AdoptsLegacyParkedRows(t *testing.T) {
 	}
 	if !acceptedTxIDs(ms)[legacy.txid] {
 		t.Errorf("adopted legacy row was not retried to ACCEPTED_BY_NETWORK")
+	}
+}
+
+// TestReapOnce_ChildDueBeforeParkedParent_StillConverges covers a parked
+// chain whose children are due BEFORE their parents.
+//
+// Nothing about parking puts a chain in parent-first order: children reach
+// the network first and draw TX_MISSING_PARENT first, so they park first, and
+// the jittered backoff reshuffles every reschedule after that. With more due
+// rows than one batch holds, the reaper kept picking children whose parents
+// were further back in the queue, broadcast them alone, and rebooked them
+// still ahead of their parents. Thousand-deep chains advanced about one link
+// per full pass and would have exhausted pending_retry_max_attempts.
+//
+// Parked here in exactly the wrong order (deepest link due first, depth ten
+// times the batch), the chain must still drain in no more ticks than a
+// parent-first queue would need.
+func TestReapOnce_ChildDueBeforeParkedParent_StillConverges(t *testing.T) {
+	for _, depth := range []int{200, 600} {
+		t.Run(fmt.Sprintf("depth=%d", depth), func(t *testing.T) {
+			reapChildFirstChain(t, depth, 20)
+		})
+	}
+}
+
+// reapChildFirstChain parks a depth-long chain deepest link first and
+// requires it to drain in depth/batchCap ticks.
+func reapChildFirstChain(t *testing.T, depth, batchCap int) {
+	t.Helper()
+	root := strings.Repeat("77", 32)
+	chain := buildChain(t, root, depth)
+
+	ms := newMockStore()
+	base := time.Now().Add(-time.Hour)
+	for i := len(chain) - 1; i >= 0; i-- {
+		// Deepest link gets the earliest next_retry_at.
+		park(ms, chain[i], base.Add(-time.Duration(i)*time.Millisecond))
+	}
+
+	tn := newDepAwareTeranode(t, root)
+	p := newReaperPropagator(t, tn.URL(), ms, batchCap)
+	p.pendingRetryBackoff = time.Nanosecond
+	p.pendingRetryMaxBackoff = time.Nanosecond
+
+	// The rate a parent-first queue drains at. Before the fix the 200-deep
+	// chain managed 60 links in 30 ticks.
+	maxTicks := depth / batchCap
+	ticks := 0
+	for ; ticks < maxTicks; ticks++ {
+		p.reapOnce(context.Background())
+		if len(acceptedTxIDs(ms)) == depth {
+			break
+		}
+	}
+
+	if got := len(acceptedTxIDs(ms)); got != depth {
+		t.Fatalf("depth-%d chain parked child-first drained only %d links in %d ticks", depth, got, maxTicks)
+	}
+	t.Logf("converged in %d ticks, %d broadcast requests", ticks+1, tn.requestCount())
+}
+
+// spendingTxFrom builds a transaction spending one output of each source,
+// in order.
+func spendingTxFrom(t *testing.T, nonce uint32, sources ...string) (txid string, raw []byte) {
+	t.Helper()
+	tx := sdkTx.NewTransaction()
+	tx.LockTime = nonce
+	for i, src := range sources {
+		h, err := chainhash.NewHashFromHex(src)
+		if err != nil {
+			t.Fatalf("NewHashFromHex(%s): %v", src, err)
+		}
+		tx.Inputs = append(tx.Inputs, &sdkTx.TransactionInput{
+			SourceTXID:       h,
+			SourceTxOutIndex: uint32(i),
+			UnlockingScript:  &script.Script{},
+			SequenceNumber:   0xffffffff,
+		})
+	}
+	return tx.TxID().String(), tx.Bytes()
+}
+
+// TestWithParkedAncestors_PullsDependencyClosedSet pins that the pull never
+// takes an ancestor without the parked parents it spends.
+//
+// D spends U and V, and V spends U, so the walk finds U and V at the same
+// distance from D. With room for one, taking V would be useless: it cannot be
+// accepted before U. U must be the one pulled, and accepted.
+func TestWithParkedAncestors_PullsDependencyClosedSet(t *testing.T) {
+	root := strings.Repeat("55", 32)
+	u, uRaw := spendingTxFrom(t, 1, root)
+	v, vRaw := spendingTxFrom(t, 2, u)
+	d, dRaw := spendingTxFrom(t, 3, u, v)
+
+	ms := newMockStore()
+	now := time.Now()
+	ms.parkTx(u, uRaw, now.Add(-time.Hour), now.Add(time.Hour))
+	ms.parkTx(v, vRaw, now.Add(-time.Hour), now.Add(time.Hour))
+	ms.parkTx(d, dRaw, now.Add(-time.Hour), now.Add(-time.Minute))
+
+	tn := newDepAwareTeranode(t, root)
+	p := newReaperPropagator(t, tn.URL(), ms, 1)
+
+	p.reapOnce(context.Background())
+
+	if !tn.isAccepted(u) {
+		t.Fatalf("U, the only ancestor that can be accepted, was not broadcast")
+	}
+}
+
+// TestWithParkedAncestors_FailedPullLeavesRowAlone pins that pulling a
+// parked ancestor for a due descendant does not spend the ancestor's retry
+// budget or rewrite its schedule and reason when the attempt settles nothing.
+// Otherwise a busy chain's children would burn their parent's
+// pending_retry_max_attempts long before its own backoff called for a retry.
+func TestWithParkedAncestors_FailedPullLeavesRowAlone(t *testing.T) {
+	missing := strings.Repeat("44", 32) // never reaches the network
+	parent, parentRaw := spendingTxFrom(t, 1, missing)
+	child, childRaw := spendingTxFrom(t, 2, parent)
+
+	ms := newMockStore()
+	now := time.Now()
+	parentNext := now.Add(time.Hour)
+	ms.parkTx(parent, parentRaw, now.Add(-time.Hour), parentNext)
+	ms.parkTx(child, childRaw, now.Add(-time.Hour), now.Add(-time.Minute))
+	const reason = "STORAGE_ERROR (69): earlier attempt"
+	ms.mu.Lock()
+	ms.pendingRetries[parent].LastReason = reason
+	before := *ms.pendingRetries[parent]
+	beforeCount := ms.retryCounts[parent]
+	ms.mu.Unlock()
+
+	tn := newDepAwareTeranode(t)
+	p := newReaperPropagator(t, tn.URL(), ms, 10)
+
+	p.reapOnce(context.Background())
+
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+	after, ok := ms.pendingRetries[parent]
+	if !ok {
+		t.Fatalf("parked parent left the retry queue after a pull that settled nothing")
+	}
+	if ms.retryCounts[parent] != beforeCount {
+		t.Errorf("retry_count = %d, want %d: the pull spent the parent's budget", ms.retryCounts[parent], beforeCount)
+	}
+	if !after.NextRetryAt.Equal(before.NextRetryAt) {
+		t.Errorf("next_retry_at = %v, want %v", after.NextRetryAt, before.NextRetryAt)
+	}
+	if after.LastReason != reason {
+		t.Errorf("retry_reason = %q, want %q", after.LastReason, reason)
+	}
+	if ms.retryCounts[child] == 1 {
+		t.Errorf("the due child was not retried")
+	}
+}
+
+// TestWithParkedAncestors_ClosureRunsThroughDueRows pins that a due row in
+// the batch does not cut the dependency analysis short. In
+// U1 -> U2 -> U3 -> A -> B -> D with A and D due and room for two
+// ancestors, B is useless without U1..U3 behind A. The two pulled must be the
+// top of the chain, U1 and U2, and both accepted.
+func TestWithParkedAncestors_ClosureRunsThroughDueRows(t *testing.T) {
+	root := strings.Repeat("33", 32)
+	chain := buildChain(t, root, 6) // U1 U2 U3 A B D
+	ms := newMockStore()
+	now := time.Now()
+	for i, link := range chain {
+		next := now.Add(time.Hour)
+		if i == 3 || i == 5 { // A, D
+			next = now.Add(-time.Minute)
+		}
+		ms.parkTx(link.txid, link.raw, now.Add(-time.Hour), next)
+	}
+
+	tn := newDepAwareTeranode(t, root)
+	p := newReaperPropagator(t, tn.URL(), ms, 2)
+
+	p.reapOnce(context.Background())
+
+	for i, name := range []string{"U1", "U2"} {
+		if !tn.isAccepted(chain[i].txid) {
+			t.Errorf("%s, at the top of the chain, was not accepted", name)
+		}
+	}
+	if n := tn.submitCount(chain[4].txid); n != 0 {
+		t.Errorf("B was sent %d times; it cannot be accepted before U3 and A", n)
+	}
+}
+
+// TestWithParkedAncestors_PullCooldown pins that a parked ancestor that
+// stays unresolved is not resubmitted on every tick just because another
+// descendant fell due: it waits out the backoff its own next attempt would
+// get.
+func TestWithParkedAncestors_PullCooldown(t *testing.T) {
+	missing := strings.Repeat("22", 32) // never reaches the network
+	parent, parentRaw := spendingTxFrom(t, 1, missing)
+	child1, child1Raw := spendingTxFrom(t, 2, parent)
+	child2, child2Raw := spendingTxFrom(t, 3, parent)
+
+	ms := newMockStore()
+	now := time.Now()
+	ms.parkTx(parent, parentRaw, now.Add(-time.Hour), now.Add(time.Hour))
+	ms.parkTx(child1, child1Raw, now.Add(-time.Hour), now.Add(-time.Minute))
+
+	tn := newDepAwareTeranode(t)
+	p := newReaperPropagator(t, tn.URL(), ms, 10)
+	p.pendingRetryBackoff = time.Hour
+	p.pendingRetryMaxBackoff = time.Hour
+
+	p.reapOnce(context.Background())
+	if n := tn.submitCount(parent); n == 0 {
+		t.Fatalf("parent was never pulled for its due child")
+	}
+	first := tn.submitCount(parent)
+
+	// A second descendant falls due on the next tick.
+	ms.parkTx(child2, child2Raw, now.Add(-time.Hour), now.Add(-time.Minute))
+	p.reapOnce(context.Background())
+
+	if n := tn.submitCount(parent); n != first {
+		t.Errorf("parent sent %d times after the second tick, want %d: pulled again inside its cooldown", n, first)
+	}
+	if tn.submitCount(child2) == 0 {
+		t.Errorf("the newly due child was not retried")
+	}
+}
+
+// TestWithParkedAncestors_NoCooldownWithoutRegistration pins that a pulled
+// ancestor whose merkle /watch registration fails is not put into pull
+// cooldown: it was never sent, so the next tick must be free to pull it.
+func TestWithParkedAncestors_NoCooldownWithoutRegistration(t *testing.T) {
+	missing := strings.Repeat("11", 32)
+	parent, parentRaw := spendingTxFrom(t, 1, missing)
+	child, childRaw := spendingTxFrom(t, 2, parent)
+
+	ms := newMockStore()
+	now := time.Now()
+	ms.parkTx(parent, parentRaw, now.Add(-time.Hour), now.Add(time.Hour))
+	ms.parkTx(child, childRaw, now.Add(-time.Hour), now.Add(-time.Minute))
+
+	tn := newDepAwareTeranode(t)
+	cfg := &config.Config{CallbackURL: testLocalCallbackURL}
+	cfg.Propagation.MerkleConcurrency = 10
+	cfg.Propagation.ReaperRebroadcastBatch = 10
+	merkleSrv := newMerkleServer(&eventLog{}, http.StatusInternalServerError)
+	t.Cleanup(merkleSrv.Close)
+	mc := merkleservice.NewClient(merkleSrv.URL, "", 5*time.Second)
+	tc := teranode.NewClient([]string{tn.URL()}, "", teranode.HealthConfig{FailureThreshold: 1 << 20})
+	p := New(cfg, zap.NewNop(), nil, nil, ms, nil, tc, mc)
+	p.pendingRetryBackoff = time.Hour
+	p.pendingRetryMaxBackoff = time.Hour
+
+	p.reapOnce(context.Background())
+
+	if tn.submitCount(parent) != 0 {
+		t.Fatalf("parent was broadcast although its registration failed")
+	}
+	if p.inPullCooldown(parent, time.Now()) {
+		t.Errorf("parent is in pull cooldown although it was never sent")
 	}
 }
