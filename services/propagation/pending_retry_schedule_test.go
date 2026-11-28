@@ -421,3 +421,53 @@ func TestReapOnce_AdoptsLegacyParkedRows(t *testing.T) {
 		t.Errorf("adopted legacy row was not retried to ACCEPTED_BY_NETWORK")
 	}
 }
+
+// TestReapOnce_ChildDueBeforeParkedParent_StillConverges covers a parked
+// chain whose children are due BEFORE their parents.
+//
+// Nothing about parking puts a chain in parent-first order: children reach
+// the network first and draw TX_MISSING_PARENT first, so they park first, and
+// the jittered backoff reshuffles every reschedule after that. With more due
+// rows than one batch holds, the reaper kept picking children whose parents
+// were further back in the queue, broadcast them alone, and rebooked them
+// still ahead of their parents. Thousand-deep chains advanced about one link
+// per full pass and would have exhausted pending_retry_max_attempts.
+//
+// Parked here in exactly the wrong order (deepest link due first, depth ten
+// times the batch), the chain must still drain at a full batch per tick.
+func TestReapOnce_ChildDueBeforeParkedParent_StillConverges(t *testing.T) {
+	const (
+		depth    = 200
+		batchCap = 20
+	)
+	root := strings.Repeat("77", 32)
+	chain := buildChain(t, root, depth)
+
+	ms := newMockStore()
+	base := time.Now().Add(-time.Hour)
+	for i := len(chain) - 1; i >= 0; i-- {
+		// Deepest link gets the earliest next_retry_at.
+		park(ms, chain[i], base.Add(-time.Duration(i)*time.Millisecond))
+	}
+
+	tn := newDepAwareTeranode(t, root)
+	p := newReaperPropagator(t, tn.URL(), ms, batchCap)
+	p.pendingRetryBackoff = time.Nanosecond
+	p.pendingRetryMaxBackoff = time.Nanosecond
+
+	// The rate a parent-first queue drains at. Before the fix this order
+	// managed 60 links in 30 ticks.
+	const maxTicks = depth / batchCap
+	ticks := 0
+	for ; ticks < maxTicks; ticks++ {
+		p.reapOnce(context.Background())
+		if len(acceptedTxIDs(ms)) == depth {
+			break
+		}
+	}
+
+	if got := len(acceptedTxIDs(ms)); got != depth {
+		t.Fatalf("depth-%d chain parked child-first drained only %d links in %d ticks", depth, got, maxTicks)
+	}
+	t.Logf("converged in %d ticks, %d broadcast requests", ticks+1, tn.requestCount())
+}

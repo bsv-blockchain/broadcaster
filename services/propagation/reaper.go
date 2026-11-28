@@ -500,8 +500,101 @@ func (p *Propagator) drainParkedRetries(ctx context.Context, now, since time.Tim
 			retryReason: r.LastReason,
 		})
 	}
+	msgs = p.withParkedAncestors(ctx, msgs, p.rebroadcastBatch)
 	p.logger.Info("reaper: rebroadcasting parked txs", zap.Int("count", len(msgs)))
 	p.rebroadcastStuck(ctx, msgs, true)
+}
+
+// parkedAncestorReadsPerBatch bounds withParkedAncestors' store reads per
+// tick, as a multiple of the rebroadcast batch.
+const parkedAncestorReadsPerBatch = 20
+
+// withParkedAncestors appends to msgs up to budget of their ancestors that
+// are themselves parked at PENDING_RETRY, preferring the ones furthest up
+// each chain.
+//
+// Nothing keeps the parked queue parent-first. Children reach the network
+// before their parents, draw TX_MISSING_PARENT first and park first, and
+// every failed retry is rebooked at now plus a jittered backoff. When more
+// rows are due than one batch holds, a batch is mostly children whose
+// parents sit further back in the queue. Each is broadcast without its
+// parent, fails, and is rebooked behind the rows that were waiting, so
+// layerByDependency rarely sees a parent and child together. A chain
+// thousands deep advanced about one link per pass over the whole parked set,
+// and would exhaust pending_retry_max_attempts long before draining.
+//
+// Pulling the parked ancestors into the batch fixes the order: layering sends
+// them first. Only the top of a chain can be accepted, since everything below
+// waits on it, so the walk goes all the way up and, when it finds more than
+// budget, keeps the ones furthest from the selected rows. Each tick then
+// accepts up to budget links from the top of the chain instead of one.
+//
+// Ancestors are pulled whether or not they are due: broadcasting a due child
+// without its parent cannot succeed, so honouring the parent's backoff would
+// only waste the child's attempt.
+//
+// The walk is breadth-first, one GetStatus per distinct parent, capped at
+// parkedAncestorReadsPerBatch × budget reads, so a chain deeper than that
+// drains more slowly but every tick still costs a bounded number of reads. A
+// pulled row is not locked the way GetReadyRetries' rows are, so a second
+// reaper process could broadcast it in the same tick; that costs a duplicate
+// submit and an extra retry_count, nothing more.
+func (p *Propagator) withParkedAncestors(ctx context.Context, msgs []propagationMsg, budget int) []propagationMsg {
+	if budget <= 0 {
+		return msgs
+	}
+	seen := make(map[string]struct{}, len(msgs))
+	for _, m := range msgs {
+		seen[m.TXID] = struct{}{}
+	}
+	type ancestor struct {
+		msg   propagationMsg
+		depth int
+	}
+	var found []ancestor
+	maxReads := parkedAncestorReadsPerBatch * budget
+	reads := 0
+	frontier := msgs
+	for depth := 1; len(frontier) > 0 && reads < maxReads; depth++ {
+		var next []propagationMsg
+		for _, m := range frontier {
+			for _, parent := range m.InputTXIDs {
+				if reads >= maxReads {
+					break
+				}
+				if _, ok := seen[parent]; ok {
+					continue
+				}
+				seen[parent] = struct{}{}
+				reads++
+				row, err := p.store.GetStatus(ctx, parent)
+				if err != nil || row == nil || row.Status != models.StatusPendingRetry || len(row.RawTx) == 0 {
+					continue
+				}
+				pm := propagationMsg{
+					TXID:       parent,
+					RawTx:      row.RawTx,
+					InputTXIDs: parentTxIDsOf(propagationMsg{TXID: parent, RawTx: row.RawTx}),
+				}
+				found = append(found, ancestor{msg: pm, depth: depth})
+				next = append(next, pm)
+			}
+		}
+		frontier = next
+	}
+	if len(found) == 0 {
+		return msgs
+	}
+	if len(found) > budget {
+		// Breadth-first order is shallowest first; keep the deepest.
+		found = found[len(found)-budget:]
+	}
+	for _, a := range found {
+		msgs = append(msgs, a.msg)
+	}
+	p.logger.Info("reaper: pulled parked ancestors into the batch",
+		zap.Int("count", len(found)), zap.Int("reads", reads))
+	return msgs
 }
 
 // rebroadcastStuck pushes msgs back through the register+broadcast pipeline

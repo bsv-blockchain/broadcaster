@@ -198,6 +198,18 @@ func (m *mockStore) GetStatus(_ context.Context, txid string) (*models.Transacti
 	if st, ok := m.statusByTxID[txid]; ok {
 		return &models.TransactionStatus{TxID: txid, Status: st, RawTx: m.rawByTxID[txid]}, nil
 	}
+	// A parked row carries its retry bins, as the real stores' GetStatus does.
+	if pr, ok := m.pendingRetries[txid]; ok {
+		if st, ok := m.latestStatusLocked(txid); !ok || st == models.StatusPendingRetry {
+			return &models.TransactionStatus{
+				TxID:        txid,
+				Status:      models.StatusPendingRetry,
+				RawTx:       pr.RawTx,
+				RetryCount:  pr.RetryCount,
+				NextRetryAt: pr.NextRetryAt,
+			}, nil
+		}
+	}
 	return nil, store.ErrNotFound
 }
 
