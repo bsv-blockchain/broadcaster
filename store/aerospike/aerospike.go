@@ -49,6 +49,10 @@ const (
 	setPeerPolicies     = "arcade_peer_policies"
 )
 
+// ErrInvalidBatchSize is returned by New when config.Aero.BatchSize is not
+// positive. The batch loops step by that value, so zero would never advance.
+var ErrInvalidBatchSize = errors.New("aerospike: batch size must be > 0")
+
 // BUMP chunking — large compound BUMPs (scaling networks with millions of
 // txs/block produce tens of MiB of merkle path data) cannot fit in a single
 // Aerospike record because record size is bounded by the namespace's
@@ -100,7 +104,14 @@ type Store struct {
 }
 
 // New creates an Aerospike-backed Store connected to the configured cluster.
+// It returns ErrInvalidBatchSize when cfg.BatchSize is not positive. Config
+// validation rejects that value on the Load path; this check covers callers
+// that build config.Aero directly.
 func New(ctx context.Context, cfg config.Aero) (*Store, error) {
+	if cfg.BatchSize <= 0 {
+		return nil, fmt.Errorf("%w, got %d", ErrInvalidBatchSize, cfg.BatchSize)
+	}
+
 	hosts := make([]*aero.Host, 0, len(cfg.Hosts))
 	for _, h := range cfg.Hosts {
 		hostname, portStr, err := net.SplitHostPort(h)
