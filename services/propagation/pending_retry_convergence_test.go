@@ -205,7 +205,7 @@ func park(ms *mockStore, link chainLink, parkedAt time.Time) {
 // against a dependency-aware teranode.
 func newReaperPropagator(t *testing.T, teranodeURL string, st *mockStore, batchCap int) *Propagator {
 	t.Helper()
-	cfg := &config.Config{CallbackURL: "http://localhost:8080/callback"}
+	cfg := &config.Config{CallbackURL: testLocalCallbackURL}
 	cfg.Propagation.MerkleConcurrency = 10
 	if batchCap > 0 {
 		cfg.Propagation.ReaperRebroadcastBatch = batchCap

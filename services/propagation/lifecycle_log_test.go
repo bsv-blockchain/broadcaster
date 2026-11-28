@@ -197,7 +197,7 @@ func TestRegisterBatch_LogsMerkleRegistrationAtDebug(t *testing.T) {
 	logger := zap.New(core)
 
 	cfg := &config.Config{
-		CallbackURL:   "http://localhost:8080/callback",
+		CallbackURL:   testLocalCallbackURL,
 		CallbackToken: "secret",
 	}
 	cfg.Propagation.MerkleConcurrency = 10

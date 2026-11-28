@@ -649,7 +649,7 @@ func newTeranodeServer(log *eventLog, statusCode int) *httptest.Server {
 
 func newPropagator(merkleSrvURL, teranodeSrvURL string, st store.Store) *Propagator {
 	cfg := &config.Config{
-		CallbackURL: "http://localhost:8080/callback",
+		CallbackURL: testLocalCallbackURL,
 	}
 	cfg.Propagation.MerkleConcurrency = 10
 
@@ -731,7 +731,7 @@ func TestHandleMessage_ForwardsCallbackToken(t *testing.T) {
 	defer teranodeSrv.Close()
 
 	cfg := &config.Config{
-		CallbackURL:   "http://localhost:8080/callback",
+		CallbackURL:   testLocalCallbackURL,
 		CallbackToken: "secret-bsv-broadcaster-token",
 	}
 	cfg.Propagation.MerkleConcurrency = 10
@@ -1288,7 +1288,7 @@ func TestProcessBatch_BulkPublish_OneEventPerStatus(t *testing.T) {
 	defer teranodeSrv.Close()
 
 	ms := newMockStore()
-	cfg := &config.Config{CallbackURL: "http://localhost:8080/callback"}
+	cfg := &config.Config{CallbackURL: testLocalCallbackURL}
 	cfg.Propagation.MerkleConcurrency = 10
 
 	mc := merkleservice.NewClient(merkleSrv.URL, "", 5*time.Second)
@@ -1356,7 +1356,7 @@ func TestBroadcastInChunks_ParallelismHonorsConfig(t *testing.T) {
 	defer teranodeSrv.Close()
 
 	ms := newMockStore()
-	cfg := &config.Config{CallbackURL: "http://localhost:8080/callback"}
+	cfg := &config.Config{CallbackURL: testLocalCallbackURL}
 	cfg.Propagation.MerkleConcurrency = 10
 	cfg.Propagation.TeranodeMaxBatchSize = 25
 	cfg.Propagation.MaxParallelChunks = 4

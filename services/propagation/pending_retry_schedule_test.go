@@ -670,7 +670,7 @@ func TestWithParkedAncestors_NoCooldownWithoutRegistration(t *testing.T) {
 	ms.parkTx(child, childRaw, now.Add(-time.Hour), now.Add(-time.Minute))
 
 	tn := newDepAwareTeranode(t)
-	cfg := &config.Config{CallbackURL: "http://localhost:8080/callback"}
+	cfg := &config.Config{CallbackURL: testLocalCallbackURL}
 	cfg.Propagation.MerkleConcurrency = 10
 	cfg.Propagation.ReaperRebroadcastBatch = 10
 	merkleSrv := newMerkleServer(&eventLog{}, http.StatusInternalServerError)
