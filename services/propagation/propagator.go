@@ -108,6 +108,9 @@ type propagationMsg struct {
 	// not due, and the descendant's need must not spend its retry budget or
 	// overwrite its recorded reason. Process-local; never serialized.
 	pulledAncestor bool
+	// parkedAttempts is a pulled ancestor's stored retry_count, which sets
+	// its pull cooldown. Process-local; never serialized.
+	parkedAttempts int
 }
 
 type Propagator struct {

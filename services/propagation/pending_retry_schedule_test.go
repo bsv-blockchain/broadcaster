@@ -3,6 +3,7 @@ package propagation
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -12,8 +13,13 @@ import (
 	sdkTx "github.com/bsv-blockchain/go-sdk/transaction"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
+	"go.uber.org/zap"
+
+	"github.com/bsv-blockchain/broadcaster/config"
+	"github.com/bsv-blockchain/broadcaster/merkleservice"
 	"github.com/bsv-blockchain/broadcaster/metrics"
 	"github.com/bsv-blockchain/broadcaster/models"
+	"github.com/bsv-blockchain/broadcaster/teranode"
 )
 
 // orphanRetryReason is the last thing the network said about a parked orphan:
@@ -440,10 +446,17 @@ func TestReapOnce_AdoptsLegacyParkedRows(t *testing.T) {
 // times the batch), the chain must still drain in no more ticks than a
 // parent-first queue would need.
 func TestReapOnce_ChildDueBeforeParkedParent_StillConverges(t *testing.T) {
-	const (
-		depth    = 200
-		batchCap = 20
-	)
+	for _, depth := range []int{200, 600} {
+		t.Run(fmt.Sprintf("depth=%d", depth), func(t *testing.T) {
+			reapChildFirstChain(t, depth, 20)
+		})
+	}
+}
+
+// reapChildFirstChain parks a depth-long chain deepest link first and
+// requires it to drain in depth/batchCap ticks.
+func reapChildFirstChain(t *testing.T, depth, batchCap int) {
+	t.Helper()
 	root := strings.Repeat("77", 32)
 	chain := buildChain(t, root, depth)
 
@@ -459,9 +472,9 @@ func TestReapOnce_ChildDueBeforeParkedParent_StillConverges(t *testing.T) {
 	p.pendingRetryBackoff = time.Nanosecond
 	p.pendingRetryMaxBackoff = time.Nanosecond
 
-	// The rate a parent-first queue drains at. Before the fix this order
-	// managed 60 links in 30 ticks.
-	const maxTicks = depth / batchCap
+	// The rate a parent-first queue drains at. Before the fix the 200-deep
+	// chain managed 60 links in 30 ticks.
+	maxTicks := depth / batchCap
 	ticks := 0
 	for ; ticks < maxTicks; ticks++ {
 		p.reapOnce(context.Background())
@@ -640,5 +653,40 @@ func TestWithParkedAncestors_PullCooldown(t *testing.T) {
 	}
 	if tn.submitCount(child2) == 0 {
 		t.Errorf("the newly due child was not retried")
+	}
+}
+
+// TestWithParkedAncestors_NoCooldownWithoutRegistration pins that a pulled
+// ancestor whose merkle /watch registration fails is not put into pull
+// cooldown: it was never sent, so the next tick must be free to pull it.
+func TestWithParkedAncestors_NoCooldownWithoutRegistration(t *testing.T) {
+	missing := strings.Repeat("11", 32)
+	parent, parentRaw := spendingTxFrom(t, 1, missing)
+	child, childRaw := spendingTxFrom(t, 2, parent)
+
+	ms := newMockStore()
+	now := time.Now()
+	ms.parkTx(parent, parentRaw, now.Add(-time.Hour), now.Add(time.Hour))
+	ms.parkTx(child, childRaw, now.Add(-time.Hour), now.Add(-time.Minute))
+
+	tn := newDepAwareTeranode(t)
+	cfg := &config.Config{CallbackURL: "http://localhost:8080/callback"}
+	cfg.Propagation.MerkleConcurrency = 10
+	cfg.Propagation.ReaperRebroadcastBatch = 10
+	merkleSrv := newMerkleServer(&eventLog{}, http.StatusInternalServerError)
+	t.Cleanup(merkleSrv.Close)
+	mc := merkleservice.NewClient(merkleSrv.URL, "", 5*time.Second)
+	tc := teranode.NewClient([]string{tn.URL()}, "", teranode.HealthConfig{FailureThreshold: 1 << 20})
+	p := New(cfg, zap.NewNop(), nil, nil, ms, nil, tc, mc)
+	p.pendingRetryBackoff = time.Hour
+	p.pendingRetryMaxBackoff = time.Hour
+
+	p.reapOnce(context.Background())
+
+	if tn.submitCount(parent) != 0 {
+		t.Fatalf("parent was broadcast although its registration failed")
+	}
+	if p.inPullCooldown(parent, time.Now()) {
+		t.Errorf("parent is in pull cooldown although it was never sent")
 	}
 }

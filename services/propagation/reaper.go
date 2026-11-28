@@ -507,53 +507,35 @@ func (p *Propagator) drainParkedRetries(ctx context.Context, now, since time.Tim
 	p.rebroadcastStuck(ctx, msgs, true)
 }
 
-// Bounds on withParkedAncestors per tick: store reads as a multiple of the
-// rebroadcast batch, and wall time for the whole walk including the re-reads,
-// so a deep chain or a slow store cannot hold the reaper lease past its TTL
-// before anything is broadcast.
+// Bounds on withParkedAncestors per tick. The walk has to reach the top of a
+// chain before it can pull anything, so the read cap is generous — the walk
+// keeps only txids and parent lists — and wall time is the bound that
+// protects the reaper lease. A chain deeper than either allows is not pulled
+// for; it drains through the normal retry rotation, as before.
 const (
-	parkedAncestorReadsPerBatch = 8
+	parkedAncestorReadsPerBatch = 64
 	parkedAncestorWalkTimeout   = 10 * time.Second
 )
 
 // withParkedAncestors appends to msgs up to budget of their ancestors that
-// are themselves parked at PENDING_RETRY, taken from the top of each chain
-// down.
+// are themselves parked at PENDING_RETRY, so layerByDependency can send them
+// ahead of the due rows that spend them. Without this, a due child whose
+// parent sits further back in the parked queue is broadcast alone, fails,
+// and is rebooked, and a deep chain drains about one link per full pass.
 //
-// Nothing keeps the parked queue parent-first. Children reach the network
-// before their parents, draw TX_MISSING_PARENT first and park first, and
-// every failed retry is rebooked at now plus a jittered backoff. When more
-// rows are due than one batch holds, a batch is mostly children whose
-// parents sit further back in the queue. Each is broadcast without its
-// parent, fails, and is rebooked behind the rows that were waiting, so
-// layerByDependency rarely sees a parent and child together. A chain
-// thousands deep advanced about one link per pass over the whole parked set,
-// and would exhaust pending_retry_max_attempts long before draining.
+// The selection is dependency-closed. Every row, due or found, gets a level
+// one above its highest parked parent, and ancestors are taken in level order
+// while budget lasts; due rows cost nothing but take part in the ordering.
+// A row that depends on something the walk could not settle (a read error,
+// a bound hit, a row in pull cooldown) is not pulled, and neither is
+// anything that spends it.
 //
-// Pulling the parked ancestors into the batch lets layering send them first.
-// Only the top of a chain can be accepted, since everything below waits on
-// it, so the walk goes as far up as its bounds allow and the selection is
-// dependency-closed. Every row — the due ones already in the batch and the
-// ancestors found — gets a level, one more than its highest parked parent,
-// and ancestors are taken in level order until the budget runs out; due rows
-// cost nothing but sit in the same order, so an ancestor above a due row is
-// never taken without what that due row waits on. A row that depends on
-// something the walk could not settle (a read error, a bound hit, a row in
-// its pull cooldown) is never pulled, and neither is anything that spends it.
-//
-// A pulled row is not due, and it is here for its descendant's sake, so an
-// attempt that settles nothing leaves its row untouched (see pulledAncestor):
-// no retry_count, no new next_retry_at, no overwritten reason. A verdict —
-// accepted, or a rejection — is still recorded. So that a stream of newly
-// due descendants cannot resubmit the same parent every tick, a pulled row
-// is not pulled again until its own backoff for its current attempt count
-// has passed (pullCooldown). Pulled rows are not locked the way
-// GetReadyRetries' rows are; a second reaper process broadcasting the same
-// row costs a duplicate submit and nothing else.
-//
-// The walk keeps only txids and parent lists; raw bytes are re-read for the
-// selected rows alone, and a row whose re-read fails takes its selected
-// descendants out with it.
+// A pulled row is not due. An attempt that settles nothing must leave its
+// retry_count, next_retry_at and retry_reason as they were (pulledAncestor),
+// and it is not pulled again until its own next backoff has passed
+// (pullCooldown), so descendants cannot spend its budget or resubmit it
+// every tick. Pulled rows are not locked as GetReadyRetries' rows are; a
+// second reaper sending one costs a duplicate submit.
 func (p *Propagator) withParkedAncestors(ctx context.Context, msgs []propagationMsg, budget int) []propagationMsg {
 	if budget <= 0 || p.store == nil {
 		return msgs
@@ -677,10 +659,10 @@ func (p *Propagator) withParkedAncestors(ctx context.Context, msgs []propagation
 	}
 	sort.SliceStable(ranked, func(i, j int) bool { return level[ranked[i]] < level[ranked[j]] })
 
-	// Walk the ranked rows top-down. An ancestor is taken while budget lasts
-	// and its re-read succeeds; once one is not taken, nothing ranked below
-	// it can be. failed marks rows — taken or due — that wait on a row which
-	// did not make the batch, so their descendants are not pulled either.
+	// Walk the ranked rows top-down, taking ancestors while budget lasts.
+	// failed marks rows that did not make the batch and rows, due or taken,
+	// that wait on one; their descendants are not pulled. Unrelated chains
+	// ranked later still are.
 	failed := make(map[string]struct{})
 	waitsOnFailed := func(txid string) bool {
 		for _, parent := range nodes[txid].parents {
@@ -717,8 +699,8 @@ func (p *Propagator) withParkedAncestors(ctx context.Context, msgs []propagation
 			RawTx:          row.RawTx,
 			InputTXIDs:     n.parents,
 			pulledAncestor: true,
+			parkedAttempts: n.retryCount,
 		})
-		p.startPullCooldown(txid, n.retryCount, now)
 		pulled++
 	}
 	p.logger.Info("reaper: pulled parked ancestors into the batch",
@@ -793,6 +775,14 @@ func (p *Propagator) rebroadcastStuck(ctx context.Context, msgs []propagationMsg
 	// original Kafka message terminated long ago) get a no-op notify,
 	// which is fine.
 	registered, _ := p.registerBatch(ctx, msgs)
+	// Cool down only the pulled rows that will actually be sent; one whose
+	// /watch registration failed stays eligible for the next tick.
+	coolFrom := time.Now()
+	for _, m := range registered {
+		if m.pulledAncestor {
+			p.startPullCooldown(m.TXID, m.parkedAttempts, coolFrom)
+		}
+	}
 	if len(registered) == 0 {
 		return
 	}
