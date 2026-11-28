@@ -7,16 +7,34 @@ import (
 	"go.uber.org/zap"
 )
 
-// CheckPartitions verifies that every topic in `topics` exists on the broker
-// and has at least `minPartitions` partitions. Topics that don't exist yet
-// (e.g. lazily-created on first publish) are reported as warnings, not
-// errors, since Sarama/Kafka will auto-create them on publish.
+// CheckPartitions verifies that every topic in topics exists on the broker
+// and has at least minPartitions partitions. Startup calls it so a
+// horizontally scaled deployment sees a bad topic before traffic arrives.
 //
-// Returns an error only when an existing topic has fewer partitions than
-// minPartitions, because that is an unrecoverable misconfiguration for a
-// horizontally-scaled deployment — more pods than partitions means some
-// pods will never receive messages. Used at startup from cmd/bsv-broadcaster so
-// operators see the problem before traffic arrives.
+// Parameters:
+//   - broker: answers PartitionCount. A topic the broker does not have is
+//     ErrTopicNotFound, and that sentinel is wrapped on the error returned
+//     here. The in-memory broker never returns that error (unknown topics
+//     report their configured width, default 1), so the missing-topic
+//     failure below does not fire on the standalone path.
+//   - topics: topics to inspect. Nil or empty checks nothing.
+//   - minPartitions: required floor. Values <= 1 skip the check. That is
+//     the standalone and single-replica setting (kafka.min_partitions left
+//     at 0 or 1), where topics may be created later and a partition floor
+//     is not meaningful.
+//   - logger: receives an info line for each topic that meets the floor.
+//
+// Returns an error when minPartitions > 1 and a topic is missing or has
+// fewer partitions than minPartitions. A missing topic is a hard error for
+// the same reason a narrow topic is: auto-creation on first publish uses
+// the broker's default partition count, which is often lower than the pod
+// count. The Sarama PartitionCount client disables auto-topic creation so
+// the probe itself cannot create the topic and then fail on that width.
+// Operators create the topic with at least minPartitions partitions before
+// startup. Other broker errors are wrapped and returned.
+//
+// Returns nil when minPartitions <= 1, when topics is empty, or when every
+// listed topic meets the floor.
 func CheckPartitions(broker Broker, topics []string, minPartitions int, logger *zap.Logger) error {
 	if minPartitions <= 1 {
 		return nil
@@ -24,12 +42,12 @@ func CheckPartitions(broker Broker, topics []string, minPartitions int, logger *
 	for _, topic := range topics {
 		count, err := broker.PartitionCount(topic)
 		if errors.Is(err, ErrTopicNotFound) {
-			logger.Warn(
-				"topic not found on broker — will be auto-created on first publish; ensure partition count matches deployment size",
-				zap.String("topic", topic),
-				zap.Int("min_partitions", minPartitions),
+			return fmt.Errorf(
+				"topic %s not found on broker; create it with at least %d partitions before startup (horizontal scaling): %w",
+				topic,
+				minPartitions,
+				err,
 			)
-			continue
 		}
 		if err != nil {
 			return fmt.Errorf("querying partition count for %s: %w", topic, err)
@@ -66,9 +84,10 @@ func CheckMinPartitions(broker Broker, topic string, want int, logger *zap.Logge
 	count, err := broker.PartitionCount(topic)
 	if errors.Is(err, ErrTopicNotFound) {
 		return fmt.Errorf(
-			"topic %s not found on broker; create it before startup with at least %d partitions (correctness requirement)",
+			"topic %s not found on broker; create it before startup with at least %d partitions (correctness requirement): %w",
 			topic,
 			want,
+			err,
 		)
 	}
 	if err != nil {

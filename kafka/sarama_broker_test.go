@@ -232,3 +232,89 @@ func TestNewSyncProducerConfig_OrderingInvariants(t *testing.T) {
 		t.Fatalf("sarama config invalid: %v", err)
 	}
 }
+
+// TestPartitionCountClientConfig_DisablesAutoTopicCreation pins the flag
+// the metadata probe must clear. Sarama's default is true; leaving it
+// would make a missing-topic lookup ask the broker to create the topic.
+func TestPartitionCountClientConfig_DisablesAutoTopicCreation(t *testing.T) {
+	if !sarama.NewConfig().Metadata.AllowAutoTopicCreation {
+		t.Fatal("sarama default AllowAutoTopicCreation changed; the override below may no longer be load-bearing")
+	}
+	cfg := partitionCountClientConfig()
+	if cfg.Metadata.AllowAutoTopicCreation {
+		t.Fatal("partition-count client must not allow auto topic creation")
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("sarama config invalid: %v", err)
+	}
+}
+
+// TestSaramaBroker_PartitionCount_DoesNotAskToCreateMissingTopic drives
+// PartitionCount against a mock broker. The metadata request for the
+// missing topic must carry AllowAutoTopicCreation=false, and the result
+// must be ErrTopicNotFound rather than a freshly created partition list.
+func TestSaramaBroker_PartitionCount_DoesNotAskToCreateMissingTopic(t *testing.T) {
+	const missing = "bsv-broadcaster.block_processed"
+	const wide = "bsv-broadcaster.tx_status"
+
+	seed := sarama.NewMockBroker(t, 1)
+	defer seed.Close()
+
+	seed.SetHandlerByMap(map[string]sarama.MockResponse{
+		// Advertise Metadata (3) and ApiVersions (18). The stock mock only
+		// advertises Produce and Fetch, which makes the real client drop
+		// the broker before it can ask about the topic.
+		"ApiVersionsRequest": sarama.NewMockApiVersionsResponse(t).SetApiKeys([]sarama.ApiVersionsResponseKey{
+			{ApiKey: 3, MinVersion: 0, MaxVersion: 12},
+			{ApiKey: 18, MinVersion: 0, MaxVersion: 4},
+		}),
+		"MetadataRequest": sarama.NewMockMetadataResponse(t).
+			SetController(seed.BrokerID()).
+			SetBroker(seed.Addr(), seed.BrokerID()).
+			SetLeader(wide, 0, seed.BrokerID()).
+			SetLeader(wide, 1, seed.BrokerID()).
+			SetLeader(wide, 2, seed.BrokerID()),
+	})
+
+	b := newSaramaBrokerFromProducers(
+		&fakeSyncProducer{},
+		newAsyncProducerMock(t),
+		[]string{seed.Addr()},
+		"bsv-broadcaster",
+		zap.NewNop(),
+	)
+	defer func() { _ = b.Close() }()
+
+	n, err := b.PartitionCount(missing)
+	if !errors.Is(err, ErrTopicNotFound) {
+		t.Fatalf("PartitionCount(%s) = %d, %v; want ErrTopicNotFound", missing, n, err)
+	}
+
+	count, err := b.PartitionCount(wide)
+	if err != nil {
+		t.Fatalf("PartitionCount(%s): %v", wide, err)
+	}
+	if count != 3 {
+		t.Fatalf("PartitionCount(%s) = %d, want 3", wide, count)
+	}
+
+	sawMissing := false
+	for _, rr := range seed.History() {
+		req, ok := rr.Request.(*sarama.MetadataRequest)
+		if !ok {
+			continue
+		}
+		for _, topic := range req.Topics {
+			if topic != missing {
+				continue
+			}
+			sawMissing = true
+			if req.AllowAutoTopicCreation {
+				t.Fatal("metadata lookup for a missing topic set AllowAutoTopicCreation")
+			}
+		}
+	}
+	if !sawMissing {
+		t.Fatal("expected a metadata request naming the missing topic")
+	}
+}
